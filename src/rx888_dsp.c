@@ -1235,6 +1235,14 @@ int main(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
+    /* -------- CPU feature check -------- */
+#if defined(__GNUC__) || defined(__clang__)
+    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
+        warn_msg("this CPU lacks AVX2+FMA support (required)");
+        return EXIT_USAGE;
+    }
+#endif
+
     /* -------- signals -------- */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
