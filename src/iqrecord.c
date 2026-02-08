@@ -1,3 +1,15 @@
+/*
+ * iqrecord (stdin -> SigMF files)
+ *
+ * Purpose
+ *   High-throughput IQ recorder for continuous capture at >=135 MS/s.
+ *   Reads cf32_le IQ samples from stdin, splits into fixed-size files
+ *   with SigMF-compatible metadata, and writes a session-level run.json.
+ *
+ * I/O
+ *   Input:  complex float32 IQ (cf32_le) on stdin.
+ *   Output: cap_NNNNNN.sigmf-data + .sigmf-meta files, plus run.json.
+ */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
