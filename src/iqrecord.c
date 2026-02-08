@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -28,7 +29,7 @@ static const uint64_t DEFAULT_BLOCK_SAMPLES = 4194304ULL;
 // cf32_le = 2 float32 little endian = 8 bytes per complex sample
 static const uint64_t BYTES_PER_SAMPLE = 8ULL;
 
-static volatile sig_atomic_t g_stop = 0;
+static _Atomic int g_stop = 0;
 
 static void on_signal(int signo) {
   (void)signo;

@@ -143,7 +143,7 @@ static spsc_queue_t free_queue;    // Available to fill
 static spsc_queue_t filled_queue;  // Ready for processing
 static spsc_queue_t ready_queue;   // Ready to output
 
-static _Atomic int stop_flag = 0;
+static _Atomic int g_stop = 0;
 static _Atomic int stats_req_flag = 0;  // set by SIGUSR1, consumed by processing thread
 static _Atomic int proc_drain_done = 0; // set by processing thread after drain completes
 
@@ -843,7 +843,7 @@ static void* processing_thread(void *arg) {
         free(hb2_eQ);   hb2_eQ   = NULL;
         free(hb2_oI);   hb2_oI   = NULL;
         free(hb2_oQ);   hb2_oQ   = NULL;
-        stop_flag = 1; /* signal main thread to stop */
+        g_stop = 1; /* signal main thread to stop */
         return NULL;
     }
 
@@ -853,7 +853,7 @@ static void* processing_thread(void *arg) {
 }
 
     
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&filled_queue);
         if (stats_req_flag) {
             /* Print stats on demand (SIGUSR1). This check is once per block and
@@ -913,11 +913,11 @@ static void* processing_thread(void *arg) {
             // Ready queue full. In --block-on-full mode, wait for space.
             // Otherwise drop the processed block (keeps latency bounded).
             if (g_app.block_on_full) {
-                while (!stop_flag && !spsc_push(&ready_queue, buf)) {
+                while (!g_stop && !spsc_push(&ready_queue, buf)) {
                     struct timespec ts = {0, 100000};
                     nanosleep(&ts, NULL);
                 }
-                if (stop_flag) {
+                if (g_stop) {
                     spsc_push(&free_queue, buf);
                 }
             } else {
@@ -927,7 +927,7 @@ static void* processing_thread(void *arg) {
         }
     }
 
-    /* Drain: process any buffers still queued when stop_flag went high.
+    /* Drain: process any buffers still queued when g_stop went high.
      * Without this, the final 1–2 blocks can be silently lost on shutdown
      * (visible as variable "Samples output" in short runs).
      * The output thread waits for proc_drain_done before finishing its
@@ -1000,17 +1000,17 @@ static void* output_thread(void *arg) {
         if (stat(g_app.output_path, &st) != 0) {
             LOG_ERR("output path '%s' not found (create with: mkfifo %s)\n",
                     g_app.output_path, g_app.output_path);
-            stop_flag = 1;
+            g_stop = 1;
             return NULL;
         }
         if (!S_ISFIFO(st.st_mode)) {
             LOG_ERR("output path '%s' is not a FIFO\n", g_app.output_path);
-            stop_flag = 1;
+            g_stop = 1;
             return NULL;
         }
     }
     
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&ready_queue);
         if (!buf) {
             struct timespec ts = {0, 100000};
@@ -1061,7 +1061,7 @@ static void* output_thread(void *arg) {
             }
             
             if (w < 0 && errno == EINTR) {
-                if (stop_flag) break;
+                if (g_stop) break;
                 continue;
             }
             if (w < 0 && errno == EPIPE) {
@@ -1071,7 +1071,7 @@ static void* output_thread(void *arg) {
             }
             if (w < 0) {
                 LOG_ERR("write failed: %s\n", strerror(errno));
-                stop_flag = 1;
+                g_stop = 1;
                 break;
             }
         }
@@ -1085,7 +1085,7 @@ static void* output_thread(void *arg) {
     }
 
     /* Drain: the processing thread may still be pushing to ready_queue
-     * during its own drain (both threads see stop_flag concurrently).
+     * during its own drain (both threads see g_stop concurrently).
      * Spin until proc_drain_done, then do one final sweep to catch any
      * push that raced with our last pop. */
     {
@@ -1121,7 +1121,7 @@ static void* output_thread(void *arg) {
 
 static void signal_handler(int sig) {
     (void)sig;
-    stop_flag = 1;
+    g_stop = 1;
 }
 
 static void sigusr1_handler(int sig) {
@@ -1289,13 +1289,13 @@ int main(int argc, char **argv) {
     rc = pthread_create(&out_thread, NULL, output_thread, NULL);
     if (rc != 0) {
         LOG_ERR("pthread_create(output_thread) failed: %s\n", strerror(rc));
-        stop_flag = 1;
+        g_stop = 1;
         pthread_join(proc_thread, NULL);
         return 1;
     }
 
     /* -------- main input loop -------- */
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&free_queue);
         if (!buf) {
             /* No free buffers: either block or drop, depending on mode. */
@@ -1326,11 +1326,11 @@ int main(int argc, char **argv) {
 
         if (!spsc_push(&filled_queue, buf)) {
             if (g_app.block_on_full) {
-                while (!stop_flag && !spsc_push(&filled_queue, buf)) {
+                while (!g_stop && !spsc_push(&filled_queue, buf)) {
                     struct timespec ts = {0, 100000};
                     nanosleep(&ts, NULL);
                 }
-                if (stop_flag) {
+                if (g_stop) {
                     spsc_push(&free_queue, buf);
                     break;
                 }
@@ -1342,7 +1342,7 @@ int main(int argc, char **argv) {
     }
 
     /* Request shutdown and unblock threads. */
-    stop_flag = 1;
+    g_stop = 1;
     pthread_join(proc_thread, NULL);
     pthread_join(out_thread, NULL);
 
