@@ -181,16 +181,19 @@ static ssize_t read_eintr(int fd, void *buf, size_t want) {
 }
 
 
-/* Returns 0 on success, -1 on error (errno set). */
+/* Returns 0 on success, -1 on error (errno set).
+ * Pure I/O helper — does not check g_stop.  The caller's outer loop
+ * checks g_stop between writes, so any write that starts will finish
+ * atomically and sample counters stay accurate. */
 static int write_all(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
   while (len > 0) {
-    if (g_stop) return 0;
     ssize_t n = write(fd, p, len);
     if (n < 0) {
       if (errno == EINTR) continue;
       return -1;
     }
+    if (n == 0) { errno = EIO; return -1; }
     p += (size_t)n;
     len -= (size_t)n;
   }
