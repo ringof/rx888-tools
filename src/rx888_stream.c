@@ -48,6 +48,8 @@ License: MIT (same as original)
 #include "ezusb.h"
 #include "rx888.h"
 
+#define PROG_NAME "rx888_stream"
+
 /* ezusb.c expects this symbol */
 int verbose = 0;
 
@@ -57,7 +59,7 @@ static const uint16_t RX888_VID = 0x04b4;
 static const uint16_t RX888_PID_BOOT = 0x00f3; /* needs firmware */
 static const uint16_t RX888_PID_APP  = 0x00f1; /* normal streaming */
 
-static atomic_int g_stop = 0;
+static volatile sig_atomic_t g_stop = 0;
 
 static int g_verbose = 0;
 static int g_dither = 0;
@@ -138,24 +140,47 @@ static unsigned int effective_max_packet(libusb_device *dev,
     return base;
 }
 
-static void vlogf(int level, const char *fmt, ...) {
-    if (g_verbose < level) return;
+__attribute__((unused))
+static void die(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
 }
 
-static int write_full(int fd, const uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
+static void warn_msg(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void info_msg(int level, const char *fmt, ...) {
+    if (g_verbose < level) return;
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -errno;
+            return -1;
         }
-        if (n == 0) return -EIO;
-        off += (size_t)n;
+        if (n == 0) { errno = EIO; return -1; }
+        p += (size_t)n;
+        len -= (size_t)n;
     }
     return 0;
 }
@@ -412,11 +437,11 @@ static int open_rx888(libusb_context *ctx, libusb_device_handle **out_h) {
     /* Not found in app mode. If we have firmware, try bootloader. */
     if (!g_firmware_path) return r;
 
-    vlogf(1, "RX888 app PID not found; trying bootloader + firmware upload...\n");
+    info_msg(1, "RX888 app PID not found; trying bootloader + firmware upload...");
 
     r = find_device(ctx, RX888_PID_BOOT, &m);
     if (r != 0) {
-        vlogf(0, "RX888 bootloader PID (0x%04x) not found either.\n", RX888_PID_BOOT);
+        warn_msg("RX888 bootloader PID (0x%04x) not found either.", RX888_PID_BOOT);
         return r;
     }
 
@@ -430,11 +455,11 @@ static int open_rx888(libusb_context *ctx, libusb_device_handle **out_h) {
     boot = NULL;
 
     if (u != 0) {
-        vlogf(0, "Firmware upload failed.\n");
+        warn_msg("Firmware upload failed.");
         return LIBUSB_ERROR_IO;
     }
 
-    vlogf(0, "Firmware uploaded; waiting for re-enumeration...\n");
+    warn_msg("Firmware uploaded; waiting for re-enumeration...");
     /* Give the device time to re-enumerate */
     usleep(500 * 1000);
 
@@ -561,7 +586,7 @@ static void LIBUSB_CALL stream_cb(struct libusb_transfer *t) {
     if (prev == 0) {
         /* Would mean a double-completion (libusb bug) — log it. */
         atomic_fetch_add(&s->bad_xfers, 1);
-        vlogf(0, "BUG: in_flight underflow\n");
+        warn_msg("BUG: in_flight underflow");
     }
 
     if (g_stop) {
@@ -600,7 +625,7 @@ static void *writer_main(void *arg) {
 
         if (t->status != LIBUSB_TRANSFER_COMPLETED) {
             atomic_fetch_add(&s->bad_xfers, 1);
-            vlogf(0, "xfer status=%s actual=%d\n", xfer_status_str(t->status), t->actual_length);
+            warn_msg("xfer status=%s actual=%d", xfer_status_str(t->status), t->actual_length);
             if (t->status == LIBUSB_TRANSFER_NO_DEVICE) {
                 g_stop = 1;
                 continue;
@@ -613,7 +638,7 @@ static void *writer_main(void *arg) {
                 if (g_fixup_samples) {
                     sample_fixup_i16_inplace((uint8_t *)t->buffer, t->actual_length);
                 }
-                int w = write_full(STDOUT_FILENO, (const uint8_t *)t->buffer, (size_t)t->actual_length);
+                int w = write_all(STDOUT_FILENO, t->buffer, (size_t)t->actual_length);
                 if (w != 0) {
                     atomic_store(&s->pipe_broken, true);
                     g_stop = 1;
@@ -637,7 +662,7 @@ static void *writer_main(void *arg) {
                 atomic_fetch_add(&s->in_flight, 1);
             } else {
                 atomic_fetch_add(&s->bad_xfers, 1);
-                vlogf(0, "submit_transfer failed: %s\n", libusb_error_name(r));
+                warn_msg("submit_transfer failed: %s", libusb_error_name(r));
                 g_stop = 1;
             }
         }
@@ -758,9 +783,8 @@ void stream_teardown(struct stream_ctx *s) {
 
     unsigned int leaked = atomic_load(&s->in_flight);
     if (leaked > 0) {
-        fprintf(stderr,
-                "warning: %u transfers still in-flight after drain; "
-                "leaking to avoid use-after-free\n", leaked);
+        warn_msg("warning: %u transfers still in-flight after drain; "
+                "leaking to avoid use-after-free", leaked);
     }
 
     for (unsigned int i = 0; i < s->nxfers; i++) {
@@ -853,188 +877,191 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN); /* we detect EPIPE via write_full */
+
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL); /* we detect EPIPE via write_all */
 
     /* Options */
     while (1) {
-	/* in your option parsing loop */
-	static struct option long_opts[] = {
-		{"firmware",       required_argument, 0, 'f'},
-		{"verbose",        optional_argument, 0, 'v'},
-		{"dither",         no_argument,       0, 'd'},
-		{"rand",           no_argument,       0, 'r'},
+    /* in your option parsing loop */
+    static struct option long_opts[] = {
+        {"firmware",       required_argument, 0, 'f'},
+        {"verbose",        optional_argument, 0, 'v'},
+        {"dither",         no_argument,       0, 'd'},
+        {"rand",           no_argument,       0, 'r'},
 
-		{"samplerate",     required_argument, 0, 's'},
-		{"gainmode",       required_argument, 0, 'm'},
-		{"gain",           required_argument, 0, 'g'},
-		{"att",            required_argument, 0, 'a'},
-		{"fixup",          no_argument,       0, 1003},
+        {"samplerate",     required_argument, 0, 's'},
+        {"gainmode",       required_argument, 0, 'm'},
+        {"gain",           required_argument, 0, 'g'},
+        {"att",            required_argument, 0, 'a'},
+        {"fixup",          no_argument,       0, 1003},
 
-		{"queuedepth",     required_argument, 0, 'q'},
-		{"reqsize",        required_argument, 0, 'p'},
-		{"ctrl-timeout",   required_argument, 0, 1001},
-		{"stream-timeout", required_argument, 0, 1002},
-		{"watchdog-timeout", required_argument, 0, 1004},
+        {"queuedepth",     required_argument, 0, 'q'},
+        {"reqsize",        required_argument, 0, 'p'},
+        {"ctrl-timeout",   required_argument, 0, 1001},
+        {"stream-timeout", required_argument, 0, 1002},
+        {"watchdog-timeout", required_argument, 0, 1004},
 
-		{"help",           no_argument,       0, 'h'},
-		{0,0,0,0}
-	};
+        {"help",           no_argument,       0, 'h'},
+        {0,0,0,0}
+    };
 
-	int opt_idx = 0;
-	int c = getopt_long(argc, argv, "f:v::drs:m:g:a:q:p:h", long_opts, &opt_idx);
-	if (c == -1) break;
+    int opt_idx = 0;
+    int c = getopt_long(argc, argv, "f:v::drs:m:g:a:q:p:h", long_opts, &opt_idx);
+    if (c == -1) break;
 
-	switch (c) {
-		case 'f':
-		g_firmware_path = optarg;
-		break;
+    switch (c) {
+        case 'f':
+        g_firmware_path = optarg;
+        break;
 
-		case 'v':
-		if (optarg) g_verbose = (int)strtoul(optarg, NULL, 10);
-		else g_verbose = 1;
-		break;
+        case 'v':
+        if (optarg) g_verbose = (int)strtoul(optarg, NULL, 10);
+        else g_verbose = 1;
+        break;
 
-		case 'd':
-		g_dither = 1;
-		break;
+        case 'd':
+        g_dither = 1;
+        break;
 
-		case 'r':
-		g_randomizer = 1;
-		break;
+        case 'r':
+        g_randomizer = 1;
+        break;
 
-		case 's': {
-		unsigned int sr = 0;
-		if (parse_u32(optarg, &sr) != 0 || !samplerate_allowed(sr)) {
-			fprintf(stderr,
-			        "Unsupported samplerate '%s'. Supported: 32000000, 135000000\n",
-			        optarg ? optarg : "(null)");
-			return 2;
-		}
-		g_samplerate = sr;
-		break;
-		}
+        case 's': {
+        unsigned int sr = 0;
+        if (parse_u32(optarg, &sr) != 0 || !samplerate_allowed(sr)) {
+            warn_msg("Unsupported samplerate '%s'. Supported: 32000000, 135000000",
+                    optarg ? optarg : "(null)");
+            return 2;
+        }
+        g_samplerate = sr;
+        break;
+        }
 
-		case 'm':
-		if (strcmp(optarg, "high") == 0) {
-			g_gain |= 0x80u;
-		} else if (strcmp(optarg, "low") == 0) {
-			g_gain &= 0x7fu;
-		} else {
-			fprintf(stderr, "Invalid gain mode '%s' (use 'low' or 'high')\n", optarg);
-			return 2;
-		}
-		break;
+        case 'm':
+        if (strcmp(optarg, "high") == 0) {
+            g_gain |= 0x80u;
+        } else if (strcmp(optarg, "low") == 0) {
+            g_gain &= 0x7fu;
+        } else {
+            warn_msg("Invalid gain mode '%s' (use 'low' or 'high')", optarg);
+            return 2;
+        }
+        break;
 
-		case 'g': {
-		long gv = 0;
-		if (parse_i32(optarg, &gv) != 0 || gv < 0 || gv > 127) {
-			fprintf(stderr, "Invalid gain value '%s' (expected 0..127)\n", optarg);
-			return 2;
-		}
-		g_gain = (g_gain & 0x80u) | (unsigned int)gv;
-		break;
-		}
+        case 'g': {
+        long gv = 0;
+        if (parse_i32(optarg, &gv) != 0 || gv < 0 || gv > 127) {
+            warn_msg("Invalid gain value '%s' (expected 0..127)", optarg);
+            return 2;
+        }
+        g_gain = (g_gain & 0x80u) | (unsigned int)gv;
+        break;
+        }
 
-		case 'a': {
-		long av = 0;
-		if (parse_i32(optarg, &av) != 0 || av < 0 || av > 63) {
-			fprintf(stderr, "Invalid attenuation value '%s' (expected 0..63)\n", optarg);
-			return 2;
-		}
-		g_att = (unsigned int)av;
-		break;
-		}
+        case 'a': {
+        long av = 0;
+        if (parse_i32(optarg, &av) != 0 || av < 0 || av > 63) {
+            warn_msg("Invalid attenuation value '%s' (expected 0..63)", optarg);
+            return 2;
+        }
+        g_att = (unsigned int)av;
+        break;
+        }
 
-		case 'q': {
-		unsigned int qd = 0;
-		if (parse_u32(optarg, &qd) != 0 || qd < 1 || qd > 4096) {
-			fprintf(stderr, "Invalid queuedepth '%s'\n", optarg);
-			return 2;
-		}
-		g_queue_depth = qd;
-		break;
-		}
+        case 'q': {
+        unsigned int qd = 0;
+        if (parse_u32(optarg, &qd) != 0 || qd < 1 || qd > 4096) {
+            warn_msg("Invalid queuedepth '%s'", optarg);
+            return 2;
+        }
+        g_queue_depth = qd;
+        break;
+        }
 
-		case 'p': {
-		unsigned int rp = 0;
-		if (parse_u32(optarg, &rp) != 0 || rp < 1 || rp > (1024u * 1024u)) {
-			fprintf(stderr, "Invalid reqsize '%s'\n", optarg);
-			return 2;
-		}
-		g_req_packets = rp;
-		break;
-		}
+        case 'p': {
+        unsigned int rp = 0;
+        if (parse_u32(optarg, &rp) != 0 || rp < 1 || rp > (1024u * 1024u)) {
+            warn_msg("Invalid reqsize '%s'", optarg);
+            return 2;
+        }
+        g_req_packets = rp;
+        break;
+        }
 
-		case 1001: { /* --ctrl-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			fprintf(stderr, "Invalid ctrl-timeout '%s'\n", optarg);
-			return 2;
-		}
-		g_ctrl_timeout_ms = ms;
-		break;
-		}
+        case 1001: { /* --ctrl-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid ctrl-timeout '%s'", optarg);
+            return 2;
+        }
+        g_ctrl_timeout_ms = ms;
+        break;
+        }
 
-		case 1002: { /* --stream-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			fprintf(stderr, "Invalid stream-timeout '%s'\n", optarg);
-			return 2;
-		}
-		g_stream_timeout_ms = ms;
-		break;
-		}
+        case 1002: { /* --stream-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid stream-timeout '%s'", optarg);
+            return 2;
+        }
+        g_stream_timeout_ms = ms;
+        break;
+        }
 
-		case 1004: { /* --watchdog-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			fprintf(stderr, "Invalid watchdog-timeout '%s'\n", optarg);
-			return 2;
-		}
-		g_watchdog_ms = ms;
-		break;
-		}
+        case 1004: { /* --watchdog-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid watchdog-timeout '%s'", optarg);
+            return 2;
+        }
+        g_watchdog_ms = ms;
+        break;
+        }
 
-		case 1003: /* --fixup */
-		g_fixup_samples = 1;
-		break;
+        case 1003: /* --fixup */
+        g_fixup_samples = 1;
+        break;
 
-		case 'h':
-		default:
-		usage(argv[0]);
-		return (c == 'h') ? 0 : 2;
+        case 'h':
+        default:
+        usage(argv[0]);
+        return (c == 'h') ? 0 : 2;
         } 
     }
 
-	/* Sync verbose for ezusb.c before anything else */
-	verbose = g_verbose;
+    /* Sync verbose for ezusb.c before anything else */
+    verbose = g_verbose;
 
-	/* After parsing options */
-	if (!samplerate_allowed(g_samplerate)) {
-		fprintf(stderr, "Internal error: samplerate %u not allowed\n", g_samplerate);
-		return 2;
-	}
+    /* After parsing options */
+    if (!samplerate_allowed(g_samplerate)) {
+        warn_msg("Internal error: samplerate %u not allowed", g_samplerate);
+        return 2;
+    }
 
-	/* Gain sanity: g_gain bit7 = mode, low 7 bits = 0..127 */
-	if ((g_gain & 0x7fu) > 127u) {
-		fprintf(stderr, "Invalid gain internal value: 0x%02x\n", g_gain);
-		return 2;
-	}
-	if (g_att > 63u) {
-		fprintf(stderr, "Invalid attenuation internal value: %u\n", g_att);
-		return 2;
-	}
-	if (g_queue_depth == 0 || g_req_packets == 0) {
-		fprintf(stderr, "Invalid USB sizing (-q/-p)\n");
-		return 2;
-	}
+    /* Gain sanity: g_gain bit7 = mode, low 7 bits = 0..127 */
+    if ((g_gain & 0x7fu) > 127u) {
+        warn_msg("Invalid gain internal value: 0x%02x", g_gain);
+        return 2;
+    }
+    if (g_att > 63u) {
+        warn_msg("Invalid attenuation internal value: %u", g_att);
+        return 2;
+    }
+    if (g_queue_depth == 0 || g_req_packets == 0) {
+        warn_msg("Invalid USB sizing (-q/-p)");
+        return 2;
+    }
 
-	if (isatty(STDOUT_FILENO)) {
-		fprintf(stderr, "rx888_stream: stdout is a TTY; redirect to a file or pipe\n");
-		return 2;
-	}
+    if (isatty(STDOUT_FILENO)) {
+        warn_msg("stdout is a TTY; redirect to a file or pipe");
+        return 2;
+    }
 
     int rc = 0;
     libusb_context *ctx = NULL;
@@ -1047,7 +1074,7 @@ int main(int argc, char **argv) {
     /* Init libusb */
     int r = libusb_init(&ctx);
     if (r != 0) {
-        fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(r));
+        warn_msg("libusb_init failed: %s", libusb_error_name(r));
         return 1;
     }
     if (g_verbose >= 3) {
@@ -1061,7 +1088,7 @@ int main(int argc, char **argv) {
     /* Open device (with optional firmware upload) */
     r = open_rx888(ctx, &h);
     if (r != 0) {
-        fprintf(stderr, "Could not open RX888: %s\n", libusb_error_name(r));
+        warn_msg("Could not open RX888: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1069,10 +1096,10 @@ int main(int argc, char **argv) {
     /* Detach kernel driver if needed */
     int kd = libusb_kernel_driver_active(h, 0);
     if (kd == 1) {
-        vlogf(0, "Kernel driver active; detaching...\n");
+        warn_msg("Kernel driver active; detaching...");
         r = libusb_detach_kernel_driver(h, 0);
         if (r != 0) {
-            fprintf(stderr, "Failed to detach kernel driver: %s\n", libusb_error_name(r));
+            warn_msg("Failed to detach kernel driver: %s", libusb_error_name(r));
             rc = 1;
             goto out;
         }
@@ -1081,17 +1108,17 @@ int main(int argc, char **argv) {
     /* Claim interface and pick endpoint */
     r = pick_bulk_in_endpoint(h, &sep);
     if (r != 0) {
-        fprintf(stderr, "Failed to find bulk IN endpoint: %s\n", libusb_error_name(r));
+        warn_msg("Failed to find bulk IN endpoint: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
 
-    vlogf(1, "Using iface=%u alt=%u ep=0x%02x maxpkt=%u\n",
-          sep.iface, sep.alt, sep.ep_in, sep.max_packet);
+    info_msg(1, "Using iface=%u alt=%u ep=0x%02x maxpkt=%u",
+             sep.iface, sep.alt, sep.ep_in, sep.max_packet);
 
     r = libusb_claim_interface(h, sep.iface);
     if (r != 0) {
-        fprintf(stderr, "Failed to claim interface %u: %s\n", sep.iface, libusb_error_name(r));
+        warn_msg("Failed to claim interface %u: %s", sep.iface, libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1100,7 +1127,7 @@ int main(int argc, char **argv) {
     if (sep.alt != 0) {
         r = libusb_set_interface_alt_setting(h, sep.iface, sep.alt);
         if (r != 0) {
-            fprintf(stderr, "Failed to set alt setting %u: %s\n", sep.alt, libusb_error_name(r));
+            warn_msg("Failed to set alt setting %u: %s", sep.alt, libusb_error_name(r));
             rc = 1;
             goto out;
         }
@@ -1112,11 +1139,18 @@ int main(int argc, char **argv) {
         /* Log requested configuration */
     if (g_verbose) {
         double actual = actual_freq((double)g_samplerate);
-        fprintf(stderr, "Ref. Clock: %u Hz\n", g_xtal_hz);
-        fprintf(stderr, "Requested Sample Rate: %u Hz (actual ~ %.3f Hz)\n", g_samplerate, actual);
-        fprintf(stderr, "Randomizer %s, Dither %s\n", g_randomizer ? "On" : "Off", g_dither ? "On" : "Off");
-        fprintf(stderr, "Gain Mode: %s, Gain: %u, Att: %u\n", (g_gain & 0x80u) ? "High" : "Low", (g_gain & 0x7fu), g_att);
-        fprintf(stderr, "Sample fixup: %s\n", g_fixup_samples ? "On" : "Off");
+        info_msg(0, "Ref. Clock: %u Hz", g_xtal_hz);
+        info_msg(0, "Requested Sample Rate: %u Hz (actual ~ %.3f Hz)", g_samplerate, actual);
+        info_msg(0, "Randomizer %s, Dither %s", g_randomizer ? "On" : "Off", g_dither ? "On" : "Off");
+        info_msg(0, "Gain Mode: %s, Gain: %u, Att: %u", (g_gain & 0x80u) ? "High" : "Low", (g_gain & 0x7fu), g_att);
+        info_msg(0, "Sample fixup: %s", g_fixup_samples ? "On" : "Off");
+        uint64_t xfer_bytes = (uint64_t)g_req_packets * sep.max_packet;
+        uint64_t total_bytes = xfer_bytes * g_queue_depth;
+        info_msg(0, "transfer_size=%" PRIu64 " bytes (%u packets x %u bytes)",
+                 xfer_bytes, g_req_packets, sep.max_packet);
+        info_msg(0, "queue_depth=%u, total_inflight=%" PRIu64 " bytes (%.2f MiB)",
+                 g_queue_depth, total_bytes, (double)total_bytes / (1024.0 * 1024.0));
+        info_msg(0, "minimum usbfs_memory_mb=%" PRIu64, (total_bytes + (1 << 20) - 1) >> 20);
     }
 
     /* Apply front-end and clock configuration (restored from original) */
@@ -1127,7 +1161,7 @@ int main(int argc, char **argv) {
     usleep(CTRL_SETTLE_US);
     r = rx888_gpio(h, gpio);
     if (r != 0) {
-        fprintf(stderr, "GPIO set failed: %s\n", libusb_error_name(r));
+        warn_msg("GPIO set failed: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1135,7 +1169,7 @@ int main(int argc, char **argv) {
     usleep(CTRL_SETTLE_US);
     r = rx888_set_arg(h, (uint16_t)DAT31_ATT, (uint16_t)g_att);
     if (r != 0) {
-        fprintf(stderr, "Set attenuation failed: %s\n", libusb_error_name(r));
+        warn_msg("Set attenuation failed: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1143,7 +1177,7 @@ int main(int argc, char **argv) {
     usleep(CTRL_SETTLE_US);
     r = rx888_set_arg(h, (uint16_t)AD8340_VGA, (uint16_t)g_gain);
     if (r != 0) {
-        fprintf(stderr, "Set gain failed: %s\n", libusb_error_name(r));
+        warn_msg("Set gain failed: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1151,7 +1185,7 @@ int main(int argc, char **argv) {
     usleep(CTRL_SETTLE_US);
     r = rx888_cmd_u32(h, (uint8_t)STARTADC, (uint32_t)g_samplerate);
     if (r != 0) {
-        fprintf(stderr, "STARTADC failed: %s\n", libusb_error_name(r));
+        warn_msg("STARTADC failed: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1159,7 +1193,7 @@ int main(int argc, char **argv) {
     usleep(CTRL_SETTLE_US);
     r = rx888_start_stream(h);
     if (r != 0) {
-        fprintf(stderr, "STARTFX3 failed: %s\n", libusb_error_name(r));
+        warn_msg("STARTFX3 failed: %s", libusb_error_name(r));
         rc = 1;
         goto out;
     }
@@ -1172,7 +1206,7 @@ int main(int argc, char **argv) {
     /* Setup transfers (malloc-only for safety) */
     r = stream_setup(&sctx, ctx, h, sep.ep_in, sep.max_packet);
     if (r != 0) {
-        fprintf(stderr, "Stream setup failed: %s\n", libusb_error_name(r));
+        warn_msg("Stream setup failed: %s", libusb_error_name(r));
         rc = 1;
         goto stop_stream;
     }
@@ -1182,7 +1216,7 @@ int main(int argc, char **argv) {
         r = libusb_submit_transfer(sctx.xfer[i]);
         if (r == 0) atomic_fetch_add(&sctx.in_flight, 1);
         else {
-            fprintf(stderr, "submit_transfer failed: %s\n", libusb_error_name(r));
+            warn_msg("submit_transfer failed: %s", libusb_error_name(r));
             rc = 1;
             g_stop = 1;
             break;
@@ -1209,7 +1243,7 @@ int main(int argc, char **argv) {
         }
         
         if (r != 0) {
-            fprintf(stderr, "handle_events error: %s\n", libusb_error_name(r));
+            warn_msg("handle_events error: %s", libusb_error_name(r));
             rc = 1;
             break;
         }
@@ -1220,7 +1254,7 @@ int main(int argc, char **argv) {
         if (!g_stop && g_watchdog_ms > 0 && atomic_load(&sctx.in_flight) > 0) {
             uint64_t now_ms = monotonic_ms();
             if (last_cb != 0 && (now_ms - last_cb) > g_watchdog_ms) {
-                fprintf(stderr, "No USB data for %" PRIu64 " ms; stopping. (in_flight=%u)\n",
+                warn_msg("No USB data for %" PRIu64 " ms; stopping. (in_flight=%u)",
                         (now_ms - last_cb), atomic_load(&sctx.in_flight));
                 g_stop = 1;
             }
@@ -1231,8 +1265,8 @@ int main(int argc, char **argv) {
             double secs = (double)(now - t0) / 1000.0;
             uint64_t bout = atomic_load(&sctx.bytes_out);
             double mbps = (secs > 0) ? (double)bout / (1024.0 * 1024.0) / secs : 0.0;
-            fprintf(stderr,
-                    "t=%.0fs ok=%" PRIu64 " bad=%" PRIu64 " in_flight=%u out=%.2f MiB (%.2f MiB/s)\n",
+            info_msg(0,
+                    "t=%.0fs ok=%" PRIu64 " bad=%" PRIu64 " in_flight=%u out=%.2f MiB (%.2f MiB/s)",
                     secs, (uint64_t)atomic_load(&sctx.ok_xfers),
                     (uint64_t)atomic_load(&sctx.bad_xfers),
                     atomic_load(&sctx.in_flight),

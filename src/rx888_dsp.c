@@ -30,6 +30,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -143,8 +144,8 @@ static spsc_queue_t free_queue;    // Available to fill
 static spsc_queue_t filled_queue;  // Ready for processing
 static spsc_queue_t ready_queue;   // Ready to output
 
-static _Atomic int stop_flag = 0;
-static _Atomic int stats_req_flag = 0;  // set by SIGUSR1, consumed by processing thread
+static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t stats_req_flag = 0;  // set by SIGUSR1, consumed by processing thread
 static _Atomic int proc_drain_done = 0; // set by processing thread after drain completes
 
 /* Compromise vs. full refactor:
@@ -163,7 +164,7 @@ static app_ctx_t g_app = {
     .output_path = NULL
 };
 
-#define PROGRAM_NAME "rx888_dsp"
+#define PROG_NAME "rx888_dsp"
 #ifndef EXIT_USAGE
 #define EXIT_USAGE 2
 #endif
@@ -172,11 +173,35 @@ static app_ctx_t g_app = {
 #define RX888_DSP_VERSION "dev"
 #endif
 
+__attribute__((unused))
+static void die(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
+}
 
-/* Logging: errors always go to stderr; info only with -v. */
-#define LOG_ERR(fmt, ...)  fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__)
-#define LOG_SYSERR(ctx)    fprintf(stderr, PROGRAM_NAME ": %s: %s\n", (ctx), strerror(errno))
-#define LOG_INFO(fmt, ...) do { if (g_app.verbose) fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__); } while (0)
+static void warn_msg(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void info_msg(const char *fmt, ...) {
+    if (!g_app.verbose) return;
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 
 static _Atomic unsigned long samples_processed = 0;
 static _Atomic unsigned long blocks_dropped = 0;
@@ -195,9 +220,7 @@ static struct {
     double max_time_ms;
 } stats = {0, 0.0, 1e9, 0.0};
 
-//=============================================================================
-// SPSC Queue (C11 atomics - correct!)
-//=============================================================================
+/* ----------------------------- SPSC Queue ------------------------------- */
 
 static inline void spsc_init(spsc_queue_t *q) {
     atomic_store_explicit(&q->write_idx, 0u, memory_order_relaxed);
@@ -225,9 +248,7 @@ static inline buffer_t* spsc_pop(spsc_queue_t *q) {
     return buf;
 }
 
-//=============================================================================
-// Filter Coefficient Folding
-//=============================================================================
+/* ----------------------- Filter Coefficient Folding --------------------- */
 
 static void init_hb2_coeffs(void) {
     // r=0 uses tap[116], r=58 uses tap[0]
@@ -279,9 +300,7 @@ static ssize_t read_full(int fd, void *buf, size_t bytes)
 }
 
 
-//=============================================================================
-// Stage 1: Convert int16 to complex with -Fs/4 shift
-//=============================================================================
+/* --------------- Stage 1: int16 to complex with -Fs/4 shift ------------- */
 
 static inline void stage1_convert_and_shift_into(const int16_t *in, float *Iptr, float *Qptr) {
     // Convert int16 real samples to complex baseband using a -Fs/4 shift.
@@ -358,9 +377,9 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 }
 
 
-//=============================================================================
-// Stage 2: HB1 with history (streaming FIR) producing SoA I/Q
-// (Stage 1 conversion + -Fs/4 shift is fused here by filling the current-block region of extI/extQ.)
+/* ----------- Stage 2: HB1 streaming FIR, decimate-by-2 (SoA) ----------- */
+// Stage 1 conversion + -Fs/4 shift is fused here by filling the
+// current-block region of extI/extQ.
 //
 // IMPORTANT: This is a *causal* streaming FIR:
 //   y[m] = sum_{k=0..L-1} h[k] * x[2m - k]
@@ -368,7 +387,6 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 // We build ext[] = [history(L-1) | current_block] so ext[H + i] == x[i].
 // Then x[2m-k] maps to ext[H + 2m - k]. This avoids any look-ahead,
 // eliminates bounds checks in the inner loop, and is correct across blocks.
-//=============================================================================
 
 static inline void stage2_hb1_stream_soa(buffer_t *buf) {
     // HB1 decimate-by-2, causal streaming FIR on SoA data:
@@ -433,13 +451,10 @@ static inline void stage2_hb1_stream_soa(buffer_t *buf) {
     memcpy(extQ, extQ + STAGE1_SAMPLES, H * sizeof(float));
 }
 
-//=============================================================================
-// Stage 3: Shift by +Fs/4 (in-place) on SoA
-//
+/* --------------- Stage 3: +Fs/4 shift (in-place, SoA) ------------------- */
 // For each sample index i:
 //   multiply by [1, j, -1, -j] repeating.
 // In SoA this is just sign flips and (I,Q) swaps.
-//=============================================================================
 
 #if 0
 // Reference implementation kept for documentation.
@@ -529,9 +544,7 @@ static inline void stage3_shift_fs4_soa(buffer_t *buf) {
 #endif
 
 
-//=============================================================================
-// Stage 4: HB2 decimate-by-2 using folded halfband symmetry + AVX2 (SoA)
-//
+/* ----------- Stage 4: HB2 decimate-by-2, folded halfband + AVX2 --------- */
 // Halfband properties for HB2 (235 taps):
 //   - All odd taps are 0 except the center tap h[117] ~= 0.5
 //   - Even taps are symmetric
@@ -558,7 +571,6 @@ static inline void stage3_shift_fs4_soa(buffer_t *buf) {
 //   x[2m - (118+2r)] = e[m - (59+r)]
 //
 // This yields contiguous loads for SIMD.
-//=============================================================================
 
 static inline void hb2_decim2_folded_avx2_soa(
     const float * restrict eI,
@@ -811,13 +823,11 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
     memcpy(hb2_extQ, hb2_extQ + STAGE2_SAMPLES, H * sizeof(float));
 }
 
-//=============================================================================
-// Processing Thread
-//=============================================================================
+/* -------------------------- Processing Thread --------------------------- */
 
 static void* processing_thread(void *arg) {
     (void)arg;
-    LOG_INFO("Processing thread started\n");
+    info_msg("Processing thread started");
     
     // Allocate working buffers for Stage 4 (HB2) using posix_memalign.
 // NOTE: aligned_alloc() requires size be a multiple of alignment; these sizes are not.
@@ -836,14 +846,14 @@ static void* processing_thread(void *arg) {
     if (posix_memalign((void**)&hb2_oQ,   64, (size_t)o_len   * sizeof(float)) != 0) hb2_oQ   = NULL;
 
     if (!hb2_extI || !hb2_extQ || !hb2_eI || !hb2_eQ || !hb2_oI || !hb2_oQ) {
-        LOG_ERR("failed to allocate Stage4 working buffers (out of memory?)\n");
+        warn_msg("failed to allocate Stage4 working buffers (out of memory?)");
         free(hb2_extI); hb2_extI = NULL;
         free(hb2_extQ); hb2_extQ = NULL;
         free(hb2_eI);   hb2_eI   = NULL;
         free(hb2_eQ);   hb2_eQ   = NULL;
         free(hb2_oI);   hb2_oI   = NULL;
         free(hb2_oQ);   hb2_oQ   = NULL;
-        stop_flag = 1; /* signal main thread to stop */
+        g_stop = 1; /* signal main thread to stop */
         return NULL;
     }
 
@@ -853,7 +863,7 @@ static void* processing_thread(void *arg) {
 }
 
     
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&filled_queue);
         if (stats_req_flag) {
             /* Print stats on demand (SIGUSR1). This check is once per block and
@@ -869,22 +879,21 @@ static void* processing_thread(void *arg) {
                     (stats.avg_time_ms > 0) ? (100.0 * (1.94 - stats.avg_time_ms) / 1.94) : 0.0;
 
             if (!g_app.verbose) {
-                fprintf(stderr,
-                        PROGRAM_NAME ": SIGUSR1: blocks=%lu dropped=%lu(%.2f%%) "
-                                     "avg=%.2fms headroom=%.1f%% out=%lu\n",
-                        stats.total_blocks, dropped, drop_pct, stats.avg_time_ms, headroom_pct,
-                        samples_processed);
+                warn_msg("SIGUSR1: blocks=%lu dropped=%lu(%.2f%%) "
+                         "avg=%.2fms headroom=%.1f%% out=%lu",
+                         stats.total_blocks, dropped, drop_pct, stats.avg_time_ms, headroom_pct,
+                         samples_processed);
             } else {
-                fprintf(stderr, PROGRAM_NAME ": === Statistics (SIGUSR1) ===\n");
-                fprintf(stderr, PROGRAM_NAME ": Blocks processed: %lu\n", stats.total_blocks);
+                warn_msg("=== Statistics (SIGUSR1) ===");
+                warn_msg("Blocks processed: %lu", stats.total_blocks);
                 if (total > 0) {
-                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (%.2f%%)\n", dropped, drop_pct);
+                    warn_msg("Blocks dropped:   %lu (%.2f%%)", dropped, drop_pct);
                 } else {
-                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (no data processed)\n", dropped);
+                    warn_msg("Blocks dropped:   %lu (no data processed)", dropped);
                 }
-                fprintf(stderr, PROGRAM_NAME ": Time/block: avg %.2f ms (min %.2f, max %.2f)\n",
-                        stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
-                fprintf(stderr, PROGRAM_NAME ": Samples output: %lu\n", samples_processed);
+                warn_msg("Time/block: avg %.2f ms (min %.2f, max %.2f)",
+                         stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
+                warn_msg("Samples output: %lu", samples_processed);
             }
         }
 
@@ -913,11 +922,11 @@ static void* processing_thread(void *arg) {
             // Ready queue full. In --block-on-full mode, wait for space.
             // Otherwise drop the processed block (keeps latency bounded).
             if (g_app.block_on_full) {
-                while (!stop_flag && !spsc_push(&ready_queue, buf)) {
+                while (!g_stop && !spsc_push(&ready_queue, buf)) {
                     struct timespec ts = {0, 100000};
                     nanosleep(&ts, NULL);
                 }
-                if (stop_flag) {
+                if (g_stop) {
                     spsc_push(&free_queue, buf);
                 }
             } else {
@@ -927,7 +936,7 @@ static void* processing_thread(void *arg) {
         }
     }
 
-    /* Drain: process any buffers still queued when stop_flag went high.
+    /* Drain: process any buffers still queued when g_stop went high.
      * Without this, the final 1–2 blocks can be silently lost on shutdown
      * (visible as variable "Samples output" in short runs).
      * The output thread waits for proc_drain_done before finishing its
@@ -957,9 +966,7 @@ static void* processing_thread(void *arg) {
     return NULL;
 }
 
-//=============================================================================
-// Output Thread (with partial write handling)
-//=============================================================================
+/* ---------------------------- Output Thread ----------------------------- */
 
 /* Write one processed buffer to the output fd and return it to free_queue.
  * Used by both the main output loop and the shutdown drain. */
@@ -977,8 +984,12 @@ static void output_and_free(buffer_t *buf) {
         if (w > 0) { off += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && errno == EPIPE) {
-            close(g_app.output_fd);
-            g_app.output_fd = -1;
+            if (g_app.output_path) {
+                close(g_app.output_fd);
+                g_app.output_fd = -1;
+            } else {
+                g_stop = 1;
+            }
         }
         break;
     }
@@ -990,7 +1001,7 @@ static void output_and_free(buffer_t *buf) {
 
 static void* output_thread(void *arg) {
     (void)arg;
-    LOG_INFO("Output thread started\n");
+    info_msg("Output thread started");
 
     /* If -o PATH was provided, require it to be a FIFO.
        This avoids accidentally writing IQ to a regular file (disk fill) and
@@ -998,19 +1009,19 @@ static void* output_thread(void *arg) {
     if (g_app.output_path) {
         struct stat st;
         if (stat(g_app.output_path, &st) != 0) {
-            LOG_ERR("output path '%s' not found (create with: mkfifo %s)\n",
-                    g_app.output_path, g_app.output_path);
-            stop_flag = 1;
+            warn_msg("output path '%s' not found (create with: mkfifo %s)",
+                     g_app.output_path, g_app.output_path);
+            g_stop = 1;
             return NULL;
         }
         if (!S_ISFIFO(st.st_mode)) {
-            LOG_ERR("output path '%s' is not a FIFO\n", g_app.output_path);
-            stop_flag = 1;
+            warn_msg("output path '%s' is not a FIFO", g_app.output_path);
+            g_stop = 1;
             return NULL;
         }
     }
     
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&ready_queue);
         if (!buf) {
             struct timespec ts = {0, 100000};
@@ -1028,11 +1039,11 @@ static void* output_thread(void *arg) {
                 int flags = fcntl(fd, F_GETFL);
                 if (flags >= 0) (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
                 g_app.output_fd = fd;
-                LOG_INFO("Connected to FIFO: %s\n", g_app.output_path);
+                info_msg("Connected to FIFO: %s", g_app.output_path);
             } else {
                 /* ENXIO: FIFO exists but no reader yet (normal). */
                 if (errno != ENXIO && errno != EINTR) {
-                    LOG_ERR("FIFO open failed: %s\n", strerror(errno));
+                    warn_msg("FIFO open failed: %s", strerror(errno));
                 }
             }
         }
@@ -1061,31 +1072,37 @@ static void* output_thread(void *arg) {
             }
             
             if (w < 0 && errno == EINTR) {
-                if (stop_flag) break;
+                if (g_stop) break;
                 continue;
             }
             if (w < 0 && errno == EPIPE) {
-                close(g_app.output_fd);
-                g_app.output_fd = -1;
+                if (g_app.output_path) {
+                    /* FIFO: close and allow reconnect on next iteration. */
+                    close(g_app.output_fd);
+                    g_app.output_fd = -1;
+                } else {
+                    /* stdout: consumer exited, shut down the pipeline. */
+                    g_stop = 1;
+                }
                 break;
             }
             if (w < 0) {
-                LOG_ERR("write failed: %s\n", strerror(errno));
-                stop_flag = 1;
+                warn_msg("write failed: %s", strerror(errno));
+                g_stop = 1;
                 break;
             }
         }
-        
+
         if (off == bytes) {
             samples_processed += OUTPUT_SAMPLES;
         }
-        
+
         // Return buffer to free pool
         spsc_push(&free_queue, buf);
     }
 
     /* Drain: the processing thread may still be pushing to ready_queue
-     * during its own drain (both threads see stop_flag concurrently).
+     * during its own drain (both threads see g_stop concurrently).
      * Spin until proc_drain_done, then do one final sweep to catch any
      * push that raced with our last pop. */
     {
@@ -1115,13 +1132,11 @@ static void* output_thread(void *arg) {
     return NULL;
 }
 
-//=============================================================================
-// Signal Handler
-//=============================================================================
+/* --------------------------- Signal Handler ----------------------------- */
 
-static void signal_handler(int sig) {
+static void on_signal(int sig) {
     (void)sig;
-    stop_flag = 1;
+    g_stop = 1;
 }
 
 static void sigusr1_handler(int sig) {
@@ -1133,12 +1148,12 @@ static void sigusr1_handler(int sig) {
 
 
 static void print_version(FILE *out) {
-    fprintf(out, "%s %s\n", PROGRAM_NAME, RX888_DSP_VERSION);
+    fprintf(out, "%s %s\n", PROG_NAME, RX888_DSP_VERSION);
 }
 
 static void usage_short(FILE *out) {
-    fprintf(out, "Usage: %s [OPTIONS]\n", PROGRAM_NAME);
-    fprintf(out, "Try '%s --help' for more information.\n", PROGRAM_NAME);
+    fprintf(out, "Usage: %s [OPTIONS]\n", PROG_NAME);
+    fprintf(out, "Try '%s --help' for more information.\n", PROG_NAME);
 }
 
 static void help_long(FILE *out) {
@@ -1170,13 +1185,11 @@ static void help_long(FILE *out) {
             "Examples:\n"
             "  cat capture.i16 | %s --block-on-full -v > /tmp/iq.fifo\n"
             "\n",
-            PROGRAM_NAME, PROGRAM_NAME);
+            PROG_NAME, PROG_NAME);
 }
 
 
-//=============================================================================
-// Main
-//=============================================================================
+/* --------------------------------- Main --------------------------------- */
 
 
 int main(int argc, char **argv) {
@@ -1215,27 +1228,35 @@ int main(int argc, char **argv) {
     }
 
     if (optind < argc) {
-        LOG_ERR("unexpected argument: '%s'\n", argv[optind]);
+        warn_msg("unexpected argument: '%s'", argv[optind]);
         usage_short(stderr);
         return EXIT_USAGE;
     }
 
     /* -------- TTY safety rails -------- */
     if (isatty(STDIN_FILENO)) {
-        LOG_ERR("stdin is a TTY; provide input via a pipe or redirection\n");
+        warn_msg("stdin is a TTY; provide input via a pipe or redirection");
         usage_short(stderr);
         return EXIT_USAGE;
     }
     if (g_app.output_path == NULL && isatty(STDOUT_FILENO)) {
-        LOG_ERR("stdout is a TTY; redirect output or use -o PATH (FIFO)\n");
+        warn_msg("stdout is a TTY; redirect output or use -o PATH (FIFO)");
         usage_short(stderr);
         return EXIT_USAGE;
     }
 
+    /* -------- CPU feature check -------- */
+#if defined(__GNUC__) || defined(__clang__)
+    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
+        warn_msg("this CPU lacks AVX2+FMA support (required)");
+        return EXIT_USAGE;
+    }
+#endif
+
     /* -------- signals -------- */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
+    sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
 
@@ -1270,10 +1291,10 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.verbose) {
-        fprintf(stderr, PROGRAM_NAME ": === rx888-decimate ===\n");
-        fprintf(stderr, PROGRAM_NAME ": Architecture: buffer pool + streaming FIR\n");
-        fprintf(stderr, PROGRAM_NAME ": HB2: folded halfband (59 pairs)\n");
-        fprintf(stderr, PROGRAM_NAME ": Output: %s\n", g_app.output_path ? g_app.output_path : "stdout");
+        info_msg("=== rx888-decimate ===");
+        info_msg("Architecture: buffer pool + streaming FIR");
+        info_msg("HB2: folded halfband (59 pairs)");
+        info_msg("Output: %s", g_app.output_path ? g_app.output_path : "stdout");
         fprintf(stderr, "\n");
     }
 
@@ -1282,20 +1303,20 @@ int main(int argc, char **argv) {
 
     rc = pthread_create(&proc_thread, NULL, processing_thread, NULL);
     if (rc != 0) {
-        LOG_ERR("pthread_create(processing_thread) failed: %s\n", strerror(rc));
+        warn_msg("pthread_create(processing_thread) failed: %s", strerror(rc));
         return 1;
     }
 
     rc = pthread_create(&out_thread, NULL, output_thread, NULL);
     if (rc != 0) {
-        LOG_ERR("pthread_create(output_thread) failed: %s\n", strerror(rc));
-        stop_flag = 1;
+        warn_msg("pthread_create(output_thread) failed: %s", strerror(rc));
+        g_stop = 1;
         pthread_join(proc_thread, NULL);
         return 1;
     }
 
     /* -------- main input loop -------- */
-    while (!stop_flag) {
+    while (!g_stop) {
         buffer_t *buf = spsc_pop(&free_queue);
         if (!buf) {
             /* No free buffers: either block or drop, depending on mode. */
@@ -1316,21 +1337,21 @@ int main(int argc, char **argv) {
             break; /* clean EOF */
         }
         if (n < 0) {
-            LOG_SYSERR("read");
+            warn_msg("read: %s", strerror(errno));
             break;
         }
         if ((size_t)n < INPUT_SAMPLES * sizeof(int16_t)) {
-            LOG_ERR("Input stream ended mid-block (%zd bytes).\n", n);
+            warn_msg("Input stream ended mid-block (%zd bytes).", n);
             break;
         }
 
         if (!spsc_push(&filled_queue, buf)) {
             if (g_app.block_on_full) {
-                while (!stop_flag && !spsc_push(&filled_queue, buf)) {
+                while (!g_stop && !spsc_push(&filled_queue, buf)) {
                     struct timespec ts = {0, 100000};
                     nanosleep(&ts, NULL);
                 }
-                if (stop_flag) {
+                if (g_stop) {
                     spsc_push(&free_queue, buf);
                     break;
                 }
@@ -1342,30 +1363,30 @@ int main(int argc, char **argv) {
     }
 
     /* Request shutdown and unblock threads. */
-    stop_flag = 1;
+    g_stop = 1;
     pthread_join(proc_thread, NULL);
     pthread_join(out_thread, NULL);
 
     if (g_app.verbose) {
         const unsigned long dropped = atomic_load_explicit(&blocks_dropped, memory_order_relaxed);
-        fprintf(stderr, "\n=== Statistics ===\n");
-        fprintf(stderr, "Blocks processed: %lu\n", stats.total_blocks);
+        warn_msg("=== Statistics ===");
+        warn_msg("Blocks processed: %lu", stats.total_blocks);
         {
             const unsigned long total = stats.total_blocks + dropped;
             if (total > 0) {
-                fprintf(stderr, "Blocks dropped:   %lu (%.2f%%)\n", dropped,
-                        100.0 * (double)dropped / (double)total);
+                warn_msg("Blocks dropped:   %lu (%.2f%%)", dropped,
+                         100.0 * (double)dropped / (double)total);
             } else {
-                fprintf(stderr, "Blocks dropped:   %lu (no data processed)\n", dropped);
+                warn_msg("Blocks dropped:   %lu (no data processed)", dropped);
             }
         }
-        fprintf(stderr, "Time/block: avg %.2f ms (min %.2f, max %.2f)\n", stats.avg_time_ms,
-                stats.min_time_ms, stats.max_time_ms);
-        fprintf(stderr, "Budget @ 135 MSPS: 1.94 ms/block\n");
+        warn_msg("Time/block: avg %.2f ms (min %.2f, max %.2f)", stats.avg_time_ms,
+                 stats.min_time_ms, stats.max_time_ms);
+        warn_msg("Budget @ 135 MSPS: 1.94 ms/block");
         if (stats.avg_time_ms > 0) {
-            fprintf(stderr, "Headroom: %.1f%%\n", 100.0 * (1.94 - stats.avg_time_ms) / 1.94);
+            warn_msg("Headroom: %.1f%%", 100.0 * (1.94 - stats.avg_time_ms) / 1.94);
         }
-        fprintf(stderr, "Samples output: %lu\n", samples_processed);
+        warn_msg("Samples output: %lu", samples_processed);
     }
 
     if (g_app.output_fd >= 0) {

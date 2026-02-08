@@ -67,7 +67,8 @@ pipes, redirection, or FIFOs.
 ### Signals
 
 - `SIGINT`, `SIGTERM`, `SIGHUP` -- Clean shutdown. All queued blocks are
-  drained through the pipeline before the process exits (no silent data loss).
+  drained through the pipeline before the process exits (no silent data loss
+  while output is connected).
 - `SIGUSR1` -- Print performance statistics to stderr. Without `-v`, prints a
   compact one-line summary. With `-v`, prints a detailed multi-line block.
 - `SIGPIPE` -- Ignored; handled internally to allow downstream reconnects.
@@ -106,6 +107,16 @@ For a complete GQRX relay setup with mbuffer, see `rx888_dsp_to_gqrx.sh`.
 - The program requires an AVX2 + FMA capable CPU and will not run otherwise.
 - Shutdown is clean: on signal or EOF, all blocks already in the pipeline are
   processed and written before the process exits.
+- When using `-o PATH` (FIFO output), blocks are dropped if no reader is
+  connected. Drop counts are reported via SIGUSR1 and at shutdown. To avoid
+  startup drops, start the FIFO consumer before the producer.
+- If the reader disconnects mid-stream (EPIPE), rx888_dsp closes the FIFO and
+  attempts to reconnect. Blocks are dropped while disconnected.
+- On shutdown, queued blocks are drained through the pipeline. If the FIFO has
+  no reader during drain, remaining blocks are dropped rather than blocking
+  the exit.
+- `--block-on-full` controls backpressure between the input reader and the
+  processing thread. It does not affect FIFO writer behavior.
 
 ---
 

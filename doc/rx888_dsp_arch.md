@@ -122,7 +122,8 @@ The application uses three threads:
 
 3. **Output Thread**
    - Writes IQ data to stdout or a FIFO
-   - Handles downstream disconnect/reconnect gracefully
+   - Handles downstream disconnect/reconnect gracefully (drops blocks
+     while disconnected; see FIFO behavior in rx888_dsp.md)
 
 Threads communicate using lock-free single-producer/single-consumer (SPSC)
 queues implemented with C11 atomics.
