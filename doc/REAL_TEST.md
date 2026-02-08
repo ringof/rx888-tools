@@ -12,12 +12,19 @@ and signal handling under load.
 - `mbuffer` installed
 - Optional: 50-ohm terminator on RF input (for consistent noise floor)
 
+**Note:** The FX3 boots in DFU mode (PID `0x00f3`) after every
+power-cycle. All commands below include `-f firmware/SDDC_FX3.img` to
+upload firmware on first use. After a successful upload the device
+re-enumerates to app mode (PID `0x00f1`) and subsequent runs in the
+same power cycle do not strictly require `-f`, but including it is
+harmless and keeps the commands copy-paste safe.
+
 ---
 
 ## 1. rx888_stream: device discovery and streaming
 
 ```sh
-./rx888_stream -v -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -v -s 135000000 -q 32 -p 1024 \
   | head -c $((64*1024*1024)) > /tmp/rx888_smoke.raw
 echo "exit=$?"
 ls -la /tmp/rx888_smoke.raw
@@ -39,7 +46,7 @@ ls -la /tmp/rx888_smoke.raw
 ## 2. rx888_stream: broken pipe handling
 
 ```sh
-./rx888_stream -s 135000000 -q 32 -p 1024 | head -c 1 > /dev/null
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 | head -c 1 > /dev/null
 echo "broken pipe exit=$?"
 ```
 
@@ -55,7 +62,7 @@ echo "broken pipe exit=$?"
 ## 3. rx888_stream: sample sanity
 
 ```sh
-./rx888_stream -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
   | head -c $((64*1024*1024)) \
   | python3 -c "
 import sys, numpy as np
@@ -76,7 +83,7 @@ and write_all.
 ## 4. rx888_dsp: DSP chain under real data
 
 ```sh
-./rx888_stream -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
   | ./rx888_dsp -v \
   | head -c $((270*1024*1024)) > /tmp/dsp_test.cf32
 echo "exit=$?"
@@ -97,7 +104,7 @@ check (Change 15) passes on a real AVX2 system, error prefixes
 
 ```sh
 rm -rf /tmp/pipeline_test
-./rx888_stream -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
   | ./rx888_dsp --block-on-full -v \
   | mbuffer -m 2G -q \
   | timeout --signal=INT 30 ./iqrecord /tmp/pipeline_test \
@@ -162,7 +169,7 @@ bash tests/kill_iqrecord_test.sh /tmp/sigint_hw_test sigint 5
 ## 7. SIGUSR1 stats (rx888_dsp)
 
 ```sh
-./rx888_stream -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
   | ./rx888_dsp --block-on-full -v > /dev/null &
 PIPELINE_PID=$!
 sleep 3
@@ -197,7 +204,7 @@ rx888_dsp: Samples output: ...
 
 ```sh
 rm -rf /tmp/soak_test
-./rx888_stream -s 135000000 -q 32 -p 1024 \
+./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
   | ./rx888_dsp --block-on-full -v \
   | mbuffer -m 4G -q \
   | ./iqrecord /tmp/soak_test --freq 7100000 --desc "30-minute soak test" &
