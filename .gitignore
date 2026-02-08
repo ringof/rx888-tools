@@ -1,0 +1,20 @@
+# Compiled binaries
+rx888_stream
+rx888_dsp
+iqrecord
+
+# Object files
+*.o
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Build artifacts
+*.d
