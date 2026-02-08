@@ -14,6 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define PROG_NAME "iqrecord"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -38,6 +40,7 @@ static void on_signal(int signo) {
 
 
 static void die(const char *fmt, ...) {
+  fprintf(stderr, PROG_NAME ": ");
   va_list ap;
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
@@ -47,6 +50,7 @@ static void die(const char *fmt, ...) {
 }
 
 static void warn_msg(const char *fmt, ...) {
+  fprintf(stderr, PROG_NAME ": ");
   va_list ap;
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
@@ -205,7 +209,7 @@ static void maybe_fsync(int fd, bool do_fsync, const char *what) {
   if (!do_fsync) return;
   if (fd < 0) return;
   if (fsync(fd) != 0) {
-    fprintf(stderr, "warning: fsync(%s) failed: %s\n", what, strerror(errno));
+    warn_msg("fsync(%s) failed: %s", what, strerror(errno));
   }
 }
 
@@ -415,8 +419,8 @@ static void finalize_run_json(FILE *runf, const char *outdir,
   snprintf(tmp_path, sizeof(tmp_path), "%s/run.json.tmp", outdir);
   snprintf(final_path, sizeof(final_path), "%s/run.json", outdir);
   if (rename(tmp_path, final_path) != 0)
-    fprintf(stderr, "iqrecord: rename('%s' -> '%s') failed: %s\n",
-            tmp_path, final_path, strerror(errno));
+    warn_msg("rename('%s' -> '%s') failed: %s",
+             tmp_path, final_path, strerror(errno));
 }
 
 int main(int argc, char **argv) {
@@ -451,7 +455,7 @@ int main(int argc, char **argv) {
   }
 
   if (isatty(STDIN_FILENO)) {
-    fprintf(stderr, "iqrecord: stdin is a TTY; provide input via a pipe or redirection\n");
+    warn_msg("stdin is a TTY; provide input via a pipe or redirection");
     return 1;
   }
 
@@ -559,7 +563,7 @@ int main(int argc, char **argv) {
 
       const uint8_t *p = buf + (off_samples * BYTES_PER_SAMPLE);
       if (write_all(outfd, p, to_write_bytes) != 0) {
-        fprintf(stderr, "iqrecord: write failed: %s\n", strerror(errno));
+        warn_msg("write failed: %s", strerror(errno));
         write_error = true;
         g_stop = 1;
         break;

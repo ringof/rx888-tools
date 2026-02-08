@@ -30,6 +30,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -163,7 +164,7 @@ static app_ctx_t g_app = {
     .output_path = NULL
 };
 
-#define PROGRAM_NAME "rx888_dsp"
+#define PROG_NAME "rx888_dsp"
 #ifndef EXIT_USAGE
 #define EXIT_USAGE 2
 #endif
@@ -172,11 +173,35 @@ static app_ctx_t g_app = {
 #define RX888_DSP_VERSION "dev"
 #endif
 
+__attribute__((unused))
+static void die(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
+}
 
-/* Logging: errors always go to stderr; info only with -v. */
-#define LOG_ERR(fmt, ...)  fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__)
-#define LOG_SYSERR(ctx)    fprintf(stderr, PROGRAM_NAME ": %s: %s\n", (ctx), strerror(errno))
-#define LOG_INFO(fmt, ...) do { if (g_app.verbose) fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__); } while (0)
+static void warn_msg(const char *fmt, ...) {
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void info_msg(const char *fmt, ...) {
+    if (!g_app.verbose) return;
+    fprintf(stderr, PROG_NAME ": ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 
 static _Atomic unsigned long samples_processed = 0;
 static _Atomic unsigned long blocks_dropped = 0;
@@ -817,7 +842,7 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
 
 static void* processing_thread(void *arg) {
     (void)arg;
-    LOG_INFO("Processing thread started\n");
+    info_msg("Processing thread started");
     
     // Allocate working buffers for Stage 4 (HB2) using posix_memalign.
 // NOTE: aligned_alloc() requires size be a multiple of alignment; these sizes are not.
@@ -836,7 +861,7 @@ static void* processing_thread(void *arg) {
     if (posix_memalign((void**)&hb2_oQ,   64, (size_t)o_len   * sizeof(float)) != 0) hb2_oQ   = NULL;
 
     if (!hb2_extI || !hb2_extQ || !hb2_eI || !hb2_eQ || !hb2_oI || !hb2_oQ) {
-        LOG_ERR("failed to allocate Stage4 working buffers (out of memory?)\n");
+        warn_msg("failed to allocate Stage4 working buffers (out of memory?)");
         free(hb2_extI); hb2_extI = NULL;
         free(hb2_extQ); hb2_extQ = NULL;
         free(hb2_eI);   hb2_eI   = NULL;
@@ -869,22 +894,21 @@ static void* processing_thread(void *arg) {
                     (stats.avg_time_ms > 0) ? (100.0 * (1.94 - stats.avg_time_ms) / 1.94) : 0.0;
 
             if (!g_app.verbose) {
-                fprintf(stderr,
-                        PROGRAM_NAME ": SIGUSR1: blocks=%lu dropped=%lu(%.2f%%) "
-                                     "avg=%.2fms headroom=%.1f%% out=%lu\n",
-                        stats.total_blocks, dropped, drop_pct, stats.avg_time_ms, headroom_pct,
-                        samples_processed);
+                warn_msg("SIGUSR1: blocks=%lu dropped=%lu(%.2f%%) "
+                         "avg=%.2fms headroom=%.1f%% out=%lu",
+                         stats.total_blocks, dropped, drop_pct, stats.avg_time_ms, headroom_pct,
+                         samples_processed);
             } else {
-                fprintf(stderr, PROGRAM_NAME ": === Statistics (SIGUSR1) ===\n");
-                fprintf(stderr, PROGRAM_NAME ": Blocks processed: %lu\n", stats.total_blocks);
+                warn_msg("=== Statistics (SIGUSR1) ===");
+                warn_msg("Blocks processed: %lu", stats.total_blocks);
                 if (total > 0) {
-                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (%.2f%%)\n", dropped, drop_pct);
+                    warn_msg("Blocks dropped:   %lu (%.2f%%)", dropped, drop_pct);
                 } else {
-                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (no data processed)\n", dropped);
+                    warn_msg("Blocks dropped:   %lu (no data processed)", dropped);
                 }
-                fprintf(stderr, PROGRAM_NAME ": Time/block: avg %.2f ms (min %.2f, max %.2f)\n",
-                        stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
-                fprintf(stderr, PROGRAM_NAME ": Samples output: %lu\n", samples_processed);
+                warn_msg("Time/block: avg %.2f ms (min %.2f, max %.2f)",
+                         stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
+                warn_msg("Samples output: %lu", samples_processed);
             }
         }
 
@@ -990,7 +1014,7 @@ static void output_and_free(buffer_t *buf) {
 
 static void* output_thread(void *arg) {
     (void)arg;
-    LOG_INFO("Output thread started\n");
+    info_msg("Output thread started");
 
     /* If -o PATH was provided, require it to be a FIFO.
        This avoids accidentally writing IQ to a regular file (disk fill) and
@@ -998,13 +1022,13 @@ static void* output_thread(void *arg) {
     if (g_app.output_path) {
         struct stat st;
         if (stat(g_app.output_path, &st) != 0) {
-            LOG_ERR("output path '%s' not found (create with: mkfifo %s)\n",
-                    g_app.output_path, g_app.output_path);
+            warn_msg("output path '%s' not found (create with: mkfifo %s)",
+                     g_app.output_path, g_app.output_path);
             g_stop = 1;
             return NULL;
         }
         if (!S_ISFIFO(st.st_mode)) {
-            LOG_ERR("output path '%s' is not a FIFO\n", g_app.output_path);
+            warn_msg("output path '%s' is not a FIFO", g_app.output_path);
             g_stop = 1;
             return NULL;
         }
@@ -1028,11 +1052,11 @@ static void* output_thread(void *arg) {
                 int flags = fcntl(fd, F_GETFL);
                 if (flags >= 0) (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
                 g_app.output_fd = fd;
-                LOG_INFO("Connected to FIFO: %s\n", g_app.output_path);
+                info_msg("Connected to FIFO: %s", g_app.output_path);
             } else {
                 /* ENXIO: FIFO exists but no reader yet (normal). */
                 if (errno != ENXIO && errno != EINTR) {
-                    LOG_ERR("FIFO open failed: %s\n", strerror(errno));
+                    warn_msg("FIFO open failed: %s", strerror(errno));
                 }
             }
         }
@@ -1070,7 +1094,7 @@ static void* output_thread(void *arg) {
                 break;
             }
             if (w < 0) {
-                LOG_ERR("write failed: %s\n", strerror(errno));
+                warn_msg("write failed: %s", strerror(errno));
                 g_stop = 1;
                 break;
             }
@@ -1133,12 +1157,12 @@ static void sigusr1_handler(int sig) {
 
 
 static void print_version(FILE *out) {
-    fprintf(out, "%s %s\n", PROGRAM_NAME, RX888_DSP_VERSION);
+    fprintf(out, "%s %s\n", PROG_NAME, RX888_DSP_VERSION);
 }
 
 static void usage_short(FILE *out) {
-    fprintf(out, "Usage: %s [OPTIONS]\n", PROGRAM_NAME);
-    fprintf(out, "Try '%s --help' for more information.\n", PROGRAM_NAME);
+    fprintf(out, "Usage: %s [OPTIONS]\n", PROG_NAME);
+    fprintf(out, "Try '%s --help' for more information.\n", PROG_NAME);
 }
 
 static void help_long(FILE *out) {
@@ -1170,7 +1194,7 @@ static void help_long(FILE *out) {
             "Examples:\n"
             "  cat capture.i16 | %s --block-on-full -v > /tmp/iq.fifo\n"
             "\n",
-            PROGRAM_NAME, PROGRAM_NAME);
+            PROG_NAME, PROG_NAME);
 }
 
 
@@ -1215,19 +1239,19 @@ int main(int argc, char **argv) {
     }
 
     if (optind < argc) {
-        LOG_ERR("unexpected argument: '%s'\n", argv[optind]);
+        warn_msg("unexpected argument: '%s'", argv[optind]);
         usage_short(stderr);
         return EXIT_USAGE;
     }
 
     /* -------- TTY safety rails -------- */
     if (isatty(STDIN_FILENO)) {
-        LOG_ERR("stdin is a TTY; provide input via a pipe or redirection\n");
+        warn_msg("stdin is a TTY; provide input via a pipe or redirection");
         usage_short(stderr);
         return EXIT_USAGE;
     }
     if (g_app.output_path == NULL && isatty(STDOUT_FILENO)) {
-        LOG_ERR("stdout is a TTY; redirect output or use -o PATH (FIFO)\n");
+        warn_msg("stdout is a TTY; redirect output or use -o PATH (FIFO)");
         usage_short(stderr);
         return EXIT_USAGE;
     }
@@ -1270,10 +1294,10 @@ int main(int argc, char **argv) {
     }
 
     if (g_app.verbose) {
-        fprintf(stderr, PROGRAM_NAME ": === rx888-decimate ===\n");
-        fprintf(stderr, PROGRAM_NAME ": Architecture: buffer pool + streaming FIR\n");
-        fprintf(stderr, PROGRAM_NAME ": HB2: folded halfband (59 pairs)\n");
-        fprintf(stderr, PROGRAM_NAME ": Output: %s\n", g_app.output_path ? g_app.output_path : "stdout");
+        info_msg("=== rx888-decimate ===");
+        info_msg("Architecture: buffer pool + streaming FIR");
+        info_msg("HB2: folded halfband (59 pairs)");
+        info_msg("Output: %s", g_app.output_path ? g_app.output_path : "stdout");
         fprintf(stderr, "\n");
     }
 
@@ -1282,13 +1306,13 @@ int main(int argc, char **argv) {
 
     rc = pthread_create(&proc_thread, NULL, processing_thread, NULL);
     if (rc != 0) {
-        LOG_ERR("pthread_create(processing_thread) failed: %s\n", strerror(rc));
+        warn_msg("pthread_create(processing_thread) failed: %s", strerror(rc));
         return 1;
     }
 
     rc = pthread_create(&out_thread, NULL, output_thread, NULL);
     if (rc != 0) {
-        LOG_ERR("pthread_create(output_thread) failed: %s\n", strerror(rc));
+        warn_msg("pthread_create(output_thread) failed: %s", strerror(rc));
         g_stop = 1;
         pthread_join(proc_thread, NULL);
         return 1;
@@ -1316,11 +1340,11 @@ int main(int argc, char **argv) {
             break; /* clean EOF */
         }
         if (n < 0) {
-            LOG_SYSERR("read");
+            warn_msg("read: %s", strerror(errno));
             break;
         }
         if ((size_t)n < INPUT_SAMPLES * sizeof(int16_t)) {
-            LOG_ERR("Input stream ended mid-block (%zd bytes).\n", n);
+            warn_msg("Input stream ended mid-block (%zd bytes).", n);
             break;
         }
 
