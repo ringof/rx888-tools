@@ -462,7 +462,9 @@ int main(int argc, char **argv) {
   const size_t block_bytes_want = (size_t)(block_samples * BYTES_PER_SAMPLE);
     // Buffer must hold up to (carry_len bytes from prior read) + (newly read bytes).
   // carry_len is always < BYTES_PER_SAMPLE, so allocate a small explicit headroom.
-  const size_t buf_bytes = block_bytes_want + (size_t)BYTES_PER_SAMPLE - 1;
+  const size_t buf_bytes_raw = block_bytes_want + (size_t)BYTES_PER_SAMPLE - 1;
+  // C11 requires aligned_alloc size to be a multiple of alignment; round up.
+  const size_t buf_bytes = (buf_bytes_raw + 4095) & ~(size_t)4095;
 
   uint8_t *buf = (uint8_t *)aligned_alloc(4096, buf_bytes);
   if (!buf) die("aligned_alloc failed");
