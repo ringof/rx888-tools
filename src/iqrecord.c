@@ -335,11 +335,6 @@ static FILE *open_run_json(const char *outdir, const char *created_utc,
     "      \"block_bytes\": %" PRIu64 "\n"
     "    }\n"
     "  },\n"
-    "  \"accounting\": {\n"
-    "    \"files_written\": 0,\n"
-    "    \"samples_written\": 0,\n"
-    "    \"bytes_written\": 0\n"
-    "  },\n"
     "  \"files\": [\n",
     created_utc,
     datatype,
@@ -392,12 +387,11 @@ static void finalize_run_json(FILE *runf,
                              uint64_t files_written,
                              uint64_t samples_written,
                              uint64_t bytes_written) {
-  // Close files array, then patch accounting by appending a summary block.
-  // (MVP: we can’t “edit earlier keys” without buffering; so we add a final summary.)
+  // Close files array, then append accounting summary.
   fprintf(runf,
     "\n"
     "  ],\n"
-    "  \"final_accounting\": {\n"
+    "  \"accounting\": {\n"
     "    \"files_written\": %" PRIu64 ",\n"
     "    \"samples_written\": %" PRIu64 ",\n"
     "    \"bytes_written\": %" PRIu64 "\n"
