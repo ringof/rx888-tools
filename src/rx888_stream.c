@@ -1144,6 +1144,13 @@ int main(int argc, char **argv) {
         info_msg(0, "Randomizer %s, Dither %s", g_randomizer ? "On" : "Off", g_dither ? "On" : "Off");
         info_msg(0, "Gain Mode: %s, Gain: %u, Att: %u", (g_gain & 0x80u) ? "High" : "Low", (g_gain & 0x7fu), g_att);
         info_msg(0, "Sample fixup: %s", g_fixup_samples ? "On" : "Off");
+        uint64_t xfer_bytes = (uint64_t)g_req_packets * sep.max_packet;
+        uint64_t total_bytes = xfer_bytes * g_queue_depth;
+        info_msg(0, "transfer_size=%" PRIu64 " bytes (%u packets x %u bytes)",
+                 xfer_bytes, g_req_packets, sep.max_packet);
+        info_msg(0, "queue_depth=%u, total_inflight=%" PRIu64 " bytes (%.2f MiB)",
+                 g_queue_depth, total_bytes, (double)total_bytes / (1024.0 * 1024.0));
+        info_msg(0, "minimum usbfs_memory_mb=%" PRIu64, (total_bytes + (1 << 20) - 1) >> 20);
     }
 
     /* Apply front-end and clock configuration (restored from original) */
