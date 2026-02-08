@@ -202,6 +202,13 @@ rx888_dsp: Samples output: ...
 
 ## 8. Sustained streaming (soak test)
 
+Each 10-second capture file is ~2.7 GB. A 30-minute run would produce
+~180 files (~480 GB), which will fill most SSDs. To exercise the full
+pipeline without exhausting disk, run a sidecar loop that prunes old
+data files — keeping only the 3 most recent on disk at any time.
+Metadata files (`.sigmf-meta`) are tiny and kept for post-run
+verification.
+
 ```sh
 rm -rf /tmp/soak_test
 ./rx888_stream -f firmware/SDDC_FX3.img -s 135000000 -q 32 -p 1024 \
@@ -209,6 +216,14 @@ rm -rf /tmp/soak_test
   | mbuffer -m 4G -q \
   | ./iqrecord /tmp/soak_test --freq 7100000 --desc "30-minute soak test" &
 PIPELINE_PID=$!
+
+# Sidecar: keep only the 3 newest .sigmf-data files to limit disk use (~8 GB peak)
+while sleep 10; do
+  ls -1t /tmp/soak_test/cap_*.sigmf-data 2>/dev/null \
+    | tail -n +4 \
+    | xargs rm -f --
+done &
+PRUNE_PID=$!
 
 # Let it run, periodically check stats
 for i in 1 2 3; do
@@ -219,22 +234,53 @@ done
 # Stop after ~30 minutes
 kill -INT $(pgrep -x iqrecord) 2>/dev/null
 wait $PIPELINE_PID 2>/dev/null
+kill $PRUNE_PID 2>/dev/null
+wait $PRUNE_PID 2>/dev/null
 
 # Verify
-python3 -m json.tool /tmp/soak_test/run.json | tail -10
-echo "Files:"
-ls -lh /tmp/soak_test/cap_*.sigmf-data | wc -l
+echo "=== run.json accounting ==="
+python3 -c "
+import json
+d = json.load(open('/tmp/soak_test/run.json'))
+a = d['accounting']
+print(f\"files: {a['files_written']}, samples: {a['samples_written']}, bytes: {a['bytes_written']}\")
+assert 'final_accounting' not in d, 'ERROR: final_accounting still present'
+print('accounting key: OK')
+"
+
+echo "=== file counts ==="
+echo "data files on disk: $(ls /tmp/soak_test/cap_*.sigmf-data 2>/dev/null | wc -l)"
+echo "meta files on disk: $(ls /tmp/soak_test/cap_*.sigmf-meta 2>/dev/null | wc -l)"
+
+echo "=== missing meta check ==="
+missing=0
+for f in /tmp/soak_test/cap_*.sigmf-data; do
+  m="${f%.sigmf-data}.sigmf-meta"
+  [ -f "$m" ] || { echo "MISSING: $(basename $m)"; missing=$((missing+1)); }
+done
+echo "Missing meta count: $missing"
+
+echo "=== tmp file check ==="
+ls /tmp/soak_test/*.tmp 2>/dev/null && echo "FAIL: .tmp files remain" || echo "No .tmp files: OK"
+
+echo "=== dmesg USB errors ==="
+dmesg | grep -i "usb.*error\|xhci.*error" | tail -5 || echo "No USB errors"
 ```
 
 **Expected:**
-- ~180 files (30 minutes / 10 seconds per file)
+- `run.json` references ~180 files (30 minutes / 10 seconds per file)
+- Only 2-3 `.sigmf-data` files on disk (pruner cleaned the rest); ~8 GB peak
+- All ~180 `.sigmf-meta` files present (pruner only removes `.sigmf-data`)
+- Zero missing `.sigmf-meta` for any `.sigmf-data` still on disk
+- No `.tmp` files remaining
 - Zero dropped blocks in SIGUSR1 stats
 - Valid `run.json` with correct accounting
 - No USB errors in `dmesg`
 
 **Validates:** Long-duration stability across all changes. Any
 regression in signal handling, memory management, or I/O paths will
-surface here.
+surface here. The pruner exercises iqrecord's ability to keep writing
+while earlier files are deleted underneath it.
 
 ---
 
