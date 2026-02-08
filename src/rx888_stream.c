@@ -59,7 +59,7 @@ static const uint16_t RX888_VID = 0x04b4;
 static const uint16_t RX888_PID_BOOT = 0x00f3; /* needs firmware */
 static const uint16_t RX888_PID_APP  = 0x00f1; /* normal streaming */
 
-static _Atomic int g_stop = 0;
+static volatile sig_atomic_t g_stop = 0;
 
 static int g_verbose = 0;
 static int g_dither = 0;
