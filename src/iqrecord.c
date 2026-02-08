@@ -422,8 +422,8 @@ static void finalize_run_json(FILE *runf, const char *outdir,
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
-      "usage: %s OUTDIR [--freq HZ] [--desc TEXT]\n"
-      "MVP defaults: datatype=cf32_le Fs=33750000 samples_per_file=337500000 block_samples=4194304\n",
+      "usage: %s OUTDIR [--freq HZ] [--desc TEXT] [--fsync]\n"
+      "defaults: datatype=cf32_le Fs=33750000 samples_per_file=337500000 block_samples=4194304\n",
       argv[0]
     );
     return 1;
