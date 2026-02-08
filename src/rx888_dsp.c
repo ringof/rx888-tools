@@ -1119,7 +1119,7 @@ static void* output_thread(void *arg) {
 // Signal Handler
 //=============================================================================
 
-static void signal_handler(int sig) {
+static void on_signal(int sig) {
     (void)sig;
     g_stop = 1;
 }
@@ -1235,7 +1235,7 @@ int main(int argc, char **argv) {
     /* -------- signals -------- */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
+    sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
 
