@@ -887,181 +887,181 @@ int main(int argc, char **argv) {
 
     /* Options */
     while (1) {
-	/* in your option parsing loop */
-	static struct option long_opts[] = {
-		{"firmware",       required_argument, 0, 'f'},
-		{"verbose",        optional_argument, 0, 'v'},
-		{"dither",         no_argument,       0, 'd'},
-		{"rand",           no_argument,       0, 'r'},
+    /* in your option parsing loop */
+    static struct option long_opts[] = {
+        {"firmware",       required_argument, 0, 'f'},
+        {"verbose",        optional_argument, 0, 'v'},
+        {"dither",         no_argument,       0, 'd'},
+        {"rand",           no_argument,       0, 'r'},
 
-		{"samplerate",     required_argument, 0, 's'},
-		{"gainmode",       required_argument, 0, 'm'},
-		{"gain",           required_argument, 0, 'g'},
-		{"att",            required_argument, 0, 'a'},
-		{"fixup",          no_argument,       0, 1003},
+        {"samplerate",     required_argument, 0, 's'},
+        {"gainmode",       required_argument, 0, 'm'},
+        {"gain",           required_argument, 0, 'g'},
+        {"att",            required_argument, 0, 'a'},
+        {"fixup",          no_argument,       0, 1003},
 
-		{"queuedepth",     required_argument, 0, 'q'},
-		{"reqsize",        required_argument, 0, 'p'},
-		{"ctrl-timeout",   required_argument, 0, 1001},
-		{"stream-timeout", required_argument, 0, 1002},
-		{"watchdog-timeout", required_argument, 0, 1004},
+        {"queuedepth",     required_argument, 0, 'q'},
+        {"reqsize",        required_argument, 0, 'p'},
+        {"ctrl-timeout",   required_argument, 0, 1001},
+        {"stream-timeout", required_argument, 0, 1002},
+        {"watchdog-timeout", required_argument, 0, 1004},
 
-		{"help",           no_argument,       0, 'h'},
-		{0,0,0,0}
-	};
+        {"help",           no_argument,       0, 'h'},
+        {0,0,0,0}
+    };
 
-	int opt_idx = 0;
-	int c = getopt_long(argc, argv, "f:v::drs:m:g:a:q:p:h", long_opts, &opt_idx);
-	if (c == -1) break;
+    int opt_idx = 0;
+    int c = getopt_long(argc, argv, "f:v::drs:m:g:a:q:p:h", long_opts, &opt_idx);
+    if (c == -1) break;
 
-	switch (c) {
-		case 'f':
-		g_firmware_path = optarg;
-		break;
+    switch (c) {
+        case 'f':
+        g_firmware_path = optarg;
+        break;
 
-		case 'v':
-		if (optarg) g_verbose = (int)strtoul(optarg, NULL, 10);
-		else g_verbose = 1;
-		break;
+        case 'v':
+        if (optarg) g_verbose = (int)strtoul(optarg, NULL, 10);
+        else g_verbose = 1;
+        break;
 
-		case 'd':
-		g_dither = 1;
-		break;
+        case 'd':
+        g_dither = 1;
+        break;
 
-		case 'r':
-		g_randomizer = 1;
-		break;
+        case 'r':
+        g_randomizer = 1;
+        break;
 
-		case 's': {
-		unsigned int sr = 0;
-		if (parse_u32(optarg, &sr) != 0 || !samplerate_allowed(sr)) {
-			warn_msg("Unsupported samplerate '%s'. Supported: 32000000, 135000000",
-			        optarg ? optarg : "(null)");
-			return 2;
-		}
-		g_samplerate = sr;
-		break;
-		}
+        case 's': {
+        unsigned int sr = 0;
+        if (parse_u32(optarg, &sr) != 0 || !samplerate_allowed(sr)) {
+            warn_msg("Unsupported samplerate '%s'. Supported: 32000000, 135000000",
+                    optarg ? optarg : "(null)");
+            return 2;
+        }
+        g_samplerate = sr;
+        break;
+        }
 
-		case 'm':
-		if (strcmp(optarg, "high") == 0) {
-			g_gain |= 0x80u;
-		} else if (strcmp(optarg, "low") == 0) {
-			g_gain &= 0x7fu;
-		} else {
-			warn_msg("Invalid gain mode '%s' (use 'low' or 'high')", optarg);
-			return 2;
-		}
-		break;
+        case 'm':
+        if (strcmp(optarg, "high") == 0) {
+            g_gain |= 0x80u;
+        } else if (strcmp(optarg, "low") == 0) {
+            g_gain &= 0x7fu;
+        } else {
+            warn_msg("Invalid gain mode '%s' (use 'low' or 'high')", optarg);
+            return 2;
+        }
+        break;
 
-		case 'g': {
-		long gv = 0;
-		if (parse_i32(optarg, &gv) != 0 || gv < 0 || gv > 127) {
-			warn_msg("Invalid gain value '%s' (expected 0..127)", optarg);
-			return 2;
-		}
-		g_gain = (g_gain & 0x80u) | (unsigned int)gv;
-		break;
-		}
+        case 'g': {
+        long gv = 0;
+        if (parse_i32(optarg, &gv) != 0 || gv < 0 || gv > 127) {
+            warn_msg("Invalid gain value '%s' (expected 0..127)", optarg);
+            return 2;
+        }
+        g_gain = (g_gain & 0x80u) | (unsigned int)gv;
+        break;
+        }
 
-		case 'a': {
-		long av = 0;
-		if (parse_i32(optarg, &av) != 0 || av < 0 || av > 63) {
-			warn_msg("Invalid attenuation value '%s' (expected 0..63)", optarg);
-			return 2;
-		}
-		g_att = (unsigned int)av;
-		break;
-		}
+        case 'a': {
+        long av = 0;
+        if (parse_i32(optarg, &av) != 0 || av < 0 || av > 63) {
+            warn_msg("Invalid attenuation value '%s' (expected 0..63)", optarg);
+            return 2;
+        }
+        g_att = (unsigned int)av;
+        break;
+        }
 
-		case 'q': {
-		unsigned int qd = 0;
-		if (parse_u32(optarg, &qd) != 0 || qd < 1 || qd > 4096) {
-			warn_msg("Invalid queuedepth '%s'", optarg);
-			return 2;
-		}
-		g_queue_depth = qd;
-		break;
-		}
+        case 'q': {
+        unsigned int qd = 0;
+        if (parse_u32(optarg, &qd) != 0 || qd < 1 || qd > 4096) {
+            warn_msg("Invalid queuedepth '%s'", optarg);
+            return 2;
+        }
+        g_queue_depth = qd;
+        break;
+        }
 
-		case 'p': {
-		unsigned int rp = 0;
-		if (parse_u32(optarg, &rp) != 0 || rp < 1 || rp > (1024u * 1024u)) {
-			warn_msg("Invalid reqsize '%s'", optarg);
-			return 2;
-		}
-		g_req_packets = rp;
-		break;
-		}
+        case 'p': {
+        unsigned int rp = 0;
+        if (parse_u32(optarg, &rp) != 0 || rp < 1 || rp > (1024u * 1024u)) {
+            warn_msg("Invalid reqsize '%s'", optarg);
+            return 2;
+        }
+        g_req_packets = rp;
+        break;
+        }
 
-		case 1001: { /* --ctrl-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			warn_msg("Invalid ctrl-timeout '%s'", optarg);
-			return 2;
-		}
-		g_ctrl_timeout_ms = ms;
-		break;
-		}
+        case 1001: { /* --ctrl-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid ctrl-timeout '%s'", optarg);
+            return 2;
+        }
+        g_ctrl_timeout_ms = ms;
+        break;
+        }
 
-		case 1002: { /* --stream-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			warn_msg("Invalid stream-timeout '%s'", optarg);
-			return 2;
-		}
-		g_stream_timeout_ms = ms;
-		break;
-		}
+        case 1002: { /* --stream-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid stream-timeout '%s'", optarg);
+            return 2;
+        }
+        g_stream_timeout_ms = ms;
+        break;
+        }
 
-		case 1004: { /* --watchdog-timeout */
-		unsigned int ms = 0;
-		if (parse_u32(optarg, &ms) != 0) {
-			warn_msg("Invalid watchdog-timeout '%s'", optarg);
-			return 2;
-		}
-		g_watchdog_ms = ms;
-		break;
-		}
+        case 1004: { /* --watchdog-timeout */
+        unsigned int ms = 0;
+        if (parse_u32(optarg, &ms) != 0) {
+            warn_msg("Invalid watchdog-timeout '%s'", optarg);
+            return 2;
+        }
+        g_watchdog_ms = ms;
+        break;
+        }
 
-		case 1003: /* --fixup */
-		g_fixup_samples = 1;
-		break;
+        case 1003: /* --fixup */
+        g_fixup_samples = 1;
+        break;
 
-		case 'h':
-		default:
-		usage(argv[0]);
-		return (c == 'h') ? 0 : 2;
+        case 'h':
+        default:
+        usage(argv[0]);
+        return (c == 'h') ? 0 : 2;
         } 
     }
 
-	/* Sync verbose for ezusb.c before anything else */
-	verbose = g_verbose;
+    /* Sync verbose for ezusb.c before anything else */
+    verbose = g_verbose;
 
-	/* After parsing options */
-	if (!samplerate_allowed(g_samplerate)) {
-		warn_msg("Internal error: samplerate %u not allowed", g_samplerate);
-		return 2;
-	}
+    /* After parsing options */
+    if (!samplerate_allowed(g_samplerate)) {
+        warn_msg("Internal error: samplerate %u not allowed", g_samplerate);
+        return 2;
+    }
 
-	/* Gain sanity: g_gain bit7 = mode, low 7 bits = 0..127 */
-	if ((g_gain & 0x7fu) > 127u) {
-		warn_msg("Invalid gain internal value: 0x%02x", g_gain);
-		return 2;
-	}
-	if (g_att > 63u) {
-		warn_msg("Invalid attenuation internal value: %u", g_att);
-		return 2;
-	}
-	if (g_queue_depth == 0 || g_req_packets == 0) {
-		warn_msg("Invalid USB sizing (-q/-p)");
-		return 2;
-	}
+    /* Gain sanity: g_gain bit7 = mode, low 7 bits = 0..127 */
+    if ((g_gain & 0x7fu) > 127u) {
+        warn_msg("Invalid gain internal value: 0x%02x", g_gain);
+        return 2;
+    }
+    if (g_att > 63u) {
+        warn_msg("Invalid attenuation internal value: %u", g_att);
+        return 2;
+    }
+    if (g_queue_depth == 0 || g_req_packets == 0) {
+        warn_msg("Invalid USB sizing (-q/-p)");
+        return 2;
+    }
 
-	if (isatty(STDOUT_FILENO)) {
-		warn_msg("stdout is a TTY; redirect to a file or pipe");
-		return 2;
-	}
+    if (isatty(STDOUT_FILENO)) {
+        warn_msg("stdout is a TTY; redirect to a file or pipe");
+        return 2;
+    }
 
     int rc = 0;
     libusb_context *ctx = NULL;
