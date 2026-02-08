@@ -32,7 +32,7 @@
 #define PATH_MAX 4096
 #endif
 
-// ---- Defaults for your setup ----
+/* ------------------------------ Defaults -------------------------------- */
 static const char *DEFAULT_DATATYPE = "cf32_le";
 static const uint64_t DEFAULT_FS_HZ = 33750000ULL;
 // 10s * 33.75e6 = 337,500,000 samples
@@ -42,6 +42,8 @@ static const uint64_t DEFAULT_BLOCK_SAMPLES = 4194304ULL;
 
 // cf32_le = 2 float32 little endian = 8 bytes per complex sample
 static const uint64_t BYTES_PER_SAMPLE = 8ULL;
+
+/* ----------------------------- Signal / error --------------------------- */
 
 static _Atomic int g_stop = 0;
 
@@ -69,6 +71,9 @@ static void warn_msg(const char *fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
 }
+
+/* ------------------------------- Helpers -------------------------------- */
+
 // Escape a C string for JSON string context (minimal but correct for ASCII/UTF-8 input).
 // Caller must free returned string.
 static char *json_escape(const char *s) {
@@ -225,6 +230,7 @@ static void maybe_fsync(int fd, bool do_fsync, const char *what) {
     }
 }
 
+/* --------------------------- I/O and metadata --------------------------- */
 
 static int open_data_file(const char *outdir, uint64_t index, char *data_path_out, size_t sz) {
     // cap_000000.sigmf-data
@@ -434,6 +440,8 @@ static void finalize_run_json(FILE *runf, const char *outdir,
         warn_msg("rename('%s' -> '%s') failed: %s",
                           tmp_path, final_path, strerror(errno));
 }
+
+/* --------------------------------- Main --------------------------------- */
 
 int main(int argc, char **argv) {
     if (argc < 2) {

@@ -220,9 +220,7 @@ static struct {
     double max_time_ms;
 } stats = {0, 0.0, 1e9, 0.0};
 
-//=============================================================================
-// SPSC Queue (C11 atomics - correct!)
-//=============================================================================
+/* ----------------------------- SPSC Queue ------------------------------- */
 
 static inline void spsc_init(spsc_queue_t *q) {
     atomic_store_explicit(&q->write_idx, 0u, memory_order_relaxed);
@@ -250,9 +248,7 @@ static inline buffer_t* spsc_pop(spsc_queue_t *q) {
     return buf;
 }
 
-//=============================================================================
-// Filter Coefficient Folding
-//=============================================================================
+/* ----------------------- Filter Coefficient Folding --------------------- */
 
 static void init_hb2_coeffs(void) {
     // r=0 uses tap[116], r=58 uses tap[0]
@@ -304,9 +300,7 @@ static ssize_t read_full(int fd, void *buf, size_t bytes)
 }
 
 
-//=============================================================================
-// Stage 1: Convert int16 to complex with -Fs/4 shift
-//=============================================================================
+/* --------------- Stage 1: int16 to complex with -Fs/4 shift ------------- */
 
 static inline void stage1_convert_and_shift_into(const int16_t *in, float *Iptr, float *Qptr) {
     // Convert int16 real samples to complex baseband using a -Fs/4 shift.
@@ -383,9 +377,9 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 }
 
 
-//=============================================================================
-// Stage 2: HB1 with history (streaming FIR) producing SoA I/Q
-// (Stage 1 conversion + -Fs/4 shift is fused here by filling the current-block region of extI/extQ.)
+/* ----------- Stage 2: HB1 streaming FIR, decimate-by-2 (SoA) ----------- */
+// Stage 1 conversion + -Fs/4 shift is fused here by filling the
+// current-block region of extI/extQ.
 //
 // IMPORTANT: This is a *causal* streaming FIR:
 //   y[m] = sum_{k=0..L-1} h[k] * x[2m - k]
@@ -393,7 +387,6 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 // We build ext[] = [history(L-1) | current_block] so ext[H + i] == x[i].
 // Then x[2m-k] maps to ext[H + 2m - k]. This avoids any look-ahead,
 // eliminates bounds checks in the inner loop, and is correct across blocks.
-//=============================================================================
 
 static inline void stage2_hb1_stream_soa(buffer_t *buf) {
     // HB1 decimate-by-2, causal streaming FIR on SoA data:
@@ -458,13 +451,10 @@ static inline void stage2_hb1_stream_soa(buffer_t *buf) {
     memcpy(extQ, extQ + STAGE1_SAMPLES, H * sizeof(float));
 }
 
-//=============================================================================
-// Stage 3: Shift by +Fs/4 (in-place) on SoA
-//
+/* --------------- Stage 3: +Fs/4 shift (in-place, SoA) ------------------- */
 // For each sample index i:
 //   multiply by [1, j, -1, -j] repeating.
 // In SoA this is just sign flips and (I,Q) swaps.
-//=============================================================================
 
 #if 0
 // Reference implementation kept for documentation.
@@ -554,9 +544,7 @@ static inline void stage3_shift_fs4_soa(buffer_t *buf) {
 #endif
 
 
-//=============================================================================
-// Stage 4: HB2 decimate-by-2 using folded halfband symmetry + AVX2 (SoA)
-//
+/* ----------- Stage 4: HB2 decimate-by-2, folded halfband + AVX2 --------- */
 // Halfband properties for HB2 (235 taps):
 //   - All odd taps are 0 except the center tap h[117] ~= 0.5
 //   - Even taps are symmetric
@@ -583,7 +571,6 @@ static inline void stage3_shift_fs4_soa(buffer_t *buf) {
 //   x[2m - (118+2r)] = e[m - (59+r)]
 //
 // This yields contiguous loads for SIMD.
-//=============================================================================
 
 static inline void hb2_decim2_folded_avx2_soa(
     const float * restrict eI,
@@ -836,9 +823,7 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
     memcpy(hb2_extQ, hb2_extQ + STAGE2_SAMPLES, H * sizeof(float));
 }
 
-//=============================================================================
-// Processing Thread
-//=============================================================================
+/* -------------------------- Processing Thread --------------------------- */
 
 static void* processing_thread(void *arg) {
     (void)arg;
@@ -981,9 +966,7 @@ static void* processing_thread(void *arg) {
     return NULL;
 }
 
-//=============================================================================
-// Output Thread (with partial write handling)
-//=============================================================================
+/* ---------------------------- Output Thread ----------------------------- */
 
 /* Write one processed buffer to the output fd and return it to free_queue.
  * Used by both the main output loop and the shutdown drain. */
@@ -1139,9 +1122,7 @@ static void* output_thread(void *arg) {
     return NULL;
 }
 
-//=============================================================================
-// Signal Handler
-//=============================================================================
+/* --------------------------- Signal Handler ----------------------------- */
 
 static void on_signal(int sig) {
     (void)sig;
@@ -1198,9 +1179,7 @@ static void help_long(FILE *out) {
 }
 
 
-//=============================================================================
-// Main
-//=============================================================================
+/* --------------------------------- Main --------------------------------- */
 
 
 int main(int argc, char **argv) {
