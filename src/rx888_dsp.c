@@ -984,8 +984,12 @@ static void output_and_free(buffer_t *buf) {
         if (w > 0) { off += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && errno == EPIPE) {
-            close(g_app.output_fd);
-            g_app.output_fd = -1;
+            if (g_app.output_path) {
+                close(g_app.output_fd);
+                g_app.output_fd = -1;
+            } else {
+                g_stop = 1;
+            }
         }
         break;
     }
@@ -1072,8 +1076,14 @@ static void* output_thread(void *arg) {
                 continue;
             }
             if (w < 0 && errno == EPIPE) {
-                close(g_app.output_fd);
-                g_app.output_fd = -1;
+                if (g_app.output_path) {
+                    /* FIFO: close and allow reconnect on next iteration. */
+                    close(g_app.output_fd);
+                    g_app.output_fd = -1;
+                } else {
+                    /* stdout: consumer exited, shut down the pipeline. */
+                    g_stop = 1;
+                }
                 break;
             }
             if (w < 0) {
@@ -1082,11 +1092,11 @@ static void* output_thread(void *arg) {
                 break;
             }
         }
-        
+
         if (off == bytes) {
             samples_processed += OUTPUT_SAMPLES;
         }
-        
+
         // Return buffer to free pool
         spsc_push(&free_queue, buf);
     }
@@ -1359,24 +1369,24 @@ int main(int argc, char **argv) {
 
     if (g_app.verbose) {
         const unsigned long dropped = atomic_load_explicit(&blocks_dropped, memory_order_relaxed);
-        fprintf(stderr, "\n=== Statistics ===\n");
-        fprintf(stderr, "Blocks processed: %lu\n", stats.total_blocks);
+        warn_msg("=== Statistics ===");
+        warn_msg("Blocks processed: %lu", stats.total_blocks);
         {
             const unsigned long total = stats.total_blocks + dropped;
             if (total > 0) {
-                fprintf(stderr, "Blocks dropped:   %lu (%.2f%%)\n", dropped,
-                        100.0 * (double)dropped / (double)total);
+                warn_msg("Blocks dropped:   %lu (%.2f%%)", dropped,
+                         100.0 * (double)dropped / (double)total);
             } else {
-                fprintf(stderr, "Blocks dropped:   %lu (no data processed)\n", dropped);
+                warn_msg("Blocks dropped:   %lu (no data processed)", dropped);
             }
         }
-        fprintf(stderr, "Time/block: avg %.2f ms (min %.2f, max %.2f)\n", stats.avg_time_ms,
-                stats.min_time_ms, stats.max_time_ms);
-        fprintf(stderr, "Budget @ 135 MSPS: 1.94 ms/block\n");
+        warn_msg("Time/block: avg %.2f ms (min %.2f, max %.2f)", stats.avg_time_ms,
+                 stats.min_time_ms, stats.max_time_ms);
+        warn_msg("Budget @ 135 MSPS: 1.94 ms/block");
         if (stats.avg_time_ms > 0) {
-            fprintf(stderr, "Headroom: %.1f%%\n", 100.0 * (1.94 - stats.avg_time_ms) / 1.94);
+            warn_msg("Headroom: %.1f%%", 100.0 * (1.94 - stats.avg_time_ms) / 1.94);
         }
-        fprintf(stderr, "Samples output: %lu\n", samples_processed);
+        warn_msg("Samples output: %lu", samples_processed);
     }
 
     if (g_app.output_fd >= 0) {
