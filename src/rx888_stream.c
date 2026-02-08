@@ -146,16 +146,17 @@ static void vlogf(int level, const char *fmt, ...) {
     va_end(ap);
 }
 
-static int write_full(int fd, const uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -errno;
+            return -1;
         }
-        if (n == 0) return -EIO;
-        off += (size_t)n;
+        if (n == 0) { errno = EIO; return -1; }
+        p += (size_t)n;
+        len -= (size_t)n;
     }
     return 0;
 }
@@ -613,7 +614,7 @@ static void *writer_main(void *arg) {
                 if (g_fixup_samples) {
                     sample_fixup_i16_inplace((uint8_t *)t->buffer, t->actual_length);
                 }
-                int w = write_full(STDOUT_FILENO, (const uint8_t *)t->buffer, (size_t)t->actual_length);
+                int w = write_all(STDOUT_FILENO, t->buffer, (size_t)t->actual_length);
                 if (w != 0) {
                     atomic_store(&s->pipe_broken, true);
                     g_stop = 1;
@@ -859,7 +860,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     sa.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &sa, NULL); /* we detect EPIPE via write_full */
+    sigaction(SIGPIPE, &sa, NULL); /* we detect EPIPE via write_all */
 
     /* Options */
     while (1) {
