@@ -228,12 +228,17 @@ static void write_sigmf_meta(const char *outdir,
                              bool have_center,
                              const char *desc,
                              const char *start_utc) {
-  char meta_path[PATH_MAX];
-  int n = snprintf(meta_path, sizeof(meta_path), "%s/cap_%06" PRIu64 ".sigmf-meta", outdir, index);
-  if (n < 0 || (size_t)n >= sizeof(meta_path)) die("meta_path buffer too small");
+  char tmp_path[PATH_MAX];
+  char final_path[PATH_MAX];
+  int n;
 
-  FILE *f = fopen(meta_path, "wb");
-  if (!f) die("fopen('%s') failed: %s", meta_path, strerror(errno));
+  n = snprintf(tmp_path, sizeof(tmp_path), "%s/cap_%06" PRIu64 ".sigmf-meta.tmp", outdir, index);
+  if (n < 0 || (size_t)n >= sizeof(tmp_path)) die("meta tmp_path buffer too small");
+  n = snprintf(final_path, sizeof(final_path), "%s/cap_%06" PRIu64 ".sigmf-meta", outdir, index);
+  if (n < 0 || (size_t)n >= sizeof(final_path)) die("meta final_path buffer too small");
+
+  FILE *f = fopen(tmp_path, "wb");
+  if (!f) die("fopen('%s') failed: %s", tmp_path, strerror(errno));
 
   // Minimal SigMF meta (manual JSON). Escape user-provided strings.
   char *desc_esc = json_escape(desc ? desc : "");
@@ -292,6 +297,9 @@ static void write_sigmf_meta(const char *outdir,
   free(desc_esc);
   free(dtype_esc);
   fclose(f);
+  // Atomic rename: file is either complete or absent.
+  if (rename(tmp_path, final_path) != 0)
+    die("rename('%s' -> '%s') failed: %s", tmp_path, final_path, strerror(errno));
 }
 
 static FILE *open_run_json(const char *outdir, const char *created_utc,
@@ -299,8 +307,8 @@ static FILE *open_run_json(const char *outdir, const char *created_utc,
                            uint64_t samples_per_file, uint64_t block_samples,
                            const struct timespec *t0_utc) {
   char path[PATH_MAX];
-  int n = snprintf(path, sizeof(path), "%s/run.json", outdir);
-  if (n < 0 || (size_t)n >= sizeof(path)) die("run.json path too small");
+  int n = snprintf(path, sizeof(path), "%s/run.json.tmp", outdir);
+  if (n < 0 || (size_t)n >= sizeof(path)) die("run.json.tmp path too small");
 
   FILE *f = fopen(path, "wb");
   if (!f) die("fopen('%s') failed: %s", path, strerror(errno));
@@ -383,7 +391,7 @@ static void append_run_json_file(FILE *runf, bool first_entry,
   fflush(runf);
 }
 
-static void finalize_run_json(FILE *runf,
+static void finalize_run_json(FILE *runf, const char *outdir,
                              uint64_t files_written,
                              uint64_t samples_written,
                              uint64_t bytes_written) {
@@ -401,6 +409,14 @@ static void finalize_run_json(FILE *runf,
   );
   fflush(runf);
   fclose(runf);
+
+  // Atomic rename: run.json is either complete or absent.
+  char tmp_path[PATH_MAX], final_path[PATH_MAX];
+  snprintf(tmp_path, sizeof(tmp_path), "%s/run.json.tmp", outdir);
+  snprintf(final_path, sizeof(final_path), "%s/run.json", outdir);
+  if (rename(tmp_path, final_path) != 0)
+    fprintf(stderr, "iqrecord: rename('%s' -> '%s') failed: %s\n",
+            tmp_path, final_path, strerror(errno));
 }
 
 int main(int argc, char **argv) {
@@ -644,7 +660,7 @@ int main(int argc, char **argv) {
   }
 
   if (runf) {
-    finalize_run_json(runf, file_index, samples_total, bytes_total);
+    finalize_run_json(runf, outdir, file_index, samples_total, bytes_total);
   } else {
     warn_msg("No data read; run.json not written");
   }
