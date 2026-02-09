@@ -81,7 +81,20 @@ This uploads firmware (if the device is in DFU mode), captures at
 files to `/data/capture/`. Use `--block-on-full` to backpressure
 instead of dropping blocks when the recorder falls behind.
 
-**3. Stream to GQRX via FIFO:**
+**3. Stream to GQRX via helper script:**
+
+```bash
+./scripts/rx888_dsp_to_gqrx.sh                  # live from RX888
+./scripts/rx888_dsp_to_gqrx.sh recording.raw     # loop a capture file
+SHOW_STATUS=1 ./scripts/rx888_dsp_to_gqrx.sh     # live with mbuffer status
+```
+
+The script sets up the full pipeline with dual FIFOs and mbuffer relay,
+prints the GQRX device string to use, and cleans up on Ctrl-C. All
+parameters (firmware path, sample rate, gain, buffer size) are tunable
+via environment variables — see the script header for details.
+
+**4. Stream to GQRX manually (no script):**
 
 ```bash
 mkfifo /tmp/iq.fifo
@@ -91,7 +104,7 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 
-**4. Buffer with mbuffer for sustained writes:**
+**5. Buffer with mbuffer for sustained writes:**
 
 ```bash
 rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
