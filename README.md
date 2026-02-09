@@ -71,20 +71,37 @@ sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
 **2. Stream, decimate, and record:**
 
 ```bash
-rx888_stream | rx888_dsp | iqrecord /data/capture
+rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
+  | rx888_dsp --block-on-full \
+  | iqrecord /data/capture --freq 7100000 --desc "7.1 MHz capture"
 ```
 
-This captures at 135 MS/s, decimates 4:1 to 33.75 MS/s cf32, and writes
-10-second SigMF files to `/data/capture/`.
+This uploads firmware (if the device is in DFU mode), captures at
+135 MS/s, decimates 4:1 to 33.75 MS/s cf32, and writes 10-second SigMF
+files to `/data/capture/`. Use `--block-on-full` to backpressure
+instead of dropping blocks when the recorder falls behind.
 
 **3. Stream to GQRX via FIFO:**
 
 ```bash
 mkfifo /tmp/iq.fifo
-rx888_stream | rx888_dsp -o /tmp/iq.fifo
+rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
+  | rx888_dsp -o /tmp/iq.fifo
 ```
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
+
+**4. Buffer with mbuffer for sustained writes:**
+
+```bash
+rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
+  | rx888_dsp --block-on-full -v \
+  | mbuffer -m 2G -q \
+  | iqrecord /data/capture --freq 7100000
+```
+
+The `mbuffer` stage absorbs disk I/O stalls, preventing backpressure
+from reaching the DSP pipeline.
 
 ---
 
@@ -95,6 +112,38 @@ Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 | `rx888_stream` | USB3 bulk capture | RX888 device | int16 real samples on stdout |
 | `rx888_dsp` | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
 | `iqrecord` | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
+
+### rx888_stream
+
+```
+rx888_stream -f firmware/SDDC_FX3.img [options] > iq.raw
+```
+
+Key options: `-f <firmware>` (required on first run after power-cycle),
+`-s <Hz>` (sample rate: 32000000 or 135000000, default 32000000),
+`-v` (verbose), `-g <0..127>` (gain), `-q <N>` (queue depth),
+`-p <N>` (request size in packets). Run `rx888_stream -h` for full usage.
+
+### rx888_dsp
+
+```
+rx888_dsp [OPTIONS]
+```
+
+Key options: `-o <path>` (output to FIFO instead of stdout),
+`-v` (verbose + stats), `--block-on-full` (backpressure instead of
+dropping blocks). Send `SIGUSR1` to print live statistics.
+Run `rx888_dsp -h` for full usage.
+
+### iqrecord
+
+```
+iqrecord OUTDIR [--freq HZ] [--desc TEXT] [--fsync]
+```
+
+Reads cf32 IQ from stdin and writes 10-second SigMF file pairs plus a
+session-level `run.json`. Use `--freq` to set the center frequency in
+metadata and `--desc` for a capture description.
 
 See `doc/` for detailed per-program documentation, architecture notes, and
 test plans.
@@ -124,4 +173,10 @@ rx888_tools/
 
 ## License
 
-MIT — see individual source files for copyright notices.
+MIT — see [LICENSE](LICENSE) for the full text.
+
+**Exception:** `src/ezusb.c` and `include/ezusb.h` are GPL-2.0-or-later
+(derived from the Linux kernel fxload utility). Because `rx888_stream`
+links with ezusb, the `rx888_stream` binary is distributed under
+GPL-2.0-or-later. The other two programs (`rx888_dsp`, `iqrecord`) are
+MIT only.
