@@ -10,6 +10,7 @@
 # Usage:
 #   ./scripts/rx888_dsp_to_gqrx.sh                 # live from RX888
 #   ./scripts/rx888_dsp_to_gqrx.sh recording.raw   # loop a capture file
+#   SHOW_STATUS=1 ./scripts/rx888_dsp_to_gqrx.sh   # live with mbuffer status
 #
 # Configure GQRX:
 #   I/O device string:  file=/tmp/iq_gqrx.fifo,freq=33750000,rate=33750000
@@ -32,6 +33,7 @@ MBUFFER_PREFILL="${MBUFFER_PREFILL:-20}"
 
 STREAM_BIN="${STREAM_BIN:-./rx888_stream}"
 DSP_BIN="${DSP_BIN:-./rx888_dsp}"
+SHOW_STATUS="${SHOW_STATUS:-0}"  # set to 1 to show mbuffer fill/throughput
 
 INFILE="${1:-}"
 
@@ -76,6 +78,7 @@ else
 fi
 echo "FIFOs      : $FIFO_DSP -> mbuffer -> $FIFO_GQRX"
 echo "mbuffer    : ${MBUFFER_MEM} buffer, ${MBUFFER_PREFILL}% prefill"
+[[ "$SHOW_STATUS" == "1" ]] && echo "Status     : mbuffer fill/throughput display ENABLED"
 echo ""
 echo "Configure GQRX:"
 echo "  Device string : file=$FIFO_GQRX,freq=33750000,rate=33750000"
@@ -86,7 +89,9 @@ echo "Start GQRX, then press Enter here to begin streaming..."
 read -r
 
 # ---------- start mbuffer ----------
-mbuffer -q -m "$MBUFFER_MEM" -P "$MBUFFER_PREFILL" \
+MBUF_QUIET="-q"
+[[ "$SHOW_STATUS" == "1" ]] && MBUF_QUIET=""
+mbuffer $MBUF_QUIET -m "$MBUFFER_MEM" -P "$MBUFFER_PREFILL" \
     -i "$FIFO_DSP" -o - > "$FIFO_GQRX" &
 PIDS+=($!)
 
