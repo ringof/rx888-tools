@@ -1,7 +1,10 @@
 MIT License
 
-Copyright (c) 2021 Ruslan Migirov <trapi78@gmail.com>
 Copyright (c) 2024-2026 David Goncalves <dave@w1euj.com>
+
+rx888_stream.c is based on work originally by Ruslan Migirov (2021),
+modified and maintained by David Goncalves (2024-). All other source
+files are original works by David Goncalves.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
