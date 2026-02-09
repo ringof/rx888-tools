@@ -1,74 +1,119 @@
 #!/usr/bin/env bash
-# rx888_dsp_to_gqrx.sh
+# rx888_dsp_to_gqrx.sh — stand up the full RX888 pipeline feeding GQRX
 #
-# Robust dual-FIFO + mbuffer relay for GQRX.
+# Topology (live):
+#   rx888_stream -> rx888_dsp -> FIFO -> mbuffer -> FIFO -> GQRX
 #
-# IMPORTANT:
-# Some mbuffer builds CANNOT open an existing FIFO with -o <path> and will
-# fail with:
-#   "unable to open output ... File exists"
+# Topology (file playback):
+#   (loop file) -> rx888_dsp -> FIFO -> mbuffer -> FIFO -> GQRX
 #
-# The portable solution is:
-#   - let the *shell* open FIFO_B
-#   - run mbuffer with '-o -' (stdout)
+# Usage:
+#   ./scripts/rx888_dsp_to_gqrx.sh                 # live from RX888
+#   ./scripts/rx888_dsp_to_gqrx.sh recording.raw   # loop a capture file
 #
-# Topology:
-#   file -> rx888_dsp -> FIFO_A -> mbuffer -> FIFO_B -> GQRX
+# Configure GQRX:
+#   I/O device string:  file=/tmp/iq_gqrx.fifo,freq=33750000,rate=33750000
+#   Sample rate:         33750000
+#   Format:              Complex Float32 (native endian)
 #
 set -euo pipefail
 
-INFILE="${1:?usage: $0 <real16_135Msps_file>}"
+# ---------- tunables (override via environment) ----------
+FIRMWARE="${FIRMWARE:-firmware/SDDC_FX3.img}"
+SAMPLERATE="${SAMPLERATE:-135000000}"
+GAIN="${GAIN:-0}"
+QUEUE_DEPTH="${QUEUE_DEPTH:-32}"
+REQ_SIZE="${REQ_SIZE:-1024}"
 
-FIFO_A="${FIFO_A:-/tmp/iq_a.fifo}"
-FIFO_B="${FIFO_B:-/tmp/iq_b.fifo}"
+FIFO_DSP="${FIFO_DSP:-/tmp/iq_dsp.fifo}"    # rx888_dsp writes here
+FIFO_GQRX="${FIFO_GQRX:-/tmp/iq_gqrx.fifo}" # GQRX reads here
 MBUFFER_MEM="${MBUFFER_MEM:-512M}"
 MBUFFER_PREFILL="${MBUFFER_PREFILL:-20}"
+
+STREAM_BIN="${STREAM_BIN:-./rx888_stream}"
 DSP_BIN="${DSP_BIN:-./rx888_dsp}"
-DSP_ARGS="${DSP_ARGS:--v}"
 
-BLOCK_BYTES=524288
+INFILE="${1:-}"
 
+# ---------- preflight ----------
+command -v mbuffer >/dev/null 2>&1 || { echo "ERROR: mbuffer not found (apt install mbuffer)"; exit 1; }
+[[ -x "$DSP_BIN" ]]    || { echo "ERROR: $DSP_BIN not found or not executable"; exit 1; }
+
+if [[ -z "$INFILE" ]]; then
+    # Live mode
+    [[ -x "$STREAM_BIN" ]] || { echo "ERROR: $STREAM_BIN not found or not executable"; exit 1; }
+    [[ -r "$FIRMWARE" ]]   || { echo "ERROR: firmware not found: $FIRMWARE"; exit 1; }
+else
+    # File playback mode
+    [[ -r "$INFILE" ]]     || { echo "ERROR: input file not readable: $INFILE"; exit 1; }
+fi
+
+# ---------- FIFOs ----------
+for f in "$FIFO_DSP" "$FIFO_GQRX"; do
+    [[ -p "$f" ]] || { rm -f "$f"; mkfifo "$f"; }
+done
+
+# ---------- cleanup ----------
+PIDS=()
 cleanup() {
-  [[ -n "${MBUF_PID:-}" ]] && kill "$MBUF_PID" 2>/dev/null || true
+    echo ""
+    echo "Shutting down..."
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    rm -f "$FIFO_DSP" "$FIFO_GQRX"
+    echo "Done."
 }
 trap cleanup EXIT INT TERM
 
-command -v mbuffer >/dev/null || { echo "ERROR: mbuffer not found"; exit 1; }
-[[ -x "$DSP_BIN" ]] || { echo "ERROR: DSP binary not executable: $DSP_BIN"; exit 1; }
-[[ -r "$INFILE" ]] || { echo "ERROR: input file not readable: $INFILE"; exit 1; }
-
-# FIFO_A must exist for rx888_dsp output
-[[ -p "$FIFO_A" ]] || { rm -f "$FIFO_A"; mkfifo "$FIFO_A"; }
-
-# FIFO_B must exist for shell redirection
-[[ -p "$FIFO_B" ]] || { rm -f "$FIFO_B"; mkfifo "$FIFO_B"; }
-
-sz=$(stat -c%s "$INFILE")
-trunc_sz=$(( (sz / BLOCK_BYTES) * BLOCK_BYTES ))
-[[ "$trunc_sz" -gt 0 ]] || { echo "ERROR: file < one block"; exit 1; }
-
+# ---------- banner ----------
 echo "=== rx888_dsp_to_gqrx ==="
-echo "Input file : $INFILE"
-echo "Loop size  : $trunc_sz bytes"
-echo
-echo "FIFOs:"
-echo "  FIFO_A: $FIFO_A (rx888_dsp output)"
-echo "  FIFO_B: $FIFO_B (GQRX input)"
-echo
-echo "Configure GQRX to read:"
-echo "  FIFO: $FIFO_B"
-echo "  Sample rate: 33.75e6"
-echo "  Format: complex float32 IQ (interleaved)"
-echo
+if [[ -z "$INFILE" ]]; then
+    echo "Mode       : LIVE (rx888_stream at ${SAMPLERATE} S/s)"
+else
+    echo "Mode       : FILE PLAYBACK (looping $INFILE)"
+fi
+echo "FIFOs      : $FIFO_DSP -> mbuffer -> $FIFO_GQRX"
+echo "mbuffer    : ${MBUFFER_MEM} buffer, ${MBUFFER_PREFILL}% prefill"
+echo ""
+echo "Configure GQRX:"
+echo "  Device string : file=$FIFO_GQRX,freq=33750000,rate=33750000"
+echo "  Sample rate   : 33750000"
+echo "  Format        : Complex Float32"
+echo ""
+echo "Start GQRX, then press Enter here to begin streaming..."
+read -r
 
-echo "Starting mbuffer (stdout -> FIFO_B)"
-mbuffer -m "$MBUFFER_MEM" -P "$MBUFFER_PREFILL" -i "$FIFO_A" -o - > "$FIFO_B" &
-MBUF_PID=$!
+# ---------- start mbuffer ----------
+mbuffer -q -m "$MBUFFER_MEM" -P "$MBUFFER_PREFILL" \
+    -i "$FIFO_DSP" -o - > "$FIFO_GQRX" &
+PIDS+=($!)
 
-echo "Starting rx888_dsp:"
-echo "  (loop file) | $DSP_BIN $DSP_ARGS -o $FIFO_A"
-echo
+# ---------- start source -> DSP ----------
+if [[ -z "$INFILE" ]]; then
+    # Live: rx888_stream -> rx888_dsp -> FIFO
+    "$STREAM_BIN" \
+        -f "$FIRMWARE" \
+        -s "$SAMPLERATE" \
+        -g "$GAIN" \
+        -q "$QUEUE_DEPTH" \
+        -p "$REQ_SIZE" \
+      | "$DSP_BIN" -v -o "$FIFO_DSP" &
+    PIDS+=($!)
+else
+    # File playback: loop file -> rx888_dsp -> FIFO
+    BLOCK_BYTES=524288
+    sz=$(stat -c%s "$INFILE")
+    trunc_sz=$(( (sz / BLOCK_BYTES) * BLOCK_BYTES ))
+    [[ "$trunc_sz" -gt 0 ]] || { echo "ERROR: file smaller than one block"; exit 1; }
+    (
+        while true; do
+            head -c "$trunc_sz" "$INFILE"
+        done
+    ) | "$DSP_BIN" -v -o "$FIFO_DSP" &
+    PIDS+=($!)
+fi
 
-while true; do
-  head -c "$trunc_sz" "$INFILE"
-done | "$DSP_BIN" $DSP_ARGS -o "$FIFO_A"
+echo "Pipeline running. Ctrl-C to stop."
+wait

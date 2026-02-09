@@ -144,6 +144,9 @@ static spsc_queue_t free_queue;    // Available to fill
 static spsc_queue_t filled_queue;  // Ready for processing
 static spsc_queue_t ready_queue;   // Ready to output
 
+/* g_stop / stats_req_flag: written from signal handlers, so they must be
+   volatile sig_atomic_t (the only type C guarantees for async-signal-safe
+   access).  proc_drain_done is thread-to-thread only, so _Atomic int. */
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t stats_req_flag = 0;  // set by SIGUSR1, consumed by processing thread
 static _Atomic int proc_drain_done = 0; // set by processing thread after drain completes
