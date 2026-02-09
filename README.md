@@ -173,4 +173,10 @@ rx888_tools/
 
 ## License
 
-MIT — see individual source files for copyright notices.
+MIT — see [LICENSE](LICENSE) for the full text.
+
+**Exception:** `src/ezusb.c` and `include/ezusb.h` are GPL-2.0-or-later
+(derived from the Linux kernel fxload utility). Because `rx888_stream`
+links with ezusb, the `rx888_stream` binary is distributed under
+GPL-2.0-or-later. The other two programs (`rx888_dsp`, `iqrecord`) are
+MIT only.

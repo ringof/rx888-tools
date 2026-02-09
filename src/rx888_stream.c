@@ -10,11 +10,10 @@ Goals:
 - Centralized cleanup path; no uninitialized frees
 - Better diagnostics and compile-time friendliness
 
-Copyright (c) 2021 Ruslan Migirov <trapi78@gmail.com>
-Copyright (c) 2024 David Goncalves <dave@w1euj.com>
-Copyright (c) 2026 (rewrite) OpenAI assistant
+Original author: Ruslan Migirov <trapi78@gmail.com> (2021)
+Maintainer:      David Goncalves <dave@w1euj.com> (2024-)
 
-License: MIT (same as original)
+See LICENSE in the project root for terms.
 */
 
 #define _GNU_SOURCE
