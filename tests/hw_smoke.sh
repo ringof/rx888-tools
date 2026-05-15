@@ -51,8 +51,12 @@ set +e
 timeout --preserve-status --kill-after=2 "$DEADLINE" \
     "$STREAM" -f "$FIRMWARE" -s "$RATE" 2>"$ERR" \
   | head -c "$target_bytes" >"$OUT"
-stream_rc=${PIPESTATUS[0]}
-head_rc=${PIPESTATUS[1]}
+# Snapshot PIPESTATUS in one assignment — reading PIPESTATUS[0] into
+# a scalar is itself a command that resets PIPESTATUS, so reading
+# PIPESTATUS[1] on the next line trips `set -u`.
+pipestatus=("${PIPESTATUS[@]}")
+stream_rc=${pipestatus[0]:-0}
+head_rc=${pipestatus[1]:-0}
 set -e
 end_ns=$(date +%s%N)
 elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
