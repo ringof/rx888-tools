@@ -452,8 +452,9 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
 }
 
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
-    if (!out || !cfg) return LIBUSB_ERROR_INVALID_PARAM;
+    if (!out) return LIBUSB_ERROR_INVALID_PARAM;
     *out = NULL;
+    if (!cfg) return LIBUSB_ERROR_INVALID_PARAM;
 
     /* Tuning knobs must be initialised. Callers should use
      * rx888_config_init_default(); this guards calloc'd structs. */

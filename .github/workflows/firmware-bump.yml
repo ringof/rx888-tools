@@ -1,0 +1,68 @@
+name: Auto-bump firmware
+
+on:
+  # rx888-firmware can ping us via repository_dispatch on each release;
+  # the daily cron is a belt-and-braces fallback.
+  repository_dispatch:
+    types: [rx888-firmware-released]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev jq curl
+
+      - name: Resolve and fetch latest firmware
+        id: bump
+        run: |
+          old_tag=$(cat firmware/VERSION)
+          make firmware-latest
+          new_tag=$(cat firmware/VERSION)
+          echo "old_tag=$old_tag" >> "$GITHUB_OUTPUT"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          if [[ "$old_tag" == "$new_tag" ]]; then
+            echo "No change ($old_tag); nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build + non-hardware tests against new firmware
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          make all
+          make check
+
+      - name: Open PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          old="${{ steps.bump.outputs.old_tag }}"
+          new="${{ steps.bump.outputs.new_tag }}"
+          branch="auto-bump/firmware-${new}"
+          git config user.name  "rx888-firmware bump bot"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add firmware/VERSION firmware/SHA256SUMS
+          git commit -m "firmware: bump to ${new} (was ${old})"
+          git push -u origin "$branch"
+          gh pr create --draft \
+            --title "firmware: bump to ${new}" \
+            --body "Auto-bumped from rx888-firmware release ${new} (was ${old}).
+
+          Non-hardware CI passed.  Hardware acceptance (\`make hw-check\`) requires
+          a bench run with an RX888 plugged in before this can leave draft."
