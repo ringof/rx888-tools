@@ -46,17 +46,19 @@ make all
 Library and all three binaries compile under
 `-Werror -Wall -Wextra -Wpedantic`.  CI confirms this on Ubuntu 24.04.
 
-Optional sanitizer build:
+Sanitizer / valgrind passes (run automatically in CI):
 
 ```sh
-make clean
-make CFLAGS_LIB="-O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer \
-                 -std=c11 -Wall -Wextra -fPIC -pthread \
-                 $(pkg-config --cflags libusb-1.0)"
-make check
+make check-asan        # rebuild with -fsanitize=address,undefined; run check
+make check-valgrind    # rebuild without -march=native; run librx888_api
+                       # under valgrind --leak-check=full
 ```
 
-ASAN/UBSAN should be silent on the no-hardware test runs.
+`SAN=<list>` is the underlying knob — pass any clang/gcc fsanitize
+spec.  Common alternates: `make SAN=thread check` for race detection
+(no-hardware tests barely exercise threading; mostly useful for the
+bench targets below).  `make SAN=memory check` for clang's MSan if
+you want uninitialised-read coverage stricter than valgrind's.
 
 ### A2. ABI surface
 
@@ -112,6 +114,21 @@ RX888_HW_TEST=1 make hw-check
 ```
 
 `hw-check` runs three scripts in sequence; each fails fast.
+
+Bench-side sanitizer passes (where ASan really earns its keep — the
+streaming path exercises libusb transfer lifetimes, the SPSC ring,
+and writer/event/control-thread coordination):
+
+```sh
+RX888_HW_TEST=1 make SAN=address,undefined hw-check
+RX888_HW_TEST=1 make SAN=thread             hw-check     # see caveats
+```
+
+The `thread` build is mutually exclusive with `address` and slows
+streaming by ~10x; expect USB overruns at 32 MS/s.  Use the
+shortest possible run (`RX888_SECS=1 RX888_CYCLES=1`) and treat the
+goal as "exercise the threading code paths once, look for warnings"
+rather than "validate throughput."
 
 ### B1. `tests/hw_smoke.sh` — sustained throughput
 
@@ -174,8 +191,11 @@ If any of these become recurring concerns, fold them into
 `librx888` and `rx888_stream` are considered ready when:
 
 - `make all` passes under `-Werror` on gcc and clang.
-- `make check` passes with no failures.
+- `make check`, `make check-asan`, and `make check-valgrind` all
+  pass with no failures.
 - `make hw-check` passes with the default thresholds at 32 MS/s.
+- `RX888_HW_TEST=1 make SAN=address,undefined hw-check` is clean
+  before merging to main.
 - A 30-minute 135 MS/s capture to `pv -rab -B 4M > /dev/null`
   sustains ≥ 90 % of theoretical throughput.
 - Manual broken-pipe and disconnect checks exit cleanly.
@@ -185,23 +205,19 @@ If any of these become recurring concerns, fold them into
 ## Appendix — quick commands
 
 ```sh
-# Non-hardware
+# Non-hardware (CI runs all three)
 make check
+make check-asan
+make check-valgrind
 
 # Hardware (with device + firmware fetched)
 make firmware
 RX888_HW_TEST=1 make hw-check
+RX888_HW_TEST=1 make SAN=address,undefined hw-check    # bench
 
 # Throughput watch
 ./rx888_stream -v -s 135000000 > /dev/null
 
 # Broken pipe
 ./rx888_stream -s 32000000 | head -c 1 > /dev/null; echo "exit=$?"
-
-# Sanitizer + non-hw tests
-make clean
-make CFLAGS_LIB="-O0 -g3 -fsanitize=address,undefined \
-                 -std=c11 -Wall -Wextra -fPIC -pthread \
-                 $(pkg-config --cflags libusb-1.0)"
-make check
 ```

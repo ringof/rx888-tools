@@ -25,12 +25,33 @@ CFLAGS_COMMON := -std=c11 -O3 -Wall -Wextra -Wpedantic \
                  -fstack-protector-all -ggdb3 -fPIC \
                  -DVERSION=\"$(VERSION)\"
 
+# SAN: pass through to clang/gcc -fsanitize=.  Common values:
+#   address,undefined  — out-of-bounds, UAF, leaks, UB.  Default for
+#                        `make check-asan`.
+#   thread             — race detection.  Mutually exclusive with
+#                        address; expect ~10x slowdown.
+# Drops -O3 (sanitizers want lower opt for accurate reports) and
+# disables -fstack-protector-all (sanitizers ship their own).
+ifdef SAN
+  SAN_CFLAGS    := -fsanitize=$(SAN) -fno-omit-frame-pointer -O1 -g
+  SAN_LDFLAGS   := -fsanitize=$(SAN)
+  CFLAGS_COMMON := $(filter-out -O3 -fstack-protector-all,$(CFLAGS_COMMON)) $(SAN_CFLAGS)
+endif
+
+# Strip -march=native when running under sanitizer or valgrind: those
+# tools don't always handle host-specific vector instructions
+# (AVX-512 in particular trips valgrind's memcheck on glibc memset).
+NATIVE_MARCH := -march=native
+ifneq ($(strip $(SAN)$(VALGRIND)),)
+  NATIVE_MARCH :=
+endif
+
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS   := $(shell pkg-config --libs libusb-1.0)
 
-CFLAGS_LIB    := $(CFLAGS_COMMON) -Werror -march=native -pthread $(LIBUSB_CFLAGS)
+CFLAGS_LIB    := $(CFLAGS_COMMON) -Werror $(NATIVE_MARCH) -pthread $(LIBUSB_CFLAGS)
 CFLAGS_STREAM := $(CFLAGS_COMMON) -pthread
-CFLAGS_DSP    := $(CFLAGS_COMMON) -mavx2 -mfma -march=native
+CFLAGS_DSP    := $(CFLAGS_COMMON) -mavx2 -mfma $(NATIVE_MARCH)
 CFLAGS_REC    := $(CFLAGS_COMMON)
 
 SRCDIR := src
@@ -63,7 +84,7 @@ $(SRCDIR)/ezusb.o: $(SRCDIR)/ezusb.c $(INCDIR)/ezusb.h
 	$(CC) $(CFLAGS_LIB) -I$(INCDIR) -c $< -o $@
 
 $(LIBRX_SO): $(LIBRX_OBJS)
-	$(CC) -shared -Wl,-soname,$(LIBRX_SO) -o $@ $^ $(LIBUSB_LIBS) -lpthread
+	$(CC) -shared -Wl,-soname,$(LIBRX_SO) $(SAN_LDFLAGS) -o $@ $^ $(LIBUSB_LIBS) -lpthread
 
 $(LIBRX_A): $(LIBRX_OBJS)
 	ar rcs $@ $^
@@ -83,7 +104,7 @@ $(LIBRX_PC):
 # --- binaries ---
 rx888_stream: $(SRCDIR)/rx888_stream.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/rx888_stream.c \
-	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN' -o $@
+	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN' $(SAN_LDFLAGS) -o $@
 
 rx888_dsp: $(SRCDIR)/rx888_dsp.c
 	$(CC) $(CFLAGS_DSP) -I$(INCDIR) $< -o $@ -lm -lpthread
@@ -97,11 +118,33 @@ TEST_BINS  := $(TESTS_DIR)/librx888_api
 
 $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
-	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' -o $@
+	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
 check: $(TEST_BINS) rx888_stream
 	$(TESTS_DIR)/librx888_api
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream
+
+# Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
+# Forces a clean rebuild so the sanitizer flags propagate everywhere.
+check-asan:
+	$(MAKE) clean
+	$(MAKE) SAN=address,undefined check
+
+# Run the API test under valgrind memcheck.  Different bug class from
+# ASan — finds uninitialised reads especially well.  Skip the CLI
+# smoke test under valgrind (argparse exercises don't benefit and the
+# slowdown isn't worth it).  Suppressions file silences the common
+# libusb static-init "still reachable" noise.
+check-valgrind:
+	$(MAKE) clean
+	$(MAKE) VALGRIND=1 $(TESTS_DIR)/librx888_api
+	valgrind --error-exitcode=1 \
+	         --leak-check=full \
+	         --show-leak-kinds=definite,possible \
+	         --errors-for-leak-kinds=definite \
+	         --track-origins=yes \
+	         --suppressions=$(TESTS_DIR)/valgrind.supp \
+	         $(TESTS_DIR)/librx888_api
 
 # --- firmware (pinned to rx888-firmware release) ---
 firmware: $(RX888_FW_FILE)
@@ -138,7 +181,7 @@ hw-check: all $(RX888_FW_FILE)
 	RX888_STREAM=$(CURDIR)/rx888_stream RX888_FW=$(CURDIR)/$(RX888_FW_FILE) \
 	  $(TESTS_DIR)/hw_sample_check.py
 
-.PHONY: check firmware firmware-latest hw-check
+.PHONY: check check-asan check-valgrind firmware firmware-latest hw-check
 
 # --- install ---
 install: all
