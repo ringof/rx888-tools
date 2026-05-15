@@ -181,37 +181,8 @@ enum SI5351CrystalLoadValues {
   SI5351_VALUE_MS_SRC_PLLB      = 0x20
 };
 
-/* ------------------------------ Streaming API ---------------------------- */
-
-/* Opaque stream context (defined in rx888_stream.c) */
-struct stream_ctx;
-
-/* Initialize streaming.
- *
- * pktsize must be the *effective* USB3 payload size:
- *   wMaxPacketSize * (bMaxBurst + 1)
+/* The streaming engine that used to live here is now in librx888.
+ * See include/librx888.h for the public API.
  */
-int stream_setup(struct stream_ctx *s,
-                 libusb_context *ctx,
-                 libusb_device_handle *h,
-                 uint8_t ep_in,
-                 unsigned int pktsize);
-
-/* Stop streaming and free all associated resources.
- * Safe to call on partially-initialized contexts.
- */
-void stream_teardown(struct stream_ctx *s);
-
-/* ------------------------ Streaming configuration knobs ------------------ */
-/* Set before calling stream_setup() */
-
-/* Number of in-flight USB transfers */
-extern unsigned int g_queue_depth;
-
-/* Transfer size in USB packets (packets * pktsize) */
-extern unsigned int g_req_packets;
-
-/* libusb bulk transfer timeout (ms), 0 = infinite */
-extern unsigned int g_stream_timeout_ms;
 
 #endif

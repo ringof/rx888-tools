@@ -1,227 +1,223 @@
-# rx888_stream -- Test Plan
+# rx888_stream / librx888 — Test Plan
 
-This test plan targets the RX888 USB3 stream driver (firmware upload,
-control-plane configuration, and high-rate streaming to stdout), with
-emphasis on robustness (no crashes/segfaults), throughput stability,
-and clean recovery from common failure modes.
+The streaming engine is `librx888.so`; `rx888_stream` is a CLI wrapper.
+The two layers are tested together: the library through its public API,
+the binary through its argparse and signal handling.
 
-The tests are organized in two phases:
+Tests are split into two phases:
 
-- **Phase A: No-hardware / build-only** (what you can do immediately)
-- **Phase B: Hardware-in-loop** (when you can plug an RX888 in)
+- **Phase A — no hardware.**  Runs in CI on every PR.  Single command:
+  `make check`.
+- **Phase B — hardware in loop.**  Bench validation against a real
+  RX888.  Single command: `make hw-check` (with `RX888_HW_TEST=1`).
 
 ---
 
 ## 1. Scope
 
-### In Scope
-- Compilation correctness across toolchains (gcc/clang)
-- Static analysis and sanitizer runs
-- Argument parsing and configuration validation
-- USB control transaction sequencing (best-effort validation via logs)
-- Streaming behavior and stdout backpressure handling
-- Clean shutdown and resource cleanup
-- Failure-path behavior (device missing, firmware upload failures,
-  USB resets/disconnects)
+**In scope**
 
-### Out of Scope
-- DSP correctness (handled in rx888_dsp test plan)
-- RF performance (noise floor, spurs, etc.)
-- Firmware reverse-engineering
+- librx888 public API: lifecycle, validation, NULL safety, default
+  config, no-device path.
+- `rx888_stream` argparse: every documented flag accepted, unknown
+  flags rejected, exit codes correct.
+- USB streaming: throughput within tolerance, stop/start re-entrancy,
+  sample-content sanity (no constant runs, DC offset, stddev,
+  saturation).
+- Compile cleanliness across gcc/clang.
 
----
+**Out of scope**
 
-## 2. Test Environments
-
-### Host OS
-- Ubuntu 22.04+ (or Debian stable), x86-64
-- Kernel 5.15+ recommended for USB3 stability
-
-### Toolchains
-- gcc (>= 10)
-- clang (>= 14)
-
-### Dependencies
-- libusb-1.0 development headers and library
-- pthreads (standard on Linux)
-- Optional: clang-tidy, cppcheck, valgrind, strace, pv
-
-### Hardware (Phase B)
-- RX888 (USB3 streaming path)
-- A known-good USB3 port and cable
-- Optional: powered USB3 hub (for controlled disconnect tests)
+- DSP correctness (covered by `doc/rx888_dsp.md` test scripts).
+- RF performance (noise figure, IIP3, etc.).
+- Firmware behaviour beyond "samples come out and STOPFX3 idles the
+  device" (covered by `ringof/rx888-firmware`'s own test suite).
 
 ---
 
-## 3. Build-Only Validation (Phase A)
+## 2. Phase A — no hardware
 
-### A1. Clean Builds with Strict Warnings
-
-Build matrix:
+### A1. Build
 
 ```sh
-# gcc
-gcc -O2 -g -Wall -Wextra -Wshadow -Wformat=2 -Wcast-align \
-    -Wstrict-prototypes -Wmissing-prototypes -Wconversion \
-    -Wsign-conversion -Werror \
-    -o rx888_stream rx888_stream.c ezusb.c \
-    $(pkg-config --cflags --libs libusb-1.0) -lpthread
-
-# clang (same flags)
+make all
 ```
 
-Pass criteria: clean build, no warnings, no undefined references.
+Library and all three binaries compile under
+`-Werror -Wall -Wextra -Wpedantic`.  CI confirms this on Ubuntu 24.04.
 
-### A2. Static Analysis
+Sanitizer / valgrind passes (run automatically in CI):
 
 ```sh
-scan-build make
-cppcheck --enable=all --inconclusive --std=c11 --force .
+make check-asan        # rebuild with -fsanitize=address,undefined; run check
+make check-valgrind    # rebuild without -march=native; run librx888_api
+                       # under valgrind --leak-check=full
 ```
 
-Pass criteria: no high-severity issues (null deref, uninit, leaks).
-Medium-severity findings triaged (documented or fixed).
+`SAN=<list>` is the underlying knob — pass any clang/gcc fsanitize
+spec.  Common alternates: `make SAN=thread check` for race detection
+(no-hardware tests barely exercise threading; mostly useful for the
+bench targets below).  `make SAN=memory check` for clang's MSan if
+you want uninitialised-read coverage stricter than valgrind's.
 
-### A3. Sanitizers (Without Hardware)
+### A2. ABI surface
 
-Even without a device, you can validate argument parsing and early error
-paths.
+The CI workflow (`.github/workflows/ci.yml`) asserts the exact set of
+`T rx888_*` symbols exported by `librx888.so`.  Any added or renamed
+public function must be reflected in the workflow's `expected` list,
+or the build fails.
 
-Build with `-O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer`.
+### A3. `make check`
 
-Run:
-- `./rx888_stream --help`
-- `./rx888_stream -s 135000000` (expect "device not found" but no crash)
-- Invalid args: `--samplerate 0`, `--samplerate -1`, `--gain 999`,
-  `--att 999`, `--gainmode foo`
+Runs two scripts:
 
-Pass criteria: no ASAN/UBSAN reports, clean exits with clear error messages.
+#### `tests/librx888_api`
 
-### A4. CLI Regression
+C program built against `librx888.so` that exercises the public API
+without a device:
 
-Verify:
-- `--help` output matches current option set and defaults.
-- All flags accepted and reflected in verbose logs.
-- Invalid combinations rejected with exit status 2.
-- Running without stdout redirection prints TTY error and exits 2:
-  ```sh
-  ./rx888_stream -s 135000000
-  # Expected: "rx888_stream: stdout is a TTY; redirect to a file or pipe"
-  echo "exit: $?"
-  # Expected: exit: 2
-  ```
+- NULL inputs to every public function do not crash.
+- `rx888_open(NULL, NULL)` and `rx888_open(&r, NULL)` return
+  `LIBUSB_ERROR_INVALID_PARAM` and clear `*out`.
+- `rx888_open` rejects a `calloc`'d (zero) config with
+  `LIBUSB_ERROR_INVALID_PARAM`.
+- `rx888_config_init_default()` populates every documented default.
+- With a valid config and no device present, `rx888_open()` returns
+  `LIBUSB_ERROR_NO_DEVICE` (skipped if `RX888_HW_PRESENT=1`).
+- `rx888_version()` and `rx888_strerror()` return non-empty strings.
+
+#### `tests/cli_smoke.sh`
+
+Shell harness for `rx888_stream`:
+
+- `-h` exits 0 and the help text mentions every documented long flag
+  (`--firmware --verbose --dither --rand --fixup --samplerate
+  --gainmode --gain --att --queuedepth --reqsize --ctrl-timeout
+  --stream-timeout --watchdog-timeout --help`).  Catches accidental
+  flag drops.
+- `--does-not-exist` exits non-zero.
+- No-device run with stdout redirected exits 1 (not 0, not segfault).
+
+**Pass criteria:** all subtests print `ok`, the script prints
+`ALL OK`, exit 0.
 
 ---
 
-## 4. Hardware-in-Loop Streaming (Phase B)
+## 3. Phase B — hardware in loop
 
-### B1. Device Discovery
-
-Cases:
-1. RX888 not connected -- exits cleanly with clear message.
-2. RX888 in APP PID state (0x00f1) -- opens and streams.
-3. RX888 in BOOT PID state (0x00f3) -- uploads firmware (when `-f`
-   provided), transitions to APP PID, then streams.
-
-### B2. Control-Plane Configuration
-
-Run combinations:
-- Gain mode: high/low
-- Gain: min/mid/max (0, 64, 127)
-- Attenuation: 0, 10, 63
-- Sample rate: 32000000, 135000000
-
-Pass criteria: control transfers succeed (no libusb errors), device
-streams after configuration, no wedges on settings changes.
-
-### B3. Throughput
-
-Run with USB3 settings:
+Run with `RX888_HW_TEST=1` once an RX888 is plugged in, firmware has
+been fetched (`make firmware`), and `usbfs_memory_mb` is set
+appropriately.
 
 ```sh
-# Baseline
-./rx888_stream -s 135000000 -p 1024 -q 32 | pv -rab -B 4M > /dev/null
-
-# Stress
-./rx888_stream -s 135000000 -p 2048 -q 64 | pv -rab -B 4M > /dev/null
+RX888_HW_TEST=1 make hw-check
 ```
 
-Pass criteria:
-- Sustained throughput near ~257 MiB/s for 135 MS/s int16 real.
-- `write()` sizes near transfer size (~1 MiB), not 8 KiB.
-- No periodic stalls > 100 ms under normal desktop load.
+`hw-check` runs three scripts in sequence; each fails fast.
 
-### B4. Backpressure and Broken Pipe
-
-Tests:
-1. Consumer exits immediately: `./rx888_stream ... | head -c 1 > /dev/null`
-2. Slow consumer: `./rx888_stream ... | pv -L 10m > /dev/null`
-
-Pass criteria: driver exits cleanly without segfault, writer thread
-terminates, transfers cancelled and freed, no runaway CPU loop.
-
-### B5. Controlled Disconnect
-
-While streaming, physically unplug RX888 (or disable hub port).
-
-Pass criteria: driver detects `LIBUSB_TRANSFER_NO_DEVICE` and exits
-cleanly. No hang, no segfault.
-
-### B6. CPU Jitter Resilience
-
-While streaming, introduce background load:
+Bench-side sanitizer passes (where ASan really earns its keep — the
+streaming path exercises libusb transfer lifetimes, the SPSC ring,
+and writer/event/control-thread coordination):
 
 ```sh
-stress-ng --cpu 4 --timeout 30
-stress-ng --hdd 2 --timeout 30
+RX888_HW_TEST=1 make SAN=address,undefined hw-check
+RX888_HW_TEST=1 make SAN=thread             hw-check     # see caveats
 ```
 
-Pass criteria: no wedges, minimal dropouts. If dropouts occur, they are
-logged and the program exits cleanly (fail-fast) rather than crashing.
+The `thread` build is mutually exclusive with `address` and slows
+streaming by ~10x; expect USB overruns at 32 MS/s.  Use the
+shortest possible run (`RX888_SECS=1 RX888_CYCLES=1`) and treat the
+goal as "exercise the threading code paths once, look for warnings"
+rather than "validate throughput."
+
+### B1. `tests/hw_smoke.sh` — sustained throughput
+
+Captures `RX888_SECS` (default 10) seconds of samples at
+`RX888_RATE` (default 32 MS/s) and checks the byte count is within
+`RX888_TOL_PCT` (default ±10 %) of the expected `rate × 2 × secs`.
+
+Catches: stalls, dropped buffers, USB misconfiguration, queue/packet
+sizing wrong.  Inspired by the `sustained_stream` scenario in
+rx888-firmware's `fw_test.sh`; written fresh.
+
+### B2. `tests/hw_stop_start.sh` — re-entrancy
+
+Runs `RX888_CYCLES` (default 5) consecutive open/start/stop/close
+cycles, verifying each produces non-trivial data and exits cleanly.
+
+Catches: resource leaks (transfers, threads, USB handles), FX3
+state-machine bugs that only show up after a few cycles, librx888
+teardown issues.
+
+### B3. `tests/hw_sample_check.py` — content sanity
+
+Captures `RX888_SECS` (default 3) seconds of `int16` samples and
+verifies properties that hold for any healthy ADC capture, with no
+assumptions about a known signal at the antenna:
+
+| Check                          | Default threshold | Override env var       |
+|--------------------------------|-------------------|------------------------|
+| Longest run of identical samples | ≤ 1024          | `RX888_MAX_RUN`        |
+| DC offset                       | \|x\| ≤ 4096    | `RX888_MAX_DC`         |
+| Sample stddev (first 1M)        | ≥ 1             | `RX888_MIN_STDDEV`     |
+| Saturation (\|x\| ≥ 32700)      | ≤ 1.0 %         | `RX888_MAX_SAT_PCT`    |
+
+Catches: stale-buffer reuse (constant runs), dead input (low stddev),
+overdriven input (saturation).  Pure-Python so it runs without
+NumPy/SciPy.
+
+### B4. Manual checks worth keeping in your head
+
+These aren't scripted yet:
+
+- **Broken pipe behaviour:**
+  `rx888_stream ... | head -c 1 > /dev/null` — should exit cleanly,
+  no hang, no leftover process.
+- **Controlled disconnect:** unplug the device mid-stream — should
+  exit on `LIBUSB_TRANSFER_NO_DEVICE`, no segfault.
+- **CPU jitter resilience:** run `stress-ng --cpu 4 --timeout 30` in
+  parallel with a 30-minute capture; should sustain throughput.
+- **30-minute soak:** any of the above commands run for 30 minutes
+  to a `pv -rab > /dev/null` consumer.  Watch for runaway memory or
+  drifting MiB/s.
+
+If any of these become recurring concerns, fold them into
+`tests/hw_*` scripts.
 
 ---
 
-## 5. Functional Correctness
+## 4. Exit criteria
 
-### C1. IQ Framing Sanity
+`librx888` and `rx888_stream` are considered ready when:
 
-Capture a few seconds and inspect:
-- File size matches expected rate (bytes/sec).
-- Sample alignment (even number of bytes, consistent framing).
-- Optional: apply known signal and confirm spectrum looks plausible.
-
-Pass criteria: no corruption patterns (periodic zeros, repeated blocks).
-
----
-
-## 6. Exit Criteria
-
-`rx888_stream` is considered ready when:
-
-- No warnings on gcc/clang builds with strict flags.
-- No sanitizer findings in build-only runs.
-- Can stream continuously for 30 minutes with `-p 1024 -q 32` to a
-  consumer without wedges.
-- Clean behavior on consumer exit (EPIPE).
-- Clean behavior on device disconnect (NO_DEVICE).
+- `make all` passes under `-Werror` on gcc and clang.
+- `make check`, `make check-asan`, and `make check-valgrind` all
+  pass with no failures.
+- `make hw-check` passes with the default thresholds at 32 MS/s.
+- `RX888_HW_TEST=1 make SAN=address,undefined hw-check` is clean
+  before merging to main.
+- A 30-minute 135 MS/s capture to `pv -rab -B 4M > /dev/null`
+  sustains ≥ 90 % of theoretical throughput.
+- Manual broken-pipe and disconnect checks exit cleanly.
 
 ---
 
-## Appendix: Quick Test Commands
+## Appendix — quick commands
 
 ```sh
-# Throughput
-./rx888_stream -s 135000000 -p 1024 -q 32 | pv -rab -B 4M > /dev/null
+# Non-hardware (CI runs all three)
+make check
+make check-asan
+make check-valgrind
 
-# TTY check (no redirection -- should refuse)
-./rx888_stream -s 135000000; echo "exit: $?"
+# Hardware (with device + firmware fetched)
+make firmware
+RX888_HW_TEST=1 make hw-check
+RX888_HW_TEST=1 make SAN=address,undefined hw-check    # bench
 
-# Syscall size check
-sudo strace -f -tt -e trace=write -s 0 -p $(pidof rx888_stream)
+# Throughput watch
+./rx888_stream -v -s 135000000 > /dev/null
 
 # Broken pipe
-./rx888_stream -s 135000000 -p 1024 -q 32 | head -c 1 > /dev/null
-
-# CPU jitter stress (run in parallel with streaming)
-stress-ng --cpu 4 --timeout 30
+./rx888_stream -s 32000000 | head -c 1 > /dev/null; echo "exit=$?"
 ```

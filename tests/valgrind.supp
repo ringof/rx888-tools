@@ -1,0 +1,34 @@
+# Valgrind suppressions for librx888 tests.
+#
+# Suppresses noise from libraries we don't control.  Real leaks in
+# librx888 should still surface.
+
+# libusb's internal static init allocates an event-source structure
+# that persists for the process lifetime; valgrind reports it as
+# "possibly lost" or "still reachable" depending on glibc version.
+{
+   libusb-static-init
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:libusb_init*
+}
+
+# Same for libusb_exit cleanup paths that don't free poll FDs in some
+# versions.
+{
+   libusb-exit-fd
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:libusb_exit*
+}
+
+# dlopen / ld.so internals — not ours to fix.
+{
+   ld-so-dlopen
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_dl_*
+}

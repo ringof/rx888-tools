@@ -1,16 +1,17 @@
 # Hardware Integration Tests
 
-Quick tests to run on a machine with an RX888 connected. These
-exercise the code paths that cannot be validated without hardware:
-USB streaming, DSP under real data rates, full pipeline integration,
-and signal handling under load.
+Tests to run on a machine with an RX888 connected.  These exercise
+code paths that cannot be validated without hardware: USB streaming,
+DSP under real data rates, full pipeline integration, and signal
+handling under load.
 
 **Prerequisites:**
 - RX888 / RX888mk2 connected via USB3
 - `usbfs_memory_mb` set to at least 256 (see README)
-- All three binaries built (`make`)
+- All three binaries built (`make all`)
+- Firmware fetched (`make firmware`)
 - `mbuffer` installed
-- Optional: 50-ohm terminator on RF input (for consistent noise floor)
+- Optional: 50-Ω terminator on RF input (for consistent noise floor)
 
 **Note:** The FX3 boots in DFU mode (PID `0x00f3`) after every
 power-cycle. All commands below include `-f firmware/SDDC_FX3.img` to
@@ -18,6 +19,29 @@ upload firmware on first use. After a successful upload the device
 re-enumerates to app mode (PID `0x00f1`) and subsequent runs in the
 same power cycle do not strictly require `-f`, but including it is
 harmless and keeps the commands copy-paste safe.
+
+---
+
+## 0. Quick path: `make hw-check`
+
+For the librx888 / `rx888_stream` slice — throughput, stop/start
+re-entrancy, sample-content sanity — there's a single command that
+runs the three scripts under `tests/hw_*`:
+
+```sh
+make firmware                         # once, to fetch the pinned blob
+RX888_HW_TEST=1 make hw-check
+```
+
+Knobs: `RX888_RATE` (default 32000000), `RX888_SECS` (default 10 for
+smoke / 3 for sample check), `RX888_CYCLES` (default 5 for stop/start),
+`RX888_TOL_PCT` (default 10 % byte-count tolerance).  See
+[`doc/rx888_stream_testplan.md`](rx888_stream_testplan.md) §3 for the
+full set.
+
+The pipeline-level scenarios below (sections 1+) are still useful for
+exercising rx888_dsp + iqrecord against real samples and for the
+soak / signal / disconnect paths that the scripted tests don't cover.
 
 ---
 

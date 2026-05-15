@@ -1,0 +1,4 @@
+# SDDC_FX3.img is fetched by `make firmware` from rx888-firmware
+# at the tag pinned in firmware/VERSION.  Never committed.
+SDDC_FX3.img
+SDDC_FX3.img.tmp

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev
+
+      - name: Build (librx888 + binaries)
+        run: make all
+
+      - name: Verify librx888 ABI
+        run: |
+          # Public symbol surface should match exactly what librx888.h declares.
+          actual=$(nm -D --defined-only librx888.so | awk '/ T rx888_/ {print $3}' | sort)
+          expected=$(printf '%s\n' \
+            rx888_close rx888_config_init_default rx888_get_stats \
+            rx888_is_running rx888_open rx888_start rx888_stop \
+            rx888_strerror rx888_version \
+            | sort)
+          diff <(echo "$actual") <(echo "$expected")
+
+      - name: Run non-hardware tests
+        run: make check
+
+  asan-ubsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev
+      - name: Build + tests under ASan + UBSan
+        env:
+          ASAN_OPTIONS:  detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: make check-asan
+
+  valgrind:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev valgrind
+      - name: Build + tests under valgrind memcheck
+        run: make check-valgrind
