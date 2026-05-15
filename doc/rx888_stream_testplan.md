@@ -142,7 +142,7 @@ assumptions about a known signal at the antenna:
 |--------------------------------|-------------------|------------------------|
 | Longest run of identical samples | ≤ 1024          | `RX888_MAX_RUN`        |
 | DC offset                       | \|x\| ≤ 4096    | `RX888_MAX_DC`         |
-| Sample stddev (first 1M)        | ≥ 100           | `RX888_MIN_STDDEV`     |
+| Sample stddev (first 1M)        | ≥ 1             | `RX888_MIN_STDDEV`     |
 | Saturation (\|x\| ≥ 32700)      | ≤ 1.0 %         | `RX888_MAX_SAT_PCT`    |
 
 Catches: stale-buffer reuse (constant runs), dead input (low stddev),

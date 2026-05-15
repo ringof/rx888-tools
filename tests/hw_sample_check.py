@@ -40,7 +40,14 @@ def main() -> int:
     secs      = int(env("RX888_SECS", "3"))
     max_run   = int(env("RX888_MAX_RUN", "1024"))
     max_dc    = int(env("RX888_MAX_DC", "4096"))
-    min_std   = int(env("RX888_MIN_STDDEV", "100"))
+    # MIN_STDDEV defaults very low: the goal is to verify samples are
+    # changing at all (a stuck buffer would have stddev == 0).  Quiet
+    # SDR captures with no antenna routinely land at stddev < 10 LSB.
+    # The longest_run check is what catches stuck-buffer regressions;
+    # this is a belt-and-braces "is anything moving" sanity bound.
+    # Override RX888_MIN_STDDEV if you have a known signal source and
+    # want a tighter check.
+    min_std   = float(env("RX888_MIN_STDDEV", "1"))
     max_sat   = float(env("RX888_MAX_SAT_PCT", "1.0"))
 
     if not os.path.exists(firmware):
@@ -111,10 +118,10 @@ def main() -> int:
     head = samples[: 1 << 20] if len(samples) > (1 << 20) else samples
     stddev = statistics.pstdev(head)
     if stddev < min_std:
-        print(f"FAIL stddev = {stddev:.1f} (min {min_std} — input dead?)")
+        print(f"FAIL stddev = {stddev:.2f} (min {min_std} — input dead?)")
         failures += 1
     else:
-        print(f"ok   stddev = {stddev:.1f}")
+        print(f"ok   stddev = {stddev:.2f}")
 
     # 4. Saturation.
     n_sat = sum(1 for s in samples if abs(s) >= 32700)
