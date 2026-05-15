@@ -34,7 +34,7 @@ static void test_null_safety(void) {
     rx888_stats_t s;
     rx888_get_stats(NULL, &s);
     rx888_get_stats((rx888_t *)0xdeadbeef, NULL);
-    EXPECT(1, "NULL inputs do not crash");
+    EXPECT(rx888_is_running(NULL) == 0, "rx888_is_running(NULL) returns 0");
 }
 
 static void test_version_string(void) {

@@ -451,6 +451,11 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
     out->last_cb_ms = atomic_load(&r->last_cb_ms);
 }
 
+int rx888_is_running(const rx888_t *r) {
+    if (!r) return 0;
+    return atomic_load(&r->stop_flag) ? 0 : 1;
+}
+
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
     if (!out) return LIBUSB_ERROR_INVALID_PARAM;
     *out = NULL;
@@ -589,12 +594,28 @@ fail:
 
 void rx888_stop(rx888_t *r) {
     if (!r) return;
+
+    /* Detect rx888_stop() called from inside the user callback, which
+     * runs on writer_thread.  In that case we can't pthread_join our
+     * own thread, and we mustn't xq_destroy the queue we'll come back
+     * to pop from.  Set stop_flag + shutdown the queue and return;
+     * the caller has to invoke rx888_close() (or rx888_stop() again)
+     * from a different thread to finish teardown.  Without that the
+     * streaming threads stay alive until process exit. */
+    bool from_writer = r->writer_started &&
+                       pthread_equal(pthread_self(), r->writer_thread);
+
     atomic_store(&r->stop_flag, 1);
 
     /* Cancel transfers. */
     if (r->xfer) {
         for (unsigned int i = 0; i < r->nxfers; i++)
             if (r->xfer[i]) (void)libusb_cancel_transfer(r->xfer[i]);
+    }
+
+    if (from_writer) {
+        xq_shutdown(&r->q);
+        return;
     }
 
     /* Pump events briefly so cancellations complete. */
@@ -613,15 +634,22 @@ void rx888_stop(rx888_t *r) {
     if (r->h) (void)rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms,
                                   (uint8_t)STOPFX3, 0u);
 
-    /* Free transfers (may leak if libusb still owns any). */
+    /* Free transfers and their buffers.  If libusb still owns some
+     * transfers (cancellations didn't drain within the 2s window
+     * above), we leak BOTH the transfer objects AND the sample
+     * buffers they point at — libusb has the buffer pointer via
+     * t->buffer and a late callback would touch freed memory.
+     * libusb_close() in rx888_close() reaps most of these; the rest
+     * are released at process exit. */
     unsigned int leaked = atomic_load(&r->in_flight);
-    for (unsigned int i = 0; r->xfer && i < r->nxfers; i++) {
-        if (leaked) break;  /* don't risk use-after-free */
-        if (r->xfer[i]) { libusb_free_transfer(r->xfer[i]); r->xfer[i] = NULL; }
-    }
-    if (r->buf) {
-        for (unsigned int i = 0; i < r->nxfers; i++)
-            if (r->buf[i]) { free(r->buf[i]); r->buf[i] = NULL; }
+    if (!leaked) {
+        for (unsigned int i = 0; r->xfer && i < r->nxfers; i++) {
+            if (r->xfer[i]) { libusb_free_transfer(r->xfer[i]); r->xfer[i] = NULL; }
+        }
+        if (r->buf) {
+            for (unsigned int i = 0; i < r->nxfers; i++)
+                if (r->buf[i]) { free(r->buf[i]); r->buf[i] = NULL; }
+        }
     }
     free(r->xfer); r->xfer = NULL;
     free(r->buf);  r->buf  = NULL;

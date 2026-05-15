@@ -138,10 +138,20 @@ int rx888_open(rx888_t **out, const rx888_config_t *cfg);
 int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user);
 
 /*
- * Stop streaming. Cancels in-flight transfers, joins both threads.
+ * Stop streaming.  Cancels in-flight transfers; joins the event and
+ * writer threads when called from a thread other than the writer.
  * After stop() returns, the user callback will not be invoked again.
- * Safe to call multiple times. Safe to call from inside the user
- * callback (deferred until the callback returns).
+ *
+ * Safe to call multiple times.
+ *
+ * Safe to call from inside the user callback.  In that case stop()
+ * sets the stop flag, cancels transfers, signals the writer's queue
+ * to wake, and returns immediately.  The writer thread exits when
+ * the callback returns; the event thread exits when it next checks
+ * the flag.  The caller MUST then invoke rx888_close() (or another
+ * rx888_stop()) from a different thread to finish teardown —
+ * otherwise the streaming threads and their resources stay alive
+ * until process exit.
  */
 void rx888_stop(rx888_t *r);
 
@@ -156,6 +166,18 @@ void rx888_close(rx888_t *r);
  * use only for monitoring, not for invariants.
  */
 void rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
+
+/*
+ * Returns 1 while the stream is active, 0 once librx888 has
+ * internally stopped streaming (NO_DEVICE, watchdog fired, libusb
+ * error, or rx888_stop() was called).  Before rx888_start() the
+ * return value is also 1 — call after start() to be meaningful.
+ *
+ * Callers should poll this from their main loop to notice when the
+ * library has decided to stop on its own, since stop() does not yet
+ * have a notification port.
+ */
+int rx888_is_running(const rx888_t *r);
 
 /*
  * Format a libusb error code as a human-readable string.

@@ -26,7 +26,8 @@ jobs:
           actual=$(nm -D --defined-only librx888.so | awk '/ T rx888_/ {print $3}' | sort)
           expected=$(printf '%s\n' \
             rx888_close rx888_config_init_default rx888_get_stats \
-            rx888_open rx888_start rx888_stop rx888_strerror rx888_version \
+            rx888_is_running rx888_open rx888_start rx888_stop \
+            rx888_strerror rx888_version \
             | sort)
           diff <(echo "$actual") <(echo "$expected")
 

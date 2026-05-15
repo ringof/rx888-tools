@@ -163,9 +163,18 @@ int main(int argc, char **argv) {
 
     uint64_t t0 = monotonic_ms();
     uint64_t prev_bytes = 0;
+    int internal_stop = 0;
     while (!g_stop) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
         nanosleep(&ts, NULL);
+
+        /* Notice if librx888 stopped internally (NO_DEVICE, watchdog
+         * fire, libusb error) and exit accordingly — otherwise the
+         * CLI would sleep forever after a hardware failure. */
+        if (!rx888_is_running(r)) {
+            internal_stop = 1;
+            break;
+        }
 
         if (verbose) {
             static uint64_t next_print = 0;
@@ -188,5 +197,10 @@ int main(int argc, char **argv) {
     }
 
     rx888_close(r);
+    if (internal_stop) {
+        fprintf(stderr, "%s: stream stopped by library "
+                "(device error, watchdog, or libusb failure)\n", PROG_NAME);
+        return 1;
+    }
     return 0;
 }

@@ -37,6 +37,7 @@ void rx888_close(rx888_t  *r);
 
 /* Diagnostics */
 void        rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
+int         rx888_is_running(const rx888_t *r);
 const char *rx888_strerror(int err);
 const char *rx888_version(void);
 ```
