@@ -1,10 +1,10 @@
 /*
  * rx888_stream — thin CLI wrapper over librx888.
  *
- * Replaces the previous rx888_stream.c. All the libusb / threading /
- * descriptor logic now lives in librx888; this file just parses
- * options, opens the device, registers a "write samples to stdout"
- * callback, and waits for SIGINT.
+ * All the libusb / threading / descriptor logic lives in librx888;
+ * this file parses options, opens the device, registers a "write
+ * samples to stdout" callback, and waits for SIGINT.  -v prints
+ * librx888 stats every second to stderr.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -51,19 +51,39 @@ static void sample_cb(const int16_t *samples, size_t nsamples, void *user) {
     }
 }
 
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [options] > iq.raw\n"
-        "  -f, --firmware <file>      Upload firmware if device in boot mode\n"
-        "  -s, --samplerate <Hz>      Sample rate (32000000 or 135000000)\n"
-        "  -d, --dither               Enable dither\n"
-        "  -r, --rand                 Enable randomizer (also enables fixup)\n"
-        "  -m, --gainmode <low|high>  Gain mode (default high)\n"
-        "  -g, --gain <0..127>        VGA gain code\n"
-        "  -a, --att <0..63>          DAT-31 attenuator (half-dB steps)\n"
-        "  -h, --help                 This help\n",
+        "  -f, --firmware <file>       Upload firmware if device is in boot mode\n"
+        "  -v, --verbose               Print stats once per second to stderr\n"
+        "  -d, --dither                Enable dither GPIO\n"
+        "  -r, --rand                  Enable randomizer GPIO + sample fixup\n"
+        "      --fixup                 Enable sample fixup independently of -r\n"
+        "  -s, --samplerate <Hz>       Sample rate (e.g. 32000000, 135000000)\n"
+        "  -m, --gainmode <low|high>   Gain mode (default high)\n"
+        "  -g, --gain <0..127>         VGA gain code\n"
+        "  -a, --att <0..63>           DAT-31 attenuator (half-dB steps)\n"
+        "  -q, --queuedepth <N>        Concurrent USB transfers (default 32)\n"
+        "  -p, --reqsize <N>           Transfer size in packets (default 1024)\n"
+        "      --ctrl-timeout <ms>     Control transfer timeout (default 5000)\n"
+        "      --stream-timeout <ms>   Bulk transfer timeout (default 0 = infinite)\n"
+        "      --watchdog-timeout <ms> No-data watchdog (default 3000; 0 disables)\n"
+        "  -h, --help                  Show this help\n",
         argv0);
 }
+
+enum {
+    OPT_FIXUP = 0x100,
+    OPT_CTRL_TIMEOUT,
+    OPT_STREAM_TIMEOUT,
+    OPT_WATCHDOG_TIMEOUT,
+};
 
 int main(int argc, char **argv) {
     struct sigaction sa = {0};
@@ -73,36 +93,38 @@ int main(int argc, char **argv) {
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
 
-    rx888_config_t cfg = {
-        .samplerate    = 32000000u,
-        .att           = 0,
-        .gain          = 0,
-        .gain_high     = 1,
-        .dither        = 0,
-        .randomizer    = 0,
-        .fixup_samples = 0,
-        .firmware_path = NULL,
-    };
+    rx888_config_t cfg;
+    rx888_config_init_default(&cfg);
+    int verbose = 0;
 
     static struct option opts[] = {
-        {"firmware",   required_argument, 0, 'f'},
-        {"samplerate", required_argument, 0, 's'},
-        {"dither",     no_argument,       0, 'd'},
-        {"rand",       no_argument,       0, 'r'},
-        {"gainmode",   required_argument, 0, 'm'},
-        {"gain",       required_argument, 0, 'g'},
-        {"att",        required_argument, 0, 'a'},
-        {"help",       no_argument,       0, 'h'},
+        {"firmware",         required_argument, 0, 'f'},
+        {"verbose",          no_argument,       0, 'v'},
+        {"samplerate",       required_argument, 0, 's'},
+        {"dither",           no_argument,       0, 'd'},
+        {"rand",             no_argument,       0, 'r'},
+        {"fixup",            no_argument,       0, OPT_FIXUP},
+        {"gainmode",         required_argument, 0, 'm'},
+        {"gain",             required_argument, 0, 'g'},
+        {"att",              required_argument, 0, 'a'},
+        {"queuedepth",       required_argument, 0, 'q'},
+        {"reqsize",          required_argument, 0, 'p'},
+        {"ctrl-timeout",     required_argument, 0, OPT_CTRL_TIMEOUT},
+        {"stream-timeout",   required_argument, 0, OPT_STREAM_TIMEOUT},
+        {"watchdog-timeout", required_argument, 0, OPT_WATCHDOG_TIMEOUT},
+        {"help",             no_argument,       0, 'h'},
         {0,0,0,0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "f:s:drm:g:a:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "f:vs:drm:g:a:q:p:h", opts, NULL)) != -1) {
         switch (c) {
         case 'f': cfg.firmware_path = optarg; break;
+        case 'v': verbose = 1; break;
         case 's': cfg.samplerate = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'd': cfg.dither = 1; break;
         case 'r': cfg.randomizer = 1; cfg.fixup_samples = 1; break;
+        case OPT_FIXUP: cfg.fixup_samples = 1; break;
         case 'm':
             if (!strcmp(optarg, "low"))       cfg.gain_high = 0;
             else if (!strcmp(optarg, "high")) cfg.gain_high = 1;
@@ -110,6 +132,11 @@ int main(int argc, char **argv) {
             break;
         case 'g': cfg.gain = (unsigned)strtoul(optarg, NULL, 10) & 0x7fu; break;
         case 'a': cfg.att  = (unsigned)strtoul(optarg, NULL, 10) & 0x3fu; break;
+        case 'q': cfg.queue_depth = (unsigned)strtoul(optarg, NULL, 10); break;
+        case 'p': cfg.req_packets = (unsigned)strtoul(optarg, NULL, 10); break;
+        case OPT_CTRL_TIMEOUT:     cfg.ctrl_timeout_ms   = (unsigned)strtoul(optarg, NULL, 10); break;
+        case OPT_STREAM_TIMEOUT:   cfg.stream_timeout_ms = (unsigned)strtoul(optarg, NULL, 10); break;
+        case OPT_WATCHDOG_TIMEOUT: cfg.watchdog_ms       = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -134,9 +161,30 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    uint64_t t0 = monotonic_ms();
+    uint64_t prev_bytes = 0;
     while (!g_stop) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
         nanosleep(&ts, NULL);
+
+        if (verbose) {
+            static uint64_t next_print = 0;
+            uint64_t now = monotonic_ms();
+            if (next_print == 0) next_print = now + 1000;
+            if (now >= next_print) {
+                rx888_stats_t s;
+                rx888_get_stats(r, &s);
+                double secs = (now - t0) / 1000.0;
+                double mibs = (double)(s.bytes_out - prev_bytes) / (1024.0 * 1024.0);
+                fprintf(stderr,
+                    "t=%.0fs ok=%llu bad=%llu in_flight=%u "
+                    "out=%.2f MiB (%.2f MiB/s)\n",
+                    secs, s.ok_xfers, s.bad_xfers, s.in_flight,
+                    (double)s.bytes_out / (1024.0 * 1024.0), mibs);
+                prev_bytes = s.bytes_out;
+                next_print += 1000;
+            }
+        }
     }
 
     rx888_close(r);

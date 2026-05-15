@@ -33,6 +33,15 @@ extern "C" {
 /* Opaque handle. */
 typedef struct rx888 rx888_t;
 
+/* Live counters, snapshot via rx888_get_stats(). */
+typedef struct {
+    unsigned long long ok_xfers;      /* completed bulk transfers */
+    unsigned long long bad_xfers;     /* errored / cancelled / submit failures */
+    unsigned long long bytes_out;     /* cumulative bytes delivered to callback */
+    unsigned int       in_flight;     /* outstanding USB transfers */
+    unsigned long long last_cb_ms;    /* monotonic ms of most recent callback */
+} rx888_stats_t;
+
 /*
  * Sample callback. Invoked from librx888's writer thread.
  *
@@ -72,6 +81,16 @@ typedef void (*rx888_sample_cb_t)(const int16_t *samples,
  * firmware_path Optional path to FX3 firmware image. If non-NULL and
  *               the device is in bootloader mode, it'll be uploaded.
  *               If NULL, the device must already be loaded.
+ *
+ * The fields below are tuning knobs. Call rx888_config_init_default()
+ * before mutating to get sane values; rx888_open() rejects a struct
+ * with queue_depth, req_packets, or ctrl_timeout_ms set to zero.
+ *
+ * queue_depth        Concurrent in-flight USB transfers. Default 32.
+ * req_packets        Transfer size in USB packets. Default 1024.
+ * ctrl_timeout_ms    Vendor control-transfer timeout. Default 5000.
+ * stream_timeout_ms  Bulk transfer timeout, 0 = infinite (default).
+ * watchdog_ms        No-data watchdog; 0 disables. Default 3000.
  */
 typedef struct {
     unsigned int samplerate;
@@ -82,7 +101,20 @@ typedef struct {
     int          randomizer;
     int          fixup_samples;
     const char  *firmware_path;
+
+    unsigned int queue_depth;
+    unsigned int req_packets;
+    unsigned int ctrl_timeout_ms;
+    unsigned int stream_timeout_ms;
+    unsigned int watchdog_ms;
 } rx888_config_t;
+
+/*
+ * Populate cfg with library defaults (32 MS/s, no gain, no att, etc.
+ * plus the tuning knobs above). Callers should use this and then
+ * override only the fields they care about.
+ */
+void rx888_config_init_default(rx888_config_t *cfg);
 
 /*
  * Open the device, upload firmware if needed, claim the interface,
@@ -117,6 +149,13 @@ void rx888_stop(rx888_t *r);
  * Release all resources. Implies rx888_stop() if streaming is active.
  */
 void rx888_close(rx888_t *r);
+
+/*
+ * Snapshot live counters. Safe to call from any thread while
+ * streaming. Fields are read atomically but not as a coherent group;
+ * use only for monitoring, not for invariants.
+ */
+void rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
 
 /*
  * Format a libusb error code as a human-readable string.

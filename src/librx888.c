@@ -53,12 +53,13 @@ static const uint16_t RX888_VID      = 0x04b4;
 static const uint16_t RX888_PID_BOOT = 0x00f3;
 static const uint16_t RX888_PID_APP  = 0x00f1;
 
-/* Tunables (compiled-in for v0.0; expose as setters later if needed). */
-static const unsigned int CFG_QUEUE_DEPTH       = 32;
-static const unsigned int CFG_REQ_PACKETS       = 1024;
-static const unsigned int CFG_CTRL_TIMEOUT_MS   = 5000;
-static const unsigned int CFG_STREAM_TIMEOUT_MS = 0;     /* infinite */
-static const unsigned int CFG_WATCHDOG_MS       = 3000;
+/* Library defaults; rx888_config_init_default() copies these into the
+ * caller's config struct. rx888_open() validates the result. */
+static const unsigned int DEF_QUEUE_DEPTH       = 32;
+static const unsigned int DEF_REQ_PACKETS       = 1024;
+static const unsigned int DEF_CTRL_TIMEOUT_MS   = 5000;
+static const unsigned int DEF_STREAM_TIMEOUT_MS = 0;     /* infinite */
+static const unsigned int DEF_WATCHDOG_MS       = 3000;
 static const unsigned int CFG_CTRL_SETTLE_US    = 5000;
 
 /* ----------------------------- helpers ---------------------------------- */
@@ -157,8 +158,9 @@ static struct libusb_transfer *xq_pop_blocking(xfer_queue_t *q) {
 
 /* ------------------------ control transfers ----------------------------- */
 
-static int ctrl_write_u32(libusb_device_handle *h, uint8_t request,
-                          uint16_t wValue, uint16_t wIndex, uint32_t value_le) {
+static int ctrl_write_u32(libusb_device_handle *h, unsigned int timeout_ms,
+                          uint8_t request, uint16_t wValue,
+                          uint16_t wIndex, uint32_t value_le) {
     uint8_t data[4] = {
         (uint8_t)(value_le & 0xffu),
         (uint8_t)((value_le >> 8) & 0xffu),
@@ -167,34 +169,37 @@ static int ctrl_write_u32(libusb_device_handle *h, uint8_t request,
     };
     int r = libusb_control_transfer(
         h, (uint8_t)(LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE),
-        request, wValue, wIndex, data, (uint16_t)sizeof(data), CFG_CTRL_TIMEOUT_MS);
+        request, wValue, wIndex, data, (uint16_t)sizeof(data), timeout_ms);
     if (r < 0) return r;
     if (r != (int)sizeof(data)) return LIBUSB_ERROR_IO;
     return 0;
 }
 
-static int ctrl_write_buf(libusb_device_handle *h, uint8_t request,
-                          uint16_t wValue, uint16_t wIndex,
+static int ctrl_write_buf(libusb_device_handle *h, unsigned int timeout_ms,
+                          uint8_t request, uint16_t wValue, uint16_t wIndex,
                           const uint8_t *buf, uint16_t len) {
     int r = libusb_control_transfer(
         h, (uint8_t)(LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE),
-        request, wValue, wIndex, (unsigned char *)buf, len, CFG_CTRL_TIMEOUT_MS);
+        request, wValue, wIndex, (unsigned char *)buf, len, timeout_ms);
     if (r < 0) return r;
     if (r != (int)len) return LIBUSB_ERROR_IO;
     return 0;
 }
 
-static int rx888_set_arg(libusb_device_handle *h, uint16_t arg_id, uint16_t arg_val) {
+static int rx888_set_arg(libusb_device_handle *h, unsigned int timeout_ms,
+                         uint16_t arg_id, uint16_t arg_val) {
     uint8_t zero = 0;
-    return ctrl_write_buf(h, (uint8_t)SETARGFX3, arg_val, arg_id, &zero, 1);
+    return ctrl_write_buf(h, timeout_ms, (uint8_t)SETARGFX3, arg_val, arg_id, &zero, 1);
 }
 
-static int rx888_gpio(libusb_device_handle *h, uint32_t gpio_bits) {
-    return ctrl_write_u32(h, (uint8_t)GPIOFX3, 0, 0, gpio_bits);
+static int rx888_gpio(libusb_device_handle *h, unsigned int timeout_ms,
+                      uint32_t gpio_bits) {
+    return ctrl_write_u32(h, timeout_ms, (uint8_t)GPIOFX3, 0, 0, gpio_bits);
 }
 
-static int rx888_cmd_u32(libusb_device_handle *h, uint8_t cmd, uint32_t val) {
-    return ctrl_write_u32(h, cmd, 0, 0, val);
+static int rx888_cmd_u32(libusb_device_handle *h, unsigned int timeout_ms,
+                         uint8_t cmd, uint32_t val) {
+    return ctrl_write_u32(h, timeout_ms, cmd, 0, 0, val);
 }
 
 /* -------------------------- discovery / open --------------------------- */
@@ -336,6 +341,7 @@ struct rx888 {
     atomic_ullong  last_cb_ms;
     atomic_ullong  ok_xfers;
     atomic_ullong  bad_xfers;
+    atomic_ullong  bytes_out;
 };
 
 /* ------------------------------ streaming ------------------------------- */
@@ -374,6 +380,7 @@ static void *writer_main(void *arg) {
         if (t->status == LIBUSB_TRANSFER_COMPLETED) {
             atomic_fetch_add(&r->ok_xfers, 1);
             if (t->actual_length > 0) {
+                atomic_fetch_add(&r->bytes_out, (unsigned long long)t->actual_length);
                 if (r->fixup_samples)
                     sample_fixup_i16_inplace((uint8_t *)t->buffer, t->actual_length);
                 if (r->cb) {
@@ -407,9 +414,9 @@ static void *event_main(void *arg) {
         if (rc == LIBUSB_ERROR_INTERRUPTED) continue;
         if (rc != 0) { atomic_store(&r->stop_flag, 1); break; }
 
-        if (CFG_WATCHDOG_MS > 0 && atomic_load(&r->in_flight) > 0) {
+        if (r->cfg.watchdog_ms > 0 && atomic_load(&r->in_flight) > 0) {
             uint64_t last = atomic_load(&r->last_cb_ms);
-            if (last && monotonic_ms() - last > CFG_WATCHDOG_MS) {
+            if (last && monotonic_ms() - last > r->cfg.watchdog_ms) {
                 atomic_store(&r->stop_flag, 1);
                 break;
             }
@@ -423,9 +430,37 @@ static void *event_main(void *arg) {
 const char *rx888_strerror(int err) { return libusb_error_name(err); }
 const char *rx888_version(void)     { return LIBRX888_VERSION_STR; }
 
+void rx888_config_init_default(rx888_config_t *cfg) {
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->samplerate        = 32000000u;
+    cfg->gain_high         = 1;
+    cfg->queue_depth       = DEF_QUEUE_DEPTH;
+    cfg->req_packets       = DEF_REQ_PACKETS;
+    cfg->ctrl_timeout_ms   = DEF_CTRL_TIMEOUT_MS;
+    cfg->stream_timeout_ms = DEF_STREAM_TIMEOUT_MS;
+    cfg->watchdog_ms       = DEF_WATCHDOG_MS;
+}
+
+void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
+    if (!r || !out) return;
+    out->ok_xfers   = atomic_load(&r->ok_xfers);
+    out->bad_xfers  = atomic_load(&r->bad_xfers);
+    out->bytes_out  = atomic_load(&r->bytes_out);
+    out->in_flight  = atomic_load(&r->in_flight);
+    out->last_cb_ms = atomic_load(&r->last_cb_ms);
+}
+
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
     if (!out || !cfg) return LIBUSB_ERROR_INVALID_PARAM;
     *out = NULL;
+
+    /* Tuning knobs must be initialised. Callers should use
+     * rx888_config_init_default(); this guards calloc'd structs. */
+    if (cfg->queue_depth == 0 || cfg->req_packets == 0 ||
+        cfg->ctrl_timeout_ms == 0) {
+        return LIBUSB_ERROR_INVALID_PARAM;
+    }
 
     rx888_t *r = calloc(1, sizeof(*r));
     if (!r) return LIBUSB_ERROR_NO_MEM;
@@ -458,27 +493,29 @@ int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
     }
 
     /* Make sure streaming engine is idle before reconfiguring. */
-    (void)rx888_cmd_u32(r->h, (uint8_t)STOPFX3, 0u);
+    (void)rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms, (uint8_t)STOPFX3, 0u);
 
     /* Apply config: GPIO -> attenuator -> VGA -> clock. */
     uint32_t gpio = 0;
     if (cfg->dither)     gpio |= (uint32_t)DITH;
     if (cfg->randomizer) gpio |= (uint32_t)RANDO;
     usleep(CFG_CTRL_SETTLE_US);
-    rc = rx888_gpio(r->h, gpio);
+    rc = rx888_gpio(r->h, r->cfg.ctrl_timeout_ms, gpio);
     if (rc != 0) goto fail;
 
     usleep(CFG_CTRL_SETTLE_US);
-    rc = rx888_set_arg(r->h, (uint16_t)DAT31_ATT, (uint16_t)(cfg->att & 0x3f));
+    rc = rx888_set_arg(r->h, r->cfg.ctrl_timeout_ms,
+                       (uint16_t)DAT31_ATT, (uint16_t)(cfg->att & 0x3f));
     if (rc != 0) goto fail;
 
     usleep(CFG_CTRL_SETTLE_US);
     uint16_t vga = (uint16_t)((cfg->gain & 0x7f) | (cfg->gain_high ? 0x80 : 0));
-    rc = rx888_set_arg(r->h, (uint16_t)AD8340_VGA, vga);
+    rc = rx888_set_arg(r->h, r->cfg.ctrl_timeout_ms, (uint16_t)AD8340_VGA, vga);
     if (rc != 0) goto fail;
 
     usleep(CFG_CTRL_SETTLE_US);
-    rc = rx888_cmd_u32(r->h, (uint8_t)STARTADC, (uint32_t)cfg->samplerate);
+    rc = rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms,
+                       (uint8_t)STARTADC, (uint32_t)cfg->samplerate);
     if (rc != 0) goto fail;
 
     *out = r;
@@ -496,8 +533,8 @@ int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user) {
     atomic_store(&r->stop_flag, 0);
 
     /* Allocate transfer ring. */
-    r->nxfers    = CFG_QUEUE_DEPTH;
-    uint64_t bb  = (uint64_t)CFG_REQ_PACKETS * (uint64_t)r->ep.max_packet;
+    r->nxfers    = r->cfg.queue_depth;
+    uint64_t bb  = (uint64_t)r->cfg.req_packets * (uint64_t)r->ep.max_packet;
     if (bb == 0 || bb > (uint64_t)INT_MAX) return LIBUSB_ERROR_INVALID_PARAM;
     r->buf_bytes = (unsigned int)bb;
 
@@ -520,15 +557,15 @@ int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user) {
         if (!r->buf[i] || !r->xfer[i]) { rc = LIBUSB_ERROR_NO_MEM; goto fail; }
         libusb_fill_bulk_transfer(r->xfer[i], r->h, r->ep.ep_in,
                                   r->buf[i], (int)r->buf_bytes,
-                                  stream_cb, r, CFG_STREAM_TIMEOUT_MS);
+                                  stream_cb, r, r->cfg.stream_timeout_ms);
     }
 
     /* Kick off STARTFX3 then submit transfers. */
     usleep(CFG_CTRL_SETTLE_US);
-    rc = rx888_cmd_u32(r->h, (uint8_t)STARTFX3, 0u);
+    rc = rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms, (uint8_t)STARTFX3, 0u);
     if (rc != 0) goto fail;
     usleep(CFG_CTRL_SETTLE_US);
-    (void)rx888_cmd_u32(r->h, (uint8_t)TUNERSTDBY, 0u);
+    (void)rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms, (uint8_t)TUNERSTDBY, 0u);
 
     for (unsigned int i = 0; i < r->nxfers; i++) {
         rc = libusb_submit_transfer(r->xfer[i]);
@@ -572,7 +609,8 @@ void rx888_stop(rx888_t *r) {
     xq_destroy(&r->q);
 
     /* Tell device to stop. */
-    if (r->h) (void)rx888_cmd_u32(r->h, (uint8_t)STOPFX3, 0u);
+    if (r->h) (void)rx888_cmd_u32(r->h, r->cfg.ctrl_timeout_ms,
+                                  (uint8_t)STOPFX3, 0u);
 
     /* Free transfers (may leak if libusb still owns any). */
     unsigned int leaked = atomic_load(&r->in_flight);
