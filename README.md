@@ -1,4 +1,4 @@
-# rx888_tools
+# rx888-tools
 
 A Linux toolset for high-throughput SDR streaming with the RX888 / RX888mk2.
 The streaming engine is a shared library (`librx888`); on top of it, three
