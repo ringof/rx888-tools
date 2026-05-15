@@ -19,21 +19,25 @@ require a fresh streaming session — which is the right call for a
 Unix pipeline tool (the user restarts the pipe), but is unfriendly
 behaviour inside a GR flowgraph.
 
-## What the existing streamer already handles
+## What librx888 already handles
 
-In the writer thread (`src/rx888_stream.c:619-668`):
+In the writer thread (`src/librx888.c:writer_main`, around
+`src/librx888.c:373`) and the event thread
+(`src/librx888.c:event_main`, around `src/librx888.c:409`):
 
-| Failure | Today's behaviour |
+| Failure | librx888's behaviour |
 |---|---|
-| `LIBUSB_TRANSFER_STALL` / `ERROR` / `OVERFLOW` / `TIMED_OUT` | Warn, resubmit the transfer. Stream continues. |
-| `LIBUSB_TRANSFER_NO_DEVICE` | Set `g_stop`, exit. |
-| Watchdog: no callbacks for `g_watchdog_ms` (`src/rx888_stream.c:1252`) | Set `g_stop`, exit. |
-| Pipe broken (`SIGPIPE` / `EPIPE` on stdout) | Set `g_stop`, exit. |
-| Internal queue full | Set `g_stop`, exit. |
+| `LIBUSB_TRANSFER_STALL` / `ERROR` / `OVERFLOW` / `TIMED_OUT` | Count as `bad_xfers`, attempt resubmit; stream continues. |
+| `LIBUSB_TRANSFER_NO_DEVICE` | Set `stop_flag`; writer thread exits, then `rx888_stop` joins. |
+| Watchdog: no callbacks for `cfg.watchdog_ms` | Set `stop_flag`; same exit path. |
+| Internal queue full | Set `stop_flag`, shutdown ring; same exit path. |
+| Pipe broken (only seen by the CLI) | Caller's `sample_cb` returns; CLI's `g_stop` triggers `rx888_close`. |
 
-So the per-transfer resilience is free. The "session-level" resilience
-(re-open device, re-upload firmware if needed, re-configure, restart)
-does not exist yet.
+So the per-transfer resilience is free.  The "session-level"
+resilience (re-open device, re-upload firmware if needed,
+re-configure, restart) does not exist yet — librx888 doesn't expose
+a `restart()` and `rx888_open` is not currently re-entrant on the
+same handle.
 
 ## Design principle: mechanism in the driver, policy in the block
 

@@ -83,7 +83,8 @@ the block exposes only HF-relevant SETARGs and GPIO bits.
 **Dropped entirely:** all `R82XX_*` SETARGs, `PRESELECTOR`,
 `VHF_ATTENUATOR`, `BIAS_VHF`, `VHF_EN`, `PGA_EN`, and the
 `TUNERINIT` / `TUNERTUNE` / `TUNERSTDBY` vendor commands (including
-the best-effort `TUNERSTDBY` at `src/rx888_stream.c:1202`).
+the best-effort `TUNERSTDBY` at the end of `rx888_start` in
+`src/librx888.c`).
 
 ## Phase 1 — Scaffolding (½ day)
 
@@ -103,27 +104,35 @@ in GRC and runs without crashing.
 
 ## Phase 2 — `rx888_device` core (1 day)
 
-Pure C++ class, no GR dependencies — easier to unit-test and reusable.
+Most of this work is already done — `librx888` (added in this branch)
+has the libusb / threading / control-plane logic.  The C++ wrapper is
+a thin shim that calls into librx888 and exposes a class-shaped API
+to the GR block.
 
-- `open(firmware_path)`: enumerate via libusb, upload firmware if
-  `idProduct == 0x00f3`, wait for re-enumeration to `0x00f1`, claim
-  interface, locate bulk-IN endpoint, compute effective packet size.
-  Mirrors `src/rx888_stream.c:117` and the device-discovery block.
-- `configure(sample_rate, vga, att, dither, randomizer, bias_hf)`:
-  runs the SETARG / GPIO / STARTADC sequence from
-  `src/rx888_stream.c:1155-1190` with the existing 5 ms
-  `CTRL_SETTLE_US` between commands.
-- `start_stream()` / `stop_stream()`: STARTFX3 / STOPFX3.
-- Async transfer engine ported from `stream_setup` / `stream_teardown`
-  (`src/rx888_stream.c:188-790`): N in-flight transfers, libusb
-  event-pump thread, completed transfers pushed onto an SPSC ring of
-  `(uint8_t* buf, size_t len)` pairs.
-- Runtime setters: `set_vga_gain`, `set_attenuation`, `set_dither`,
-  `set_randomizer`, `set_bias_hf`, `set_led(color, on)`. All take a
-  `std::lock_guard<std::mutex>` on a control-endpoint mutex; pace at
-  ≥5 ms internally if back-to-back.
-- Atomic counters exposed by getter: `ok_xfers`, `bad_xfers`,
-  `bytes_out`, `in_flight`, `dropped_blocks`, `last_cb_ms`.
+If we choose to build directly against librx888 instead of writing a
+C++ shim, the work collapses to "wire the library's callback into a
+GR-friendly SPSC ring."  Either way the underlying mechanism is:
+
+- Device open + firmware upload: `librx888.c:open_device` (around
+  `src/librx888.c:227`).
+- Configure / SETARG / GPIO / STARTADC: inline in `rx888_open()`
+  (`src/librx888.c:454`).
+- `start_stream` / `stop_stream`: `STARTFX3` / `STOPFX3` issued from
+  `rx888_start` / `rx888_stop`.
+- Async transfer engine: `librx888.c:writer_main` and
+  `librx888.c:event_main` (around `src/librx888.c:373` and `:409`).
+  N in-flight transfers, libusb event-pump thread, completed
+  transfers pushed onto a thread-safe ring.
+- Runtime setters (`set_vga_gain`, `set_attenuation`, `set_dither`,
+  `set_randomizer`, `set_bias_hf`, `set_led(color, on)`) — **not yet
+  in librx888**; v0.0 of the library is config-at-open only.  Adding
+  setters means adding a control-endpoint mutex and the corresponding
+  `rx888_set_*` exports; tracked as a librx888 follow-up.
+- Atomic counters: `librx888` already exposes `ok_xfers`, `bad_xfers`,
+  `bytes_out`, `in_flight`, `last_cb_ms` via `rx888_get_stats()`
+  (`include/librx888.h`); the GR block adds `dropped_blocks` on its
+  side (count of buffers it had to discard because the GR scheduler
+  couldn't absorb them).
 - `restart()` (added in Phase 4.5; see `stream-division-of-recovery.md`):
   re-entrant `open` + `configure` + `start_stream` so the block can
   bring a wedged FX3 back without process exit.
@@ -131,7 +140,9 @@ Pure C++ class, no GR dependencies — easier to unit-test and reusable.
 **Done when:** a standalone test program in
 `lib/test_rx888_device.cc` opens the device, streams for 10 s at
 32 MS/s, prints the same stats `rx888_stream -v` does, and exits
-cleanly.
+cleanly.  (At the C level, `tests/hw_smoke.sh` already does
+the equivalent against `rx888_stream`; the new test exercises the
+C++ shim path.)
 
 ## Phase 3 — `rx888_source` block (1 day)
 
@@ -199,7 +210,9 @@ See `stream-division-of-recovery.md` for the full rationale. Summary:
 ## Phase 5 — GRC integration & examples (½ day)
 
 - Polish `grc/rx888_rx888_source.block.yml`: parameter labels, ranges,
-  tooltips matching the CLI help in `src/rx888_stream.c:843-870`.
+  tooltips matching the CLI help in
+  `src/rx888_stream.c:usage()` and the field comments in
+  `include/librx888.h`.
 - `examples/rx888_to_file.grc`: source → head(32M samples) →
   file_sink. Equivalent to `rx888_stream … > out.s16`.
 - `examples/rx888_hf_spectrum.grc`: source → short_to_float →
@@ -244,11 +257,12 @@ The OOT module fixes this two ways:
 
 2. In `rx888_device::open()`, compute the required minimum
    (`queue_depth × req_packets × pktsize`) and read the current
-   `usbfs_memory_mb`. If too low, throw a runtime error quoting the
+   `usbfs_memory_mb`.  If too low, throw a runtime error quoting the
    exact `systemd-tmpfiles --create` and `echo` commands needed to
-   fix it. The CLI already computes this value at
-   `src/rx888_stream.c:1152`; we just turn the log line into a hard
-   precondition.
+   fix it.  The arithmetic is the same one librx888 uses to size the
+   transfer ring (`src/librx888.c:rx888_start`); we just turn it into
+   a hard precondition that fails fast with an actionable message
+   instead of letting `LIBUSB_ERROR_NO_MEM` surface mid-stream.
 
 ## Risks & mitigations
 

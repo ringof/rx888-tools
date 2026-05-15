@@ -1,8 +1,9 @@
 # rx888_tools
 
 A Linux toolset for high-throughput SDR streaming with the RX888 / RX888mk2.
-Three command-line programs form a Unix pipeline that captures raw USB3
-samples, decimates them to complex IQ, and records to disk in SigMF format:
+The streaming engine is a shared library (`librx888`); on top of it, three
+command-line programs form a Unix pipeline that captures raw USB3 samples,
+decimates them to complex IQ, and records to disk in SigMF format:
 
 ```
 rx888_stream  →  rx888_dsp  →  iqrecord
@@ -12,8 +13,9 @@ rx888_stream  →  rx888_dsp  →  iqrecord
                    33.75 MS/s out
 ```
 
-Each program does one thing and communicates via pipes, so any stage can be
-replaced, teed, buffered (`mbuffer`, `pv`), or omitted as needed.
+`rx888_stream` is a thin CLI wrapper around `librx888.so`. The library is
+also what `gr-rx888` (a GNU Radio out-of-tree source block, planning docs
+under `doc/gr-rx888/`) will consume — same code path for both.
 
 ---
 
@@ -21,38 +23,61 @@ replaced, teed, buffered (`mbuffer`, `pv`), or omitted as needed.
 
 - **Linux** (x86_64) — kernel USB3 support, sufficient USBFS buffer memory
 - **libusb-1.0** development headers (`libusb-1.0-0-dev` on Debian/Ubuntu)
-- **AVX2 + FMA** capable CPU (required by `rx888_dsp`)
+- **AVX2 + FMA** capable CPU (required by `rx888_dsp` only)
 - **RX888 / RX888mk2** with USB3 cable and host port
+
+Build deps on Ubuntu 24.04:
+
+```bash
+sudo apt install build-essential pkg-config libusb-1.0-0-dev
+```
 
 ---
 
 ## Build
 
 ```bash
-make
+make            # librx888.so + librx888.a + pkg-config + 3 binaries
+make check      # non-hardware ABI / CLI tests (also runs in CI)
 ```
 
-This builds all three binaries in the project root. To build a single
-program:
+To build a single program:
 
 ```bash
-make rx888_stream
+make rx888_stream    # links librx888.so
 make rx888_dsp
 make iqrecord
 ```
 
 ---
 
+## Firmware
+
+The FX3 firmware blob is **not vendored**. It is fetched from the
+[`ringof/rx888-firmware`](https://github.com/ringof/rx888-firmware) release
+matching `firmware/VERSION` and checksum-verified against `firmware/SHA256SUMS`:
+
+```bash
+make firmware                # fetch the pinned version
+make firmware-latest         # bump to the most recent rx888-firmware release
+                             #   (used by the auto-bump CI workflow)
+```
+
+`firmware/SDDC_FX3.img` is gitignored. `make install` refuses to run until
+the blob has been fetched.
+
+---
+
 ## Install / Uninstall
 
 ```bash
-sudo make install                      # installs to /usr/local/bin
-sudo make install PREFIX=/opt/rx888    # or a custom prefix
+sudo make install                      # installs to /usr/local
+sudo make install PREFIX=/opt/rx888    # custom prefix
 sudo make uninstall
 ```
 
-This installs the binaries, the firmware image, and the udev rule. After
-installing, reload udev rules:
+This installs `librx888.so`, `librx888.a`, `librx888.pc`, `librx888.h`,
+the three binaries, the firmware blob, and the udev rule. After installing:
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -62,13 +87,31 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Quick Start
 
-**1. Set up USB buffer memory** (required once per boot for 135 MS/s):
+**1. Set up USB buffer memory** (once per boot for 135 MS/s):
 
 ```bash
 sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
 ```
 
-**2. Stream, decimate, and record:**
+For 32 MS/s, 256 MiB is plenty. To make this persistent, drop a
+`tmpfiles.d` snippet:
+
+```bash
+echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 256' \
+  | sudo tee /usr/lib/tmpfiles.d/rx888.conf
+sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/rx888.conf
+```
+
+(`/etc/modprobe.d/usbcore.conf` does not work on Ubuntu — `usbcore` is
+built into the kernel, not a module.)
+
+**2. Fetch firmware:**
+
+```bash
+make firmware
+```
+
+**3. Stream, decimate, record:**
 
 ```bash
 rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
@@ -76,12 +119,7 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
   | iqrecord /data/capture --freq 7100000 --desc "7.1 MHz capture"
 ```
 
-This uploads firmware (if the device is in DFU mode), captures at
-135 MS/s, decimates 4:1 to 33.75 MS/s cf32, and writes 10-second SigMF
-files to `/data/capture/`. Use `--block-on-full` to backpressure
-instead of dropping blocks when the recorder falls behind.
-
-**3. Stream to GQRX via FIFO:**
+**4. Stream to GQRX via FIFO:**
 
 ```bash
 mkfifo /tmp/iq.fifo
@@ -91,17 +129,17 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 
-**4. Buffer with mbuffer for sustained writes:**
+---
+
+## Tests
 
 ```bash
-rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
-  | rx888_dsp --block-on-full -v \
-  | mbuffer -m 2G -q \
-  | iqrecord /data/capture --freq 7100000
+make check         # non-hardware: librx888 ABI + CLI smoke. Run on every PR.
+make hw-check      # hardware: throughput, stop/start cycles, sample sanity.
+                   # Requires RX888 + RX888_HW_TEST=1.
 ```
 
-The `mbuffer` stage absorbs disk I/O stalls, preventing backpressure
-from reaching the DSP pipeline.
+Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 
 ---
 
@@ -109,44 +147,17 @@ from reaching the DSP pipeline.
 
 | Program | Purpose | Input | Output |
 |---------|---------|-------|--------|
-| `rx888_stream` | USB3 bulk capture | RX888 device | int16 real samples on stdout |
-| `rx888_dsp` | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
-| `iqrecord` | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
+| `rx888_stream` | USB3 bulk capture (CLI over librx888) | RX888 device | int16 real samples on stdout |
+| `rx888_dsp`    | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
+| `iqrecord`     | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
 
-### rx888_stream
+Per-program docs in `doc/`:
 
-```
-rx888_stream -f firmware/SDDC_FX3.img [options] > iq.raw
-```
-
-Key options: `-f <firmware>` (required on first run after power-cycle),
-`-s <Hz>` (sample rate: 32000000 or 135000000, default 32000000),
-`-v` (verbose), `-g <0..127>` (gain), `-q <N>` (queue depth),
-`-p <N>` (request size in packets). Run `rx888_stream -h` for full usage.
-
-### rx888_dsp
-
-```
-rx888_dsp [OPTIONS]
-```
-
-Key options: `-o <path>` (output to FIFO instead of stdout),
-`-v` (verbose + stats), `--block-on-full` (backpressure instead of
-dropping blocks). Send `SIGUSR1` to print live statistics.
-Run `rx888_dsp -h` for full usage.
-
-### iqrecord
-
-```
-iqrecord OUTDIR [--freq HZ] [--desc TEXT] [--fsync]
-```
-
-Reads cf32 IQ from stdin and writes 10-second SigMF file pairs plus a
-session-level `run.json`. Use `--freq` to set the center frequency in
-metadata and `--desc` for a capture description.
-
-See `doc/` for detailed per-program documentation, architecture notes, and
-test plans.
+- `doc/librx888.md` — library API and threading model
+- `doc/rx888_stream.md` — CLI options and pipeline examples
+- `doc/rx888_dsp.md` / `doc/rx888_dsp_arch.md`
+- `doc/iqrecord.md`
+- `doc/gr-rx888/` — design plan for the GNU Radio source block
 
 ---
 
@@ -154,29 +165,35 @@ test plans.
 
 ```
 rx888_tools/
-├── Makefile              Build system with install/uninstall
-├── src/                  Source code (C11)
-│   ├── rx888_stream.c    USB3 streamer + ezusb firmware loader
-│   ├── ezusb.c           EZ-USB/FX3 firmware upload (vendor code)
-│   ├── rx888_dsp.c       AVX2/FMA DSP pipeline (3 threads)
-│   └── iqrecord.c        SigMF recorder with file rotation
-├── include/              Shared headers
-│   ├── rx888.h           RX888 protocol constants
-│   └── ezusb.h           EZ-USB API
-├── doc/                  Documentation
-├── tests/                Test scripts and generators
-├── firmware/             RX888 FX3 firmware image
-└── udev/                 udev rule for non-root device access
+├── Makefile                      Build, install, firmware, tests
+├── src/
+│   ├── librx888.c                Streaming engine (libusb + threading)
+│   ├── ezusb.c                   FX3 firmware upload (vendored, GPL-2.0+)
+│   ├── rx888_stream.c            Thin CLI over librx888 (~200 lines)
+│   ├── rx888_dsp.c               AVX2/FMA DSP pipeline
+│   └── iqrecord.c                SigMF recorder
+├── include/
+│   ├── librx888.h                Public library API
+│   ├── rx888.h                   FX3 protocol constants
+│   └── ezusb.h                   EZ-USB API
+├── firmware/
+│   ├── VERSION                   Pinned rx888-firmware tag
+│   ├── SHA256SUMS                Expected checksum
+│   └── (SDDC_FX3.img)            Fetched, never committed
+├── tests/                        DSP/iqrecord scripts + librx888 + hw tests
+├── doc/                          Documentation
+├── udev/                         udev rule for non-root device access
+└── .github/workflows/            CI + auto-firmware-bump
 ```
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for the full text.
+MIT for the original tools — see [LICENSE](LICENSE).
 
-**Exception:** `src/ezusb.c` and `include/ezusb.h` are GPL-2.0-or-later
-(derived from the Linux kernel fxload utility). Because `rx888_stream`
-links with ezusb, the `rx888_stream` binary is distributed under
-GPL-2.0-or-later. The other two programs (`rx888_dsp`, `iqrecord`) are
-MIT only.
+`src/ezusb.c` and `include/ezusb.h` are GPL-2.0-or-later (derived from the
+Linux kernel `fxload` utility). Because `librx888.so` links them, the
+library and `rx888_stream` binary are distributed under GPL-3.0-or-later
+(compatible with GPL-2.0-or-later upstream and with GNU Radio downstream).
+`rx888_dsp` and `iqrecord` are MIT only.
