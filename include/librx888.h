@@ -33,13 +33,34 @@ extern "C" {
 /* Opaque handle. */
 typedef struct rx888 rx888_t;
 
-/* Live counters, snapshot via rx888_get_stats(). */
+/* Live counters, snapshot via rx888_get_stats().
+ *
+ * The "short transfer" fields track DMA commits whose actual_length is
+ * less than the configured full transfer size (expected_xfer_bytes).
+ * rx888-firmware uses GPIF-side PPS injection to force such a commit on
+ * the rising edge of PPS; the bytes between consecutive short transfers
+ * therefore equal the number of ADC samples (x2 for int16) produced in
+ * one PPS interval. With stock firmware that does not force commits,
+ * short_xfers stays at zero on healthy USB.
+ */
 typedef struct {
-    unsigned long long ok_xfers;      /* completed bulk transfers */
-    unsigned long long bad_xfers;     /* errored / cancelled / submit failures */
-    unsigned long long bytes_out;     /* cumulative bytes delivered to callback */
-    unsigned int       in_flight;     /* outstanding USB transfers */
-    unsigned long long last_cb_ms;    /* monotonic ms of most recent callback */
+    unsigned long long ok_xfers;            /* completed bulk transfers */
+    unsigned long long bad_xfers;           /* errored / cancelled / submit failures */
+    unsigned long long bytes_out;           /* cumulative bytes delivered to callback */
+    unsigned int       in_flight;           /* outstanding USB transfers */
+    unsigned long long last_cb_ms;          /* monotonic ms of most recent callback */
+
+    /* Transfer-length classification. */
+    unsigned int       expected_xfer_bytes; /* configured full transfer length */
+    unsigned long long full_xfers;          /* transfers at expected length */
+    unsigned long long short_xfers;         /* shorter than expected (incl. synthetic) */
+    unsigned long long zero_xfers;          /* zero-length transfers (should be 0) */
+    unsigned int       min_actual_len;      /* smallest non-zero actual_length observed */
+    unsigned int       max_actual_len;      /* largest actual_length observed */
+
+    /* PPS window byte counting. */
+    unsigned long long bytes_in_window;     /* bytes since last short transfer */
+    unsigned long long last_window_bytes;   /* bytes in most recent completed PPS window */
 } rx888_stats_t;
 
 /*
@@ -86,11 +107,16 @@ typedef void (*rx888_sample_cb_t)(const int16_t *samples,
  * before mutating to get sane values; rx888_open() rejects a struct
  * with queue_depth, req_packets, or ctrl_timeout_ms set to zero.
  *
- * queue_depth        Concurrent in-flight USB transfers. Default 32.
- * req_packets        Transfer size in USB packets. Default 1024.
- * ctrl_timeout_ms    Vendor control-transfer timeout. Default 5000.
- * stream_timeout_ms  Bulk transfer timeout, 0 = infinite (default).
- * watchdog_ms        No-data watchdog; 0 disables. Default 3000.
+ * queue_depth                Concurrent in-flight USB transfers. Default 32.
+ * req_packets                Transfer size in USB packets. Default 1024.
+ * ctrl_timeout_ms            Vendor control-transfer timeout. Default 5000.
+ * stream_timeout_ms          Bulk transfer timeout, 0 = infinite (default).
+ * watchdog_ms                No-data watchdog; 0 disables. Default 3000.
+ * debug_synthetic_pps_every  0 = off (default). When >0, every Nth completed
+ *                            transfer is classified as if it were a PPS-aligned
+ *                            short commit. Real data is unaffected. For
+ *                            exercising the short-transfer detector end-to-end
+ *                            against firmware that does not (yet) force commits.
  */
 typedef struct {
     unsigned int samplerate;
@@ -107,6 +133,7 @@ typedef struct {
     unsigned int ctrl_timeout_ms;
     unsigned int stream_timeout_ms;
     unsigned int watchdog_ms;
+    unsigned int debug_synthetic_pps_every;
 } rx888_config_t;
 
 /*

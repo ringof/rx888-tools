@@ -187,9 +187,11 @@ int main(int argc, char **argv) {
                 double mibs = (double)(s.bytes_out - prev_bytes) / (1024.0 * 1024.0);
                 fprintf(stderr,
                     "t=%.0fs ok=%llu bad=%llu in_flight=%u "
-                    "out=%.2f MiB (%.2f MiB/s)\n",
+                    "out=%.2f MiB (%.2f MiB/s) "
+                    "full=%llu short=%llu last_window=%llu\n",
                     secs, s.ok_xfers, s.bad_xfers, s.in_flight,
-                    (double)s.bytes_out / (1024.0 * 1024.0), mibs);
+                    (double)s.bytes_out / (1024.0 * 1024.0), mibs,
+                    s.full_xfers, s.short_xfers, s.last_window_bytes);
                 prev_bytes = s.bytes_out;
                 next_print += 1000;
             }

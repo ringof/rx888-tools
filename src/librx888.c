@@ -41,6 +41,7 @@
 
 #include "ezusb.h"
 #include "librx888.h"
+#include "pps_audit.h"
 #include "rx888.h"
 
 /* ezusb.c expects this symbol */
@@ -342,6 +343,20 @@ struct rx888 {
     atomic_ullong  ok_xfers;
     atomic_ullong  bad_xfers;
     atomic_ullong  bytes_out;
+
+    /* Short-transfer / PPS-window accounting. State owned by writer_thread;
+     * mirrored to the atomics below after each pps_audit_step() so
+     * rx888_get_stats() can read without coordinating. */
+    pps_audit_t    pps;
+    unsigned long  total_xfer_count;       /* writer-thread-only, for synthetic mode */
+    atomic_uint    expected_xfer_bytes;    /* set at start() */
+    atomic_ullong  full_xfers;
+    atomic_ullong  short_xfers;
+    atomic_ullong  zero_xfers;
+    atomic_uint    min_actual_len;
+    atomic_uint    max_actual_len;
+    atomic_ullong  bytes_in_window;
+    atomic_ullong  last_window_bytes;
 };
 
 /* ------------------------------ streaming ------------------------------- */
@@ -379,6 +394,29 @@ static void *writer_main(void *arg) {
 
         if (t->status == LIBUSB_TRANSFER_COMPLETED) {
             atomic_fetch_add(&r->ok_xfers, 1);
+
+            /* Classify the transfer length and update PPS-window state.
+             * Synthetic mode forces a "short" classification every Nth
+             * transfer regardless of actual length; bytes_in_window
+             * still tracks real bytes. */
+            r->total_xfer_count++;
+            int force_short = 0;
+            if (r->cfg.debug_synthetic_pps_every > 0 &&
+                (r->total_xfer_count % r->cfg.debug_synthetic_pps_every) == 0) {
+                force_short = 1;
+            }
+            pps_audit_step(&r->pps,
+                           atomic_load(&r->expected_xfer_bytes),
+                           (uint32_t)t->actual_length,
+                           force_short);
+            atomic_store(&r->full_xfers,        r->pps.full_xfers);
+            atomic_store(&r->short_xfers,       r->pps.short_xfers);
+            atomic_store(&r->zero_xfers,        r->pps.zero_xfers);
+            atomic_store(&r->min_actual_len,    r->pps.min_actual_len);
+            atomic_store(&r->max_actual_len,    r->pps.max_actual_len);
+            atomic_store(&r->bytes_in_window,   r->pps.bytes_in_window);
+            atomic_store(&r->last_window_bytes, r->pps.last_window_bytes);
+
             if (t->actual_length > 0) {
                 atomic_fetch_add(&r->bytes_out, (unsigned long long)t->actual_length);
                 if (r->fixup_samples)
@@ -444,11 +482,19 @@ void rx888_config_init_default(rx888_config_t *cfg) {
 
 void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
     if (!r || !out) return;
-    out->ok_xfers   = atomic_load(&r->ok_xfers);
-    out->bad_xfers  = atomic_load(&r->bad_xfers);
-    out->bytes_out  = atomic_load(&r->bytes_out);
-    out->in_flight  = atomic_load(&r->in_flight);
-    out->last_cb_ms = atomic_load(&r->last_cb_ms);
+    out->ok_xfers            = atomic_load(&r->ok_xfers);
+    out->bad_xfers           = atomic_load(&r->bad_xfers);
+    out->bytes_out           = atomic_load(&r->bytes_out);
+    out->in_flight           = atomic_load(&r->in_flight);
+    out->last_cb_ms          = atomic_load(&r->last_cb_ms);
+    out->expected_xfer_bytes = atomic_load(&r->expected_xfer_bytes);
+    out->full_xfers          = atomic_load(&r->full_xfers);
+    out->short_xfers         = atomic_load(&r->short_xfers);
+    out->zero_xfers          = atomic_load(&r->zero_xfers);
+    out->min_actual_len      = atomic_load(&r->min_actual_len);
+    out->max_actual_len      = atomic_load(&r->max_actual_len);
+    out->bytes_in_window     = atomic_load(&r->bytes_in_window);
+    out->last_window_bytes   = atomic_load(&r->last_window_bytes);
 }
 
 int rx888_is_running(const rx888_t *r) {
@@ -543,6 +589,19 @@ int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user) {
     uint64_t bb  = (uint64_t)r->cfg.req_packets * (uint64_t)r->ep.max_packet;
     if (bb == 0 || bb > (uint64_t)INT_MAX) return LIBUSB_ERROR_INVALID_PARAM;
     r->buf_bytes = (unsigned int)bb;
+
+    /* Reset PPS-window state and publish the full-transfer length to
+     * the atomic snapshot so rx888_get_stats() reflects it from start. */
+    pps_audit_init(&r->pps);
+    r->total_xfer_count = 0;
+    atomic_store(&r->expected_xfer_bytes, r->buf_bytes);
+    atomic_store(&r->full_xfers,        0ULL);
+    atomic_store(&r->short_xfers,       0ULL);
+    atomic_store(&r->zero_xfers,        0ULL);
+    atomic_store(&r->min_actual_len,    0u);
+    atomic_store(&r->max_actual_len,    0u);
+    atomic_store(&r->bytes_in_window,   0ULL);
+    atomic_store(&r->last_window_bytes, 0ULL);
 
     int rc = xq_init(&r->q, (size_t)r->nxfers * 2u);
     if (rc != 0) return LIBUSB_ERROR_NO_MEM;

@@ -86,6 +86,28 @@ static void test_config_init_default(void) {
     EXPECT(cfg.dither             == 0,         "default dither off");
     EXPECT(cfg.randomizer         == 0,         "default randomizer off");
     EXPECT(cfg.fixup_samples      == 0,         "default fixup off");
+    EXPECT(cfg.debug_synthetic_pps_every == 0u,
+                                                "default synthetic-pps debug off");
+}
+
+static void test_stats_struct_layout(void) {
+    /* Verify the snapshot API zero-initialises every new field when
+     * called against a fresh (poisoned) buffer with a NULL handle —
+     * since rx888_get_stats(NULL, ...) is documented as safe, callers
+     * should be able to rely on the fields being readable. */
+    rx888_stats_t s;
+    memset(&s, 0xaa, sizeof s);
+    rx888_get_stats(NULL, &s);  /* no-op; just verifies it links */
+    /* And explicit zero-init must leave PPS fields at sane values. */
+    memset(&s, 0, sizeof s);
+    EXPECT(s.full_xfers          == 0ULL, "zeroed stats: full_xfers");
+    EXPECT(s.short_xfers         == 0ULL, "zeroed stats: short_xfers");
+    EXPECT(s.zero_xfers          == 0ULL, "zeroed stats: zero_xfers");
+    EXPECT(s.bytes_in_window     == 0ULL, "zeroed stats: bytes_in_window");
+    EXPECT(s.last_window_bytes   == 0ULL, "zeroed stats: last_window_bytes");
+    EXPECT(s.expected_xfer_bytes == 0u,   "zeroed stats: expected_xfer_bytes");
+    EXPECT(s.min_actual_len      == 0u,   "zeroed stats: min_actual_len");
+    EXPECT(s.max_actual_len      == 0u,   "zeroed stats: max_actual_len");
 }
 
 static void test_open_no_device(void) {
@@ -111,6 +133,7 @@ int main(void) {
     test_open_validates_null();
     test_open_rejects_uninit_config();
     test_config_init_default();
+    test_stats_struct_layout();
     test_open_no_device();
 
     fprintf(stderr, "\n%s (%d failures)\n",
