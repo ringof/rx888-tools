@@ -27,7 +27,8 @@ fi
 # this fails loudly instead of silently.
 for flag in --firmware --verbose --dither --rand --fixup --samplerate \
             --gainmode --gain --att --queuedepth --reqsize \
-            --ctrl-timeout --stream-timeout --watchdog-timeout --help; do
+            --ctrl-timeout --stream-timeout --watchdog-timeout \
+            --debug-synth-pps --help; do
     if grep -q -- "$flag" "$tmp_help"; then
         ok "help mentions $flag"
     else
