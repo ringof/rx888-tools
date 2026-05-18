@@ -63,7 +63,7 @@ INCDIR := include
 RX888_FW_REPO := ringof/rx888-firmware
 RX888_FW_TAG  := $(strip $(shell cat firmware/VERSION 2>/dev/null))
 RX888_FW_FILE := firmware/SDDC_FX3.img
-RX888_FW_URL  := https://github.com/$(RX888_FW_REPO)/releases/download/$(RX888_FW_TAG)/SDDC_FX3-$(RX888_FW_TAG).img
+RX888_FW_URL  := https://github.com/$(RX888_FW_REPO)/releases/download/$(RX888_FW_TAG)/SDDC_FX3.img
 
 # librx888 sources
 LIBRX_OBJS := $(SRCDIR)/librx888.o $(SRCDIR)/ezusb.o
@@ -165,7 +165,7 @@ firmware-latest:
 	@tag=$$(curl -fsSL https://api.github.com/repos/$(RX888_FW_REPO)/releases/latest | jq -r .tag_name); \
 	  [ -n "$$tag" ] && [ "$$tag" != "null" ] || { echo "could not resolve latest tag"; exit 1; }; \
 	  echo "Bumping firmware to $$tag"; \
-	  url="https://github.com/$(RX888_FW_REPO)/releases/download/$$tag/SDDC_FX3-$$tag.img"; \
+	  url="https://github.com/$(RX888_FW_REPO)/releases/download/$$tag/SDDC_FX3.img"; \
 	  curl -fL -o firmware/SDDC_FX3.img.tmp "$$url"; \
 	  echo "$$tag" > firmware/VERSION; \
 	  ( cd firmware && sha256sum SDDC_FX3.img.tmp \
