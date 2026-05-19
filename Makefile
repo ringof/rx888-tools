@@ -77,8 +77,8 @@ BINS := rx888_stream rx888_dsp iqrecord
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
 # --- librx888 ---
-$(SRCDIR)/librx888.o: $(SRCDIR)/librx888.c $(INCDIR)/librx888.h $(INCDIR)/rx888.h $(INCDIR)/ezusb.h
-	$(CC) $(CFLAGS_LIB) -I$(INCDIR) -c $< -o $@
+$(SRCDIR)/librx888.o: $(SRCDIR)/librx888.c $(SRCDIR)/pps_audit.h $(INCDIR)/librx888.h $(INCDIR)/rx888.h $(INCDIR)/ezusb.h
+	$(CC) $(CFLAGS_LIB) -I$(INCDIR) -I$(SRCDIR) -c $< -o $@
 
 $(SRCDIR)/ezusb.o: $(SRCDIR)/ezusb.c $(INCDIR)/ezusb.h
 	$(CC) $(CFLAGS_LIB) -I$(INCDIR) -c $< -o $@
@@ -114,13 +114,17 @@ iqrecord: $(SRCDIR)/iqrecord.c
 
 # --- non-hardware tests (CI) ---
 TESTS_DIR  := tests
-TEST_BINS  := $(TESTS_DIR)/librx888_api
+TEST_BINS  := $(TESTS_DIR)/librx888_api $(TESTS_DIR)/pps_audit_test
 
 $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
+$(TESTS_DIR)/pps_audit_test: $(TESTS_DIR)/pps_audit_test.c $(SRCDIR)/pps_audit.h
+	$(CC) $(CFLAGS_STREAM) -I$(SRCDIR) $< $(SAN_LDFLAGS) -o $@
+
 check: $(TEST_BINS) rx888_stream
+	$(TESTS_DIR)/pps_audit_test
 	$(TESTS_DIR)/librx888_api
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream
 
@@ -184,6 +188,18 @@ hw-check: all $(RX888_FW_FILE)
 .PHONY: check check-asan check-valgrind firmware firmware-latest hw-check
 
 # --- install ---
+
+# install-dev: library, header, and pkg-config file only.  Does NOT
+# require the firmware blob; intended for downstream consumers (e.g.
+# gr-rx888) that build against librx888 but don't ship the firmware.
+install-dev: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(LIBRX_HDR)
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCDIR_INST) $(DESTDIR)$(PCDIR)
+	$(INSTALL) -m 755 $(LIBRX_SO) $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 644 $(LIBRX_A)  $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 644 $(LIBRX_HDR) $(DESTDIR)$(INCDIR_INST)/
+	$(INSTALL) -m 644 $(LIBRX_PC) $(DESTDIR)$(PCDIR)/
+	-ldconfig 2>/dev/null || true
+
 install: all
 	@[ -f $(RX888_FW_FILE) ] || { \
 	  echo "Firmware blob $(RX888_FW_FILE) is not present."; \
@@ -210,4 +226,4 @@ clean:
 	rm -f $(BINS) $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(SRCDIR)/*.o
 	rm -f $(TEST_BINS)
 
-.PHONY: all install uninstall clean
+.PHONY: all install install-dev uninstall clean

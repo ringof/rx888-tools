@@ -33,13 +33,34 @@ extern "C" {
 /* Opaque handle. */
 typedef struct rx888 rx888_t;
 
-/* Live counters, snapshot via rx888_get_stats(). */
+/* Live counters, snapshot via rx888_get_stats().
+ *
+ * The "short transfer" fields track DMA commits whose actual_length is
+ * less than the configured full transfer size (expected_xfer_bytes).
+ * rx888-firmware uses GPIF-side PPS injection to force such a commit on
+ * the rising edge of PPS; the bytes between consecutive short transfers
+ * therefore equal the number of ADC samples (x2 for int16) produced in
+ * one PPS interval. With stock firmware that does not force commits,
+ * short_xfers stays at zero on healthy USB.
+ */
 typedef struct {
-    unsigned long long ok_xfers;      /* completed bulk transfers */
-    unsigned long long bad_xfers;     /* errored / cancelled / submit failures */
-    unsigned long long bytes_out;     /* cumulative bytes delivered to callback */
-    unsigned int       in_flight;     /* outstanding USB transfers */
-    unsigned long long last_cb_ms;    /* monotonic ms of most recent callback */
+    unsigned long long ok_xfers;            /* completed bulk transfers */
+    unsigned long long bad_xfers;           /* errored / cancelled / submit failures */
+    unsigned long long bytes_out;           /* cumulative bytes delivered to callback */
+    unsigned int       in_flight;           /* outstanding USB transfers */
+    unsigned long long last_cb_ms;          /* monotonic ms of most recent callback */
+
+    /* Transfer-length classification. */
+    unsigned int       expected_xfer_bytes; /* configured full transfer length */
+    unsigned long long full_xfers;          /* transfers at expected length */
+    unsigned long long short_xfers;         /* shorter than expected (incl. synthetic) */
+    unsigned long long zero_xfers;          /* zero-length transfers (should be 0) */
+    unsigned int       min_actual_len;      /* smallest non-zero actual_length observed */
+    unsigned int       max_actual_len;      /* largest actual_length observed */
+
+    /* PPS window byte counting. */
+    unsigned long long bytes_in_window;     /* bytes since last short transfer */
+    unsigned long long last_window_bytes;   /* bytes in most recent completed PPS window */
 } rx888_stats_t;
 
 /*
@@ -59,6 +80,56 @@ typedef struct {
 typedef void (*rx888_sample_cb_t)(const int16_t *samples,
                                   size_t nsamples,
                                   void *user);
+
+/*
+ * PPS event. Delivered to the registered rx888_pps_cb_t once per
+ * closed PPS-window — including synthetic shorts when debug mode is
+ * enabled. Fired from the writer thread, after the closing short
+ * transfer's samples have been handed to the sample callback.
+ *
+ *   event_id          monotonic counter, 0-based, reset at rx888_start().
+ *   host_monotonic_ms CLOCK_MONOTONIC milliseconds at the moment the
+ *                     window closed on the host. Useful for host-side
+ *                     jitter analysis; not a UTC time.
+ *   bytes_since_prev  bytes accumulated in the just-closed window.
+ *                     For a healthy 1 Hz PPS this is fs*2 bytes
+ *                     (int16 real samples).
+ *   sample_index      bytes_out/2 at the boundary — i.e. the index of
+ *                     the first sample AFTER the PPS edge. This is
+ *                     the offset to use when emitting a GNURadio
+ *                     rx_time stream tag for the corresponding UTC
+ *                     second.
+ */
+typedef struct {
+    uint64_t event_id;
+    uint64_t host_monotonic_ms;
+    uint64_t bytes_since_prev;
+    uint64_t sample_index;
+} rx888_pps_event_t;
+
+/*
+ * PPS event callback. Invoked from librx888's writer thread, on the
+ * same thread that runs the sample callback. Must return promptly —
+ * blocking the writer blocks the libusb event queue. Hand off to a
+ * ring buffer / queue and return.
+ *
+ * The event pointer is only valid for the duration of the callback;
+ * copy what you need.
+ */
+typedef void (*rx888_pps_cb_t)(const rx888_pps_event_t *e, void *user);
+
+/*
+ * Register a PPS event callback. Pass NULL to disable.
+ *
+ * Intended use: call after rx888_open() and before rx888_start(); the
+ * pthread_create() in rx888_start() then provides the happens-before
+ * barrier for the writer thread to see the callback. Replacing the
+ * callback while a stream is running is not race-free in this
+ * implementation; stop, set, restart if you need that.
+ *
+ * Safe to call with a NULL handle (no-op).
+ */
+void rx888_set_pps_callback(rx888_t *r, rx888_pps_cb_t cb, void *user);
 
 /*
  * Configuration. Filled by the caller before rx888_open().
@@ -86,11 +157,26 @@ typedef void (*rx888_sample_cb_t)(const int16_t *samples,
  * before mutating to get sane values; rx888_open() rejects a struct
  * with queue_depth, req_packets, or ctrl_timeout_ms set to zero.
  *
- * queue_depth        Concurrent in-flight USB transfers. Default 32.
- * req_packets        Transfer size in USB packets. Default 1024.
- * ctrl_timeout_ms    Vendor control-transfer timeout. Default 5000.
- * stream_timeout_ms  Bulk transfer timeout, 0 = infinite (default).
- * watchdog_ms        No-data watchdog; 0 disables. Default 3000.
+ * queue_depth                Concurrent in-flight USB transfers. Default 32.
+ * req_packets                Transfer size in USB packets. Default 1024.
+ * ctrl_timeout_ms            Vendor control-transfer timeout. Default 5000.
+ * stream_timeout_ms          Bulk transfer timeout, 0 = infinite (default).
+ * watchdog_ms                No-data watchdog; 0 disables. Default 3000.
+ * debug_synthetic_pps_every  0 = off (default). When >0, every Nth completed
+ *                            transfer is classified as if it were a PPS-aligned
+ *                            short commit. Real data is unaffected. For
+ *                            exercising the short-transfer detector end-to-end
+ *                            against firmware that does not (yet) force commits.
+ *                            Requires a real device; see debug_no_device for
+ *                            a fully hardware-free alternative.
+ * debug_no_device            0 = normal (default). When 1, rx888_open()
+ *                            succeeds without any USB device present.
+ *                            rx888_start() generates zero-valued samples at
+ *                            samplerate, pacing the callbacks in real time.
+ *                            Combine with debug_synthetic_pps_every to drive
+ *                            the PPS callback path in CI or Docker without
+ *                            hardware. Transfer size is req_packets × 512 B
+ *                            (USB HS bulk max packet).
  */
 typedef struct {
     unsigned int samplerate;
@@ -107,6 +193,8 @@ typedef struct {
     unsigned int ctrl_timeout_ms;
     unsigned int stream_timeout_ms;
     unsigned int watchdog_ms;
+    unsigned int debug_synthetic_pps_every;
+    int          debug_no_device;
 } rx888_config_t;
 
 /*

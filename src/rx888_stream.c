@@ -74,6 +74,11 @@ static void usage(const char *argv0) {
         "      --ctrl-timeout <ms>     Control transfer timeout (default 5000)\n"
         "      --stream-timeout <ms>   Bulk transfer timeout (default 0 = infinite)\n"
         "      --watchdog-timeout <ms> No-data watchdog (default 3000; 0 disables)\n"
+        "      --debug-synth-pps <N>   Treat every Nth completed transfer as a forced\n"
+        "                              short for end-to-end exercise of the PPS-window\n"
+        "                              detector against stock firmware. Real data is\n"
+        "                              unaffected; only the classifier sees a synthetic\n"
+        "                              short. 0 = off (default).\n"
         "  -h, --help                  Show this help\n",
         argv0);
 }
@@ -83,6 +88,7 @@ enum {
     OPT_CTRL_TIMEOUT,
     OPT_STREAM_TIMEOUT,
     OPT_WATCHDOG_TIMEOUT,
+    OPT_DEBUG_SYNTH_PPS,
 };
 
 int main(int argc, char **argv) {
@@ -112,6 +118,7 @@ int main(int argc, char **argv) {
         {"ctrl-timeout",     required_argument, 0, OPT_CTRL_TIMEOUT},
         {"stream-timeout",   required_argument, 0, OPT_STREAM_TIMEOUT},
         {"watchdog-timeout", required_argument, 0, OPT_WATCHDOG_TIMEOUT},
+        {"debug-synth-pps",  required_argument, 0, OPT_DEBUG_SYNTH_PPS},
         {"help",             no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -137,6 +144,7 @@ int main(int argc, char **argv) {
         case OPT_CTRL_TIMEOUT:     cfg.ctrl_timeout_ms   = (unsigned)strtoul(optarg, NULL, 10); break;
         case OPT_STREAM_TIMEOUT:   cfg.stream_timeout_ms = (unsigned)strtoul(optarg, NULL, 10); break;
         case OPT_WATCHDOG_TIMEOUT: cfg.watchdog_ms       = (unsigned)strtoul(optarg, NULL, 10); break;
+        case OPT_DEBUG_SYNTH_PPS:  cfg.debug_synthetic_pps_every = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -187,9 +195,11 @@ int main(int argc, char **argv) {
                 double mibs = (double)(s.bytes_out - prev_bytes) / (1024.0 * 1024.0);
                 fprintf(stderr,
                     "t=%.0fs ok=%llu bad=%llu in_flight=%u "
-                    "out=%.2f MiB (%.2f MiB/s)\n",
+                    "out=%.2f MiB (%.2f MiB/s) "
+                    "full=%llu short=%llu last_window=%llu\n",
                     secs, s.ok_xfers, s.bad_xfers, s.in_flight,
-                    (double)s.bytes_out / (1024.0 * 1024.0), mibs);
+                    (double)s.bytes_out / (1024.0 * 1024.0), mibs,
+                    s.full_xfers, s.short_xfers, s.last_window_bytes);
                 prev_bytes = s.bytes_out;
                 next_print += 1000;
             }

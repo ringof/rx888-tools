@@ -41,6 +41,7 @@
 
 #include "ezusb.h"
 #include "librx888.h"
+#include "pps_audit.h"
 #include "rx888.h"
 
 /* ezusb.c expects this symbol */
@@ -313,6 +314,7 @@ struct rx888 {
     /* config snapshot */
     rx888_config_t cfg;
     int            fixup_samples;
+    bool           synthetic_mode;    /* debug_no_device: no USB */
 
     /* USB */
     libusb_context        *ctx;
@@ -323,6 +325,14 @@ struct rx888 {
     /* user callback */
     rx888_sample_cb_t cb;
     void             *cb_user;
+
+    /* PPS event callback. Set via rx888_set_pps_callback() before
+     * rx888_start(); read by writer_thread. pthread_create() inside
+     * rx888_start() establishes the happens-before barrier so a
+     * plain-pointer store is sufficient there. */
+    rx888_pps_cb_t    pps_cb;
+    void             *pps_cb_user;
+    uint64_t          pps_event_id;     /* writer-thread-only */
 
     /* streaming state */
     struct libusb_transfer **xfer;
@@ -342,6 +352,20 @@ struct rx888 {
     atomic_ullong  ok_xfers;
     atomic_ullong  bad_xfers;
     atomic_ullong  bytes_out;
+
+    /* Short-transfer / PPS-window accounting. State owned by writer_thread;
+     * mirrored to the atomics below after each pps_audit_step() so
+     * rx888_get_stats() can read without coordinating. */
+    pps_audit_t    pps;
+    unsigned long  total_xfer_count;       /* writer-thread-only, for synthetic mode */
+    atomic_uint    expected_xfer_bytes;    /* set at start() */
+    atomic_ullong  full_xfers;
+    atomic_ullong  short_xfers;
+    atomic_ullong  zero_xfers;
+    atomic_uint    min_actual_len;
+    atomic_uint    max_actual_len;
+    atomic_ullong  bytes_in_window;
+    atomic_ullong  last_window_bytes;
 };
 
 /* ------------------------------ streaming ------------------------------- */
@@ -370,6 +394,68 @@ static void LIBUSB_CALL stream_cb(struct libusb_transfer *t) {
     }
 }
 
+/* Synthetic streaming: generates zero-samples at the configured rate with no
+ * USB device.  Mirrors the classification + callback logic of writer_main so
+ * the PPS event path is exercised identically.  Used when debug_no_device=1. */
+static void *synthetic_writer_main(void *arg) {
+    rx888_t *r = (rx888_t *)arg;
+    unsigned int buf_bytes = atomic_load(&r->expected_xfer_bytes);
+    size_t nsamples = buf_bytes / sizeof(int16_t);
+
+    int16_t *buf = calloc(nsamples, sizeof(int16_t));
+    if (!buf) { atomic_store(&r->stop_flag, 1); return NULL; }
+
+    uint64_t t0_ms           = monotonic_ms();
+    uint64_t samples_total   = 0;
+
+    while (!atomic_load(&r->stop_flag)) {
+        /* Pace to samplerate so the caller's ring buffer isn't flooded. */
+        uint64_t target_ms = t0_ms + samples_total * 1000ULL / r->cfg.samplerate;
+        uint64_t now_ms    = monotonic_ms();
+        if (now_ms < target_ms)
+            usleep((unsigned int)((target_ms - now_ms) * 1000UL));
+        if (atomic_load(&r->stop_flag)) break;
+
+        atomic_fetch_add(&r->ok_xfers, 1);
+        r->total_xfer_count++;
+
+        int force_short = (r->cfg.debug_synthetic_pps_every > 0 &&
+                           (r->total_xfer_count % r->cfg.debug_synthetic_pps_every) == 0)
+                          ? 1 : 0;
+
+        uint64_t prev_short = r->pps.short_xfers;
+        pps_audit_step(&r->pps, buf_bytes, buf_bytes, force_short);
+        atomic_store(&r->full_xfers,        r->pps.full_xfers);
+        atomic_store(&r->short_xfers,       r->pps.short_xfers);
+        atomic_store(&r->zero_xfers,        r->pps.zero_xfers);
+        atomic_store(&r->min_actual_len,    r->pps.min_actual_len);
+        atomic_store(&r->max_actual_len,    r->pps.max_actual_len);
+        atomic_store(&r->bytes_in_window,   r->pps.bytes_in_window);
+        atomic_store(&r->last_window_bytes, r->pps.last_window_bytes);
+
+        atomic_fetch_add(&r->bytes_out, (unsigned long long)buf_bytes);
+        atomic_store(&r->last_cb_ms, monotonic_ms());
+
+        if (r->cb)
+            r->cb(buf, nsamples, r->cb_user);
+
+        if (r->pps.short_xfers > prev_short && r->pps_cb) {
+            rx888_pps_event_t ev = {
+                .event_id          = r->pps_event_id++,
+                .host_monotonic_ms = monotonic_ms(),
+                .bytes_since_prev  = r->pps.last_window_bytes,
+                .sample_index      = atomic_load(&r->bytes_out) / 2ULL,
+            };
+            r->pps_cb(&ev, r->pps_cb_user);
+        }
+
+        samples_total += nsamples;
+    }
+
+    free(buf);
+    return NULL;
+}
+
 static void *writer_main(void *arg) {
     rx888_t *r = (rx888_t *)arg;
     for (;;) {
@@ -379,6 +465,30 @@ static void *writer_main(void *arg) {
 
         if (t->status == LIBUSB_TRANSFER_COMPLETED) {
             atomic_fetch_add(&r->ok_xfers, 1);
+
+            /* Classify the transfer length and update PPS-window state.
+             * Synthetic mode forces a "short" classification every Nth
+             * transfer regardless of actual length; bytes_in_window
+             * still tracks real bytes. */
+            r->total_xfer_count++;
+            int force_short = 0;
+            if (r->cfg.debug_synthetic_pps_every > 0 &&
+                (r->total_xfer_count % r->cfg.debug_synthetic_pps_every) == 0) {
+                force_short = 1;
+            }
+            uint64_t prev_short = r->pps.short_xfers;
+            pps_audit_step(&r->pps,
+                           atomic_load(&r->expected_xfer_bytes),
+                           (uint32_t)t->actual_length,
+                           force_short);
+            atomic_store(&r->full_xfers,        r->pps.full_xfers);
+            atomic_store(&r->short_xfers,       r->pps.short_xfers);
+            atomic_store(&r->zero_xfers,        r->pps.zero_xfers);
+            atomic_store(&r->min_actual_len,    r->pps.min_actual_len);
+            atomic_store(&r->max_actual_len,    r->pps.max_actual_len);
+            atomic_store(&r->bytes_in_window,   r->pps.bytes_in_window);
+            atomic_store(&r->last_window_bytes, r->pps.last_window_bytes);
+
             if (t->actual_length > 0) {
                 atomic_fetch_add(&r->bytes_out, (unsigned long long)t->actual_length);
                 if (r->fixup_samples)
@@ -388,6 +498,20 @@ static void *writer_main(void *arg) {
                           (size_t)t->actual_length / sizeof(int16_t),
                           r->cb_user);
                 }
+            }
+
+            /* Fire the PPS event callback if this transfer closed a
+             * window. sample_index is captured AFTER bytes_out has
+             * been updated, so it points at the first sample beyond
+             * the PPS edge — the correct offset for an rx_time tag. */
+            if (r->pps.short_xfers > prev_short && r->pps_cb) {
+                rx888_pps_event_t ev = {
+                    .event_id          = r->pps_event_id++,
+                    .host_monotonic_ms = monotonic_ms(),
+                    .bytes_since_prev  = r->pps.last_window_bytes,
+                    .sample_index      = atomic_load(&r->bytes_out) / 2ULL,
+                };
+                r->pps_cb(&ev, r->pps_cb_user);
             }
         } else {
             atomic_fetch_add(&r->bad_xfers, 1);
@@ -444,16 +568,30 @@ void rx888_config_init_default(rx888_config_t *cfg) {
 
 void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
     if (!r || !out) return;
-    out->ok_xfers   = atomic_load(&r->ok_xfers);
-    out->bad_xfers  = atomic_load(&r->bad_xfers);
-    out->bytes_out  = atomic_load(&r->bytes_out);
-    out->in_flight  = atomic_load(&r->in_flight);
-    out->last_cb_ms = atomic_load(&r->last_cb_ms);
+    out->ok_xfers            = atomic_load(&r->ok_xfers);
+    out->bad_xfers           = atomic_load(&r->bad_xfers);
+    out->bytes_out           = atomic_load(&r->bytes_out);
+    out->in_flight           = atomic_load(&r->in_flight);
+    out->last_cb_ms          = atomic_load(&r->last_cb_ms);
+    out->expected_xfer_bytes = atomic_load(&r->expected_xfer_bytes);
+    out->full_xfers          = atomic_load(&r->full_xfers);
+    out->short_xfers         = atomic_load(&r->short_xfers);
+    out->zero_xfers          = atomic_load(&r->zero_xfers);
+    out->min_actual_len      = atomic_load(&r->min_actual_len);
+    out->max_actual_len      = atomic_load(&r->max_actual_len);
+    out->bytes_in_window     = atomic_load(&r->bytes_in_window);
+    out->last_window_bytes   = atomic_load(&r->last_window_bytes);
 }
 
 int rx888_is_running(const rx888_t *r) {
     if (!r) return 0;
     return atomic_load(&r->stop_flag) ? 0 : 1;
+}
+
+void rx888_set_pps_callback(rx888_t *r, rx888_pps_cb_t cb, void *user) {
+    if (!r) return;
+    r->pps_cb      = cb;
+    r->pps_cb_user = user;
 }
 
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
@@ -473,6 +611,12 @@ int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
     r->cfg           = *cfg;
     r->fixup_samples = cfg->fixup_samples;
     atomic_store(&r->last_cb_ms, monotonic_ms());
+
+    if (cfg->debug_no_device) {
+        r->synthetic_mode = true;
+        *out = r;
+        return 0;
+    }
 
     int rc = libusb_init(&r->ctx);
     if (rc != 0) { free(r); return rc; }
@@ -538,11 +682,48 @@ int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user) {
     r->cb_user = user;
     atomic_store(&r->stop_flag, 0);
 
+    if (r->synthetic_mode) {
+        /* USB HS bulk max packet is 512 B; use req_packets × 512 as the
+         * synthetic transfer size.  No queue or USB transfers needed. */
+        uint64_t bb = (uint64_t)r->cfg.req_packets * 512ULL;
+        if (bb == 0 || bb > (uint64_t)INT_MAX) return LIBUSB_ERROR_INVALID_PARAM;
+        r->buf_bytes = (unsigned int)bb;
+        pps_audit_init(&r->pps);
+        r->total_xfer_count = 0;
+        r->pps_event_id     = 0;
+        atomic_store(&r->expected_xfer_bytes, r->buf_bytes);
+        atomic_store(&r->full_xfers,        0ULL);
+        atomic_store(&r->short_xfers,       0ULL);
+        atomic_store(&r->zero_xfers,        0ULL);
+        atomic_store(&r->min_actual_len,    0u);
+        atomic_store(&r->max_actual_len,    0u);
+        atomic_store(&r->bytes_in_window,   0ULL);
+        atomic_store(&r->last_window_bytes, 0ULL);
+        if (pthread_create(&r->writer_thread, NULL, synthetic_writer_main, r) != 0)
+            return LIBUSB_ERROR_OTHER;
+        r->writer_started = true;
+        return 0;
+    }
+
     /* Allocate transfer ring. */
     r->nxfers    = r->cfg.queue_depth;
     uint64_t bb  = (uint64_t)r->cfg.req_packets * (uint64_t)r->ep.max_packet;
     if (bb == 0 || bb > (uint64_t)INT_MAX) return LIBUSB_ERROR_INVALID_PARAM;
     r->buf_bytes = (unsigned int)bb;
+
+    /* Reset PPS-window state and publish the full-transfer length to
+     * the atomic snapshot so rx888_get_stats() reflects it from start. */
+    pps_audit_init(&r->pps);
+    r->total_xfer_count = 0;
+    r->pps_event_id     = 0;
+    atomic_store(&r->expected_xfer_bytes, r->buf_bytes);
+    atomic_store(&r->full_xfers,        0ULL);
+    atomic_store(&r->short_xfers,       0ULL);
+    atomic_store(&r->zero_xfers,        0ULL);
+    atomic_store(&r->min_actual_len,    0u);
+    atomic_store(&r->max_actual_len,    0u);
+    atomic_store(&r->bytes_in_window,   0ULL);
+    atomic_store(&r->last_window_bytes, 0ULL);
 
     int rc = xq_init(&r->q, (size_t)r->nxfers * 2u);
     if (rc != 0) return LIBUSB_ERROR_NO_MEM;
@@ -607,6 +788,16 @@ void rx888_stop(rx888_t *r) {
 
     atomic_store(&r->stop_flag, 1);
 
+    if (r->synthetic_mode) {
+        /* No USB transfers to cancel; just join the generator thread.
+         * from_writer: caller must invoke close/stop from another thread. */
+        if (!from_writer && r->writer_started) {
+            pthread_join(r->writer_thread, NULL);
+            r->writer_started = false;
+        }
+        return;
+    }
+
     /* Cancel transfers. */
     if (r->xfer) {
         for (unsigned int i = 0; i < r->nxfers; i++)
@@ -659,10 +850,12 @@ void rx888_stop(rx888_t *r) {
 void rx888_close(rx888_t *r) {
     if (!r) return;
     rx888_stop(r);
-    if (r->h) {
-        if (r->claimed) (void)libusb_release_interface(r->h, r->ep.iface);
-        libusb_close(r->h);
+    if (!r->synthetic_mode) {
+        if (r->h) {
+            if (r->claimed) (void)libusb_release_interface(r->h, r->ep.iface);
+            libusb_close(r->h);
+        }
+        if (r->ctx) libusb_exit(r->ctx);
     }
-    if (r->ctx) libusb_exit(r->ctx);
     free(r);
 }
