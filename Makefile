@@ -188,6 +188,18 @@ hw-check: all $(RX888_FW_FILE)
 .PHONY: check check-asan check-valgrind firmware firmware-latest hw-check
 
 # --- install ---
+
+# install-dev: library, header, and pkg-config file only.  Does NOT
+# require the firmware blob; intended for downstream consumers (e.g.
+# gr-rx888) that build against librx888 but don't ship the firmware.
+install-dev: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(LIBRX_HDR)
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCDIR_INST) $(DESTDIR)$(PCDIR)
+	$(INSTALL) -m 755 $(LIBRX_SO) $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 644 $(LIBRX_A)  $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 644 $(LIBRX_HDR) $(DESTDIR)$(INCDIR_INST)/
+	$(INSTALL) -m 644 $(LIBRX_PC) $(DESTDIR)$(PCDIR)/
+	-ldconfig 2>/dev/null || true
+
 install: all
 	@[ -f $(RX888_FW_FILE) ] || { \
 	  echo "Firmware blob $(RX888_FW_FILE) is not present."; \
@@ -214,4 +226,4 @@ clean:
 	rm -f $(BINS) $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(SRCDIR)/*.o
 	rm -f $(TEST_BINS)
 
-.PHONY: all install uninstall clean
+.PHONY: all install install-dev uninstall clean
