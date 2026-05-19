@@ -11,9 +11,11 @@
  */
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <libusb-1.0/libusb.h>
 
@@ -110,6 +112,7 @@ static void test_config_init_default(void) {
     EXPECT(cfg.fixup_samples      == 0,         "default fixup off");
     EXPECT(cfg.debug_synthetic_pps_every == 0u,
                                                 "default synthetic-pps debug off");
+    EXPECT(cfg.debug_no_device           == 0,  "default no-device mode off");
 }
 
 static void test_stats_struct_layout(void) {
@@ -130,6 +133,42 @@ static void test_stats_struct_layout(void) {
     EXPECT(s.expected_xfer_bytes == 0u,   "zeroed stats: expected_xfer_bytes");
     EXPECT(s.min_actual_len      == 0u,   "zeroed stats: min_actual_len");
     EXPECT(s.max_actual_len      == 0u,   "zeroed stats: max_actual_len");
+}
+
+static atomic_int synth_pps_count;
+
+static void synth_pps_stop_cb(const rx888_pps_event_t *e, void *user) {
+    (void)e;
+    if (atomic_fetch_add(&synth_pps_count, 1) + 1 >= 3)
+        rx888_stop((rx888_t *)user);
+}
+
+static void test_synthetic_no_device(void) {
+    atomic_store(&synth_pps_count, 0);
+
+    rx888_config_t cfg;
+    rx888_config_init_default(&cfg);
+    cfg.debug_no_device           = 1;
+    cfg.debug_synthetic_pps_every = 4;  /* PPS event every 4th transfer */
+
+    rx888_t *r = NULL;
+    int rc = rx888_open(&r, &cfg);
+    EXPECT(rc == 0,   "debug_no_device open succeeds without hardware");
+    EXPECT(r != NULL, "debug_no_device open returns handle");
+    if (!r) return;
+
+    rx888_set_pps_callback(r, synth_pps_stop_cb, r);
+    rc = rx888_start(r, NULL, NULL);
+    EXPECT(rc == 0, "debug_no_device start succeeds");
+
+    /* Wait for the PPS callback to self-stop the stream (3 events). */
+    struct timespec ms1 = {0, 1000000L};
+    while (rx888_is_running(r))
+        nanosleep(&ms1, NULL);
+
+    rx888_close(r);
+    EXPECT(atomic_load(&synth_pps_count) >= 3,
+           "debug_no_device fires >= 3 synthetic PPS events");
 }
 
 static void test_open_no_device(void) {
@@ -157,6 +196,7 @@ int main(void) {
     test_config_init_default();
     test_stats_struct_layout();
     test_pps_event_struct_layout();
+    test_synthetic_no_device();
     test_open_no_device();
 
     fprintf(stderr, "\n%s (%d failures)\n",

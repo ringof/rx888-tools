@@ -167,6 +167,16 @@ void rx888_set_pps_callback(rx888_t *r, rx888_pps_cb_t cb, void *user);
  *                            short commit. Real data is unaffected. For
  *                            exercising the short-transfer detector end-to-end
  *                            against firmware that does not (yet) force commits.
+ *                            Requires a real device; see debug_no_device for
+ *                            a fully hardware-free alternative.
+ * debug_no_device            0 = normal (default). When 1, rx888_open()
+ *                            succeeds without any USB device present.
+ *                            rx888_start() generates zero-valued samples at
+ *                            samplerate, pacing the callbacks in real time.
+ *                            Combine with debug_synthetic_pps_every to drive
+ *                            the PPS callback path in CI or Docker without
+ *                            hardware. Transfer size is req_packets × 512 B
+ *                            (USB HS bulk max packet).
  */
 typedef struct {
     unsigned int samplerate;
@@ -184,6 +194,7 @@ typedef struct {
     unsigned int stream_timeout_ms;
     unsigned int watchdog_ms;
     unsigned int debug_synthetic_pps_every;
+    int          debug_no_device;
 } rx888_config_t;
 
 /*

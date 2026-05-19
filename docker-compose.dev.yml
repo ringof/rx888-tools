@@ -1,0 +1,45 @@
+# Joint development environment for rx888-tools + gr-rx888.
+#
+# Usage (from the rx888-tools directory):
+#
+#   docker compose -f docker-compose.dev.yml up --build
+#
+# Both repos are bind-mounted so edits on the host are immediately visible
+# inside the container.  librx888 is installed into the container's
+# /usr/local on every startup via the bootstrap script.
+#
+# With a real RX888 attached (no PPS hardware needed):
+#   The device is passed through via /dev/bus/usb.  The bootstrap script
+#   installs the udev rule inside the container so libusb can open it.
+#   On the host you still need the rule in /etc/udev/rules.d/ (or run
+#   Docker with --privileged if you're in a hurry).
+#
+# Without hardware (Docker CI, no device):
+#   Set debug_no_device=1 + debug_synthetic_pps_every=N in your
+#   rx888_source block parameters.  Full PPS → rx_time tag path exercised
+#   with zero-sample data at the configured rate.
+#
+# Assumed directory layout:
+#   workspace/
+#   ├── rx888-tools/          <- this repo (docker-compose.dev.yml lives here)
+#   └── gr-rx888/             <- sibling OOT module repo
+
+services:
+  gnuradio-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: rx888-gnuradio-dev
+    volumes:
+      - .:/workspace/rx888-tools:z
+      - ../gr-rx888:/workspace/gr-rx888:z
+    environment:
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    # Pass through all USB devices so the RX888 is visible inside the
+    # container.  Remove this block if you are using debug_no_device=1 only.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    # Keep stdin open so `docker compose exec gnuradio-dev bash` works.
+    tty: true
+    stdin_open: true
+    entrypoint: ["/workspace/rx888-tools/scripts/dev-container-init.sh"]
