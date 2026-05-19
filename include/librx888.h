@@ -82,6 +82,56 @@ typedef void (*rx888_sample_cb_t)(const int16_t *samples,
                                   void *user);
 
 /*
+ * PPS event. Delivered to the registered rx888_pps_cb_t once per
+ * closed PPS-window — including synthetic shorts when debug mode is
+ * enabled. Fired from the writer thread, after the closing short
+ * transfer's samples have been handed to the sample callback.
+ *
+ *   event_id          monotonic counter, 0-based, reset at rx888_start().
+ *   host_monotonic_ms CLOCK_MONOTONIC milliseconds at the moment the
+ *                     window closed on the host. Useful for host-side
+ *                     jitter analysis; not a UTC time.
+ *   bytes_since_prev  bytes accumulated in the just-closed window.
+ *                     For a healthy 1 Hz PPS this is fs*2 bytes
+ *                     (int16 real samples).
+ *   sample_index      bytes_out/2 at the boundary — i.e. the index of
+ *                     the first sample AFTER the PPS edge. This is
+ *                     the offset to use when emitting a GNURadio
+ *                     rx_time stream tag for the corresponding UTC
+ *                     second.
+ */
+typedef struct {
+    uint64_t event_id;
+    uint64_t host_monotonic_ms;
+    uint64_t bytes_since_prev;
+    uint64_t sample_index;
+} rx888_pps_event_t;
+
+/*
+ * PPS event callback. Invoked from librx888's writer thread, on the
+ * same thread that runs the sample callback. Must return promptly —
+ * blocking the writer blocks the libusb event queue. Hand off to a
+ * ring buffer / queue and return.
+ *
+ * The event pointer is only valid for the duration of the callback;
+ * copy what you need.
+ */
+typedef void (*rx888_pps_cb_t)(const rx888_pps_event_t *e, void *user);
+
+/*
+ * Register a PPS event callback. Pass NULL to disable.
+ *
+ * Intended use: call after rx888_open() and before rx888_start(); the
+ * pthread_create() in rx888_start() then provides the happens-before
+ * barrier for the writer thread to see the callback. Replacing the
+ * callback while a stream is running is not race-free in this
+ * implementation; stop, set, restart if you need that.
+ *
+ * Safe to call with a NULL handle (no-op).
+ */
+void rx888_set_pps_callback(rx888_t *r, rx888_pps_cb_t cb, void *user);
+
+/*
  * Configuration. Filled by the caller before rx888_open().
  *
  * samplerate    Hz. Firmware-supported values: 32000000, 135000000.

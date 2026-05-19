@@ -325,6 +325,14 @@ struct rx888 {
     rx888_sample_cb_t cb;
     void             *cb_user;
 
+    /* PPS event callback. Set via rx888_set_pps_callback() before
+     * rx888_start(); read by writer_thread. pthread_create() inside
+     * rx888_start() establishes the happens-before barrier so a
+     * plain-pointer store is sufficient there. */
+    rx888_pps_cb_t    pps_cb;
+    void             *pps_cb_user;
+    uint64_t          pps_event_id;     /* writer-thread-only */
+
     /* streaming state */
     struct libusb_transfer **xfer;
     uint8_t                **buf;
@@ -405,6 +413,7 @@ static void *writer_main(void *arg) {
                 (r->total_xfer_count % r->cfg.debug_synthetic_pps_every) == 0) {
                 force_short = 1;
             }
+            uint64_t prev_short = r->pps.short_xfers;
             pps_audit_step(&r->pps,
                            atomic_load(&r->expected_xfer_bytes),
                            (uint32_t)t->actual_length,
@@ -426,6 +435,20 @@ static void *writer_main(void *arg) {
                           (size_t)t->actual_length / sizeof(int16_t),
                           r->cb_user);
                 }
+            }
+
+            /* Fire the PPS event callback if this transfer closed a
+             * window. sample_index is captured AFTER bytes_out has
+             * been updated, so it points at the first sample beyond
+             * the PPS edge — the correct offset for an rx_time tag. */
+            if (r->pps.short_xfers > prev_short && r->pps_cb) {
+                rx888_pps_event_t ev = {
+                    .event_id          = r->pps_event_id++,
+                    .host_monotonic_ms = monotonic_ms(),
+                    .bytes_since_prev  = r->pps.last_window_bytes,
+                    .sample_index      = atomic_load(&r->bytes_out) / 2ULL,
+                };
+                r->pps_cb(&ev, r->pps_cb_user);
             }
         } else {
             atomic_fetch_add(&r->bad_xfers, 1);
@@ -500,6 +523,12 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
 int rx888_is_running(const rx888_t *r) {
     if (!r) return 0;
     return atomic_load(&r->stop_flag) ? 0 : 1;
+}
+
+void rx888_set_pps_callback(rx888_t *r, rx888_pps_cb_t cb, void *user) {
+    if (!r) return;
+    r->pps_cb      = cb;
+    r->pps_cb_user = user;
 }
 
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
@@ -594,6 +623,7 @@ int rx888_start(rx888_t *r, rx888_sample_cb_t cb, void *user) {
      * the atomic snapshot so rx888_get_stats() reflects it from start. */
     pps_audit_init(&r->pps);
     r->total_xfer_count = 0;
+    r->pps_event_id     = 0;
     atomic_store(&r->expected_xfer_bytes, r->buf_bytes);
     atomic_store(&r->full_xfers,        0ULL);
     atomic_store(&r->short_xfers,       0ULL);
