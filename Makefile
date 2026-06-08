@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -111,6 +111,22 @@ rx888_dsp: $(SRCDIR)/rx888_dsp.c
 
 iqrecord: $(SRCDIR)/iqrecord.c
 	$(CC) $(CFLAGS_REC) -I$(INCDIR) $< -o $@
+
+# --- fx3_cmd diagnostics CLI ---
+# Standalone bench/diagnostics tool built on the shared FX3 host core
+# (fx3_core/fx3_usb/fx3_stats), independent of librx888.  Linked against
+# libusb directly.  -Wno-unused-parameter matches the core's origin in the
+# rx888-firmware harness; -Wpedantic is dropped for the imported core.
+FX3CMD_DIR  := tools/fx3_cmd
+FX3CMD_SRCS := $(FX3CMD_DIR)/fx3_cmd.c $(FX3CMD_DIR)/fx3_core.c \
+               $(FX3CMD_DIR)/fx3_usb.c $(FX3CMD_DIR)/fx3_stats.c
+FX3CMD_HDRS := $(wildcard $(FX3CMD_DIR)/*.h)
+CFLAGS_FX3CMD := $(filter-out -Wpedantic,$(CFLAGS_COMMON)) \
+                 -Wno-unused-parameter -D_DEFAULT_SOURCE $(LIBUSB_CFLAGS)
+
+fx3_cmd: $(FX3CMD_SRCS) $(FX3CMD_HDRS)
+	$(CC) $(CFLAGS_FX3CMD) -I$(FX3CMD_DIR) $(FX3CMD_SRCS) \
+	    $(SAN_LDFLAGS) -o $@ $(LIBUSB_LIBS)
 
 # --- non-hardware tests (CI) ---
 TESTS_DIR  := tests

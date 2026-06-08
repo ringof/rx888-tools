@@ -150,6 +150,7 @@ Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 | `rx888_stream` | USB3 bulk capture (CLI over librx888) | RX888 device | int16 real samples on stdout |
 | `rx888_dsp`    | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
 | `iqrecord`     | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
+| `fx3_cmd`      | Vendor-command diagnostics CLI | RX888 device | `PASS`/`FAIL` + details |
 
 Per-program docs in `doc/`:
 
@@ -158,6 +159,44 @@ Per-program docs in `doc/`:
 - `doc/rx888_dsp.md` / `doc/rx888_dsp_arch.md`
 - `doc/iqrecord.md`
 - `doc/gr-rx888/` — design plan for the GNU Radio source block
+
+### fx3_cmd — diagnostics CLI
+
+A bench/operator tool that sends individual SDDC_FX3 vendor commands and
+reports `PASS`/`FAIL`. Useful for bringing up hardware, poking registers, and
+recovering a wedged device. Built on a shared FX3 host core
+(`fx3_core`/`fx3_usb`/`fx3_stats`) imported from the
+[rx888-firmware](https://github.com/ringof/rx888-firmware) test harness; the
+firmware regression/fuzz/soak scenarios stay in that repo.
+
+```sh
+make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
+
+./fx3_cmd test                                 # probe device info (TESTFX3)
+./fx3_cmd gpio 0x1000                          # set GPIO word (LED_BLUE on)
+./fx3_cmd adc 64000000                         # set ADC clock to 64 MHz
+./fx3_cmd att 15                               # DAT-31 attenuator (0-63)
+./fx3_cmd vga 128                              # AD8370 VGA gain (0-255)
+./fx3_cmd start / stop                         # GPIF streaming on/off
+./fx3_cmd i2cr 0xC0 0 1                         # I2C read (Si5351 status)
+./fx3_cmd stats                                # GETSTATS diagnostic counters
+./fx3_cmd stats_pll                            # verify Si5351 PLL lock
+./fx3_cmd reset                                # reboot FX3 to bootloader
+./fx3_cmd usbreset                             # host-side USB port reset
+./fx3_cmd -F SDDC_FX3.img reload               # reset → re-upload → verify
+./fx3_cmd debug                                # interactive console (! for local cmds)
+```
+
+`load`/`reload`/`-F` upload firmware via `rx888_stream`, found alongside the
+binary or on `PATH`. Run `./fx3_cmd` with no arguments for the full command
+list.
+
+> **Protocol header note:** `fx3_cmd` ships `tools/fx3_cmd/fx3_proto.h`, the
+> firmware-accurate mirror of `rx888-firmware`'s `protocol.h`. This currently
+> differs from `include/rx888.h` (which lacks `GETSTATS`/`WDG_MAX_RECOV` and
+> names the VGA arg `AD8340_VGA` vs the firmware's `AD8370_VGA`). Unifying the
+> two onto a single `rx888.h` is tracked as follow-up work — see the split plan
+> in rx888-firmware (`docs/fx3_cmd-split-plan.md`).
 
 ---
 
@@ -172,6 +211,12 @@ rx888_tools/
 │   ├── rx888_stream.c            Thin CLI over librx888 (~200 lines)
 │   ├── rx888_dsp.c               AVX2/FMA DSP pipeline
 │   └── iqrecord.c                SigMF recorder
+├── tools/fx3_cmd/               Vendor-command diagnostics CLI
+│   ├── fx3_cmd.c                Diagnostics CLI (dispatch + debug console)
+│   ├── fx3_core.{c,h}          Shared diagnostic primitives
+│   ├── fx3_usb.{c,h}           USB transport / device lifecycle
+│   ├── fx3_stats.{c,h}         GETSTATS decoder
+│   └── fx3_proto.h             FX3 vendor-protocol constants (firmware mirror)
 ├── include/
 │   ├── librx888.h                Public library API
 │   ├── rx888.h                   FX3 protocol constants
