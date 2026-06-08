@@ -100,16 +100,49 @@ is running — but they are destructive**:
 
 These exist to recover a *wedged* device, not to coexist with a healthy stream.
 
+### Why this works — the Linux USB claiming model
+
+A common assumption is that opening a USB device is exclusive. On Linux it
+isn't. A device is a usbfs node (`/dev/bus/usb/BBB/DDD`) with three independent
+access layers, and **only the middle one is exclusive**:
+
+1. **Open** (`libusb_open`) — *not* exclusive. Multiple processes can hold the
+   same device open at once; opening claims nothing.
+2. **Claim an interface** (`libusb_claim_interface` → `USBDEVFS_CLAIMINTERFACE`)
+   — exclusive, one owner per interface. A second claim returns
+   `LIBUSB_ERROR_BUSY` (the `Resource busy` above).
+3. **Endpoint I/O** — bulk/interrupt/isochronous transfers require the claim on
+   the interface that owns the endpoint. Streaming is bulk-IN on EP1, hence the
+   claim.
+
+**Endpoint 0 sits outside all of this and cannot be claimed.** EP0 is the
+device's default *control* pipe, defined by the device descriptor — it is not
+listed in any interface descriptor, so there is no ioctl to take it. It is
+shared by every open handle, always. When the streamer claims interface 0 it
+gets interface 0's bulk endpoint exclusively; **EP0 was never — and cannot be —
+exclusively held by anyone.**
+
+The RX888's entire command set is vendor control transfers addressed to the
+*device* (recipient = device), which usbfs permits without consulting any
+interface claim. So `--no-claim` just opens the device (allowed), skips the
+claim, and pokes EP0 — concurrently with the streamer's bulk transfers on EP1,
+which it never touches. (Everyday proof that EP0 is shared: `lsusb -v` reads
+descriptors over EP0 from devices that already have drivers bound and interfaces
+claimed.)
+
+This is a property of *every* USB device, not just the RX888 — EP0 is mandatory
+and is how enumeration happens before any driver or claim exists. What is
+RX888-specific is only that its firmware (a) implements useful vendor commands
+on EP0 and (b) services them on a thread separate from the GPIF/DMA stream, so
+concurrent EP0 traffic doesn't disturb streaming — see the firmware concurrency
+contract, [`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170).
+
 ### `--no-claim` — using stream-safe commands during a stream
 
 `--no-claim` opens the device *without* claiming interface 0 or touching the
-bulk endpoint. Vendor control transfers go to endpoint 0, which is not owned by
-any interface and is serviced on a **separate firmware thread** from the
-GPIF→DMA streaming path, so the firmware handles them even while another process
-streams with interface 0 claimed. (See the firmware concurrency contract,
-[`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170).)
-
-Per that contract, `--no-claim` allows the **stream-safe** EP0 commands:
+bulk endpoint, so its EP0 vendor commands run while another process streams with
+interface 0 claimed (see *Why this works* above). Per the firmware contract,
+`--no-claim` allows the **stream-safe** EP0 commands:
 
 | Command(s) | Vendor request | Why it's safe |
 |---|---|---|
