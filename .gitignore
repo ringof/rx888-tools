@@ -2,6 +2,15 @@
 rx888_stream
 rx888_dsp
 iqrecord
+fx3_cmd
+
+# Library + pkg-config build outputs
+librx888.so
+librx888.a
+librx888.pc
+
+# Test binaries
+tests/librx888_api
 
 # Object files
 *.o
