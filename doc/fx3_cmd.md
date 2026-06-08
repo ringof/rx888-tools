@@ -47,7 +47,7 @@ Built at the repo root next to `rx888_stream` (and installed into the same
 | `i2cw <addr> <reg> <byte>...` | `I2CWFX3` | I2C write (hex) |
 | `stats` | `GETSTATS` | Dump the firmware diagnostic counters |
 | `stats_pll` | `GETSTATS` | Verify the Si5351 PLL is locked |
-| `stats_shdn` | `GETSTATS` | Verify SHDN is asserted after `STOPFX3` |
+| `stats_shdn` | `GETSTATS` | Verify SHDN is asserted after `STOPFX3` (needs the 30-byte `GETSTATS`) |
 | `stack_check` | `READINFODEBUG` | Query the firmware stack high-water mark |
 | `raw <code>` | (arbitrary) | Send a raw vendor request code; expects a STALL for removed commands |
 | `reset` | `RESETFX3` | Reboot the FX3 back to bootloader |
@@ -159,6 +159,17 @@ there is no separate protocol header. Its constants (command IDs, SETARG IDs,
 and the GPIO bit map) track the firmware's `protocol.h`, so the `gpio` command
 and the `GETSTATS` `gpio_state` readback use the same bit positions the
 firmware does — including `LED_BLUE` at bit 11.
+
+### GETSTATS firmware compatibility
+
+The `GETSTATS` payload grew from **26 to 30 bytes** when the firmware added the
+`gpio_state` field (#131). `fx3_cmd` reads whichever length the firmware
+returns: the first 26 bytes (DMA/GPIF/PIB/I2C/fault counters, Si5351 status,
+boot count, CLK0 state) decode on every version, so `stats` and `stats_pll`
+work against older firmware too. `stats` prints `gpio=n/a` and `stats_shdn`
+reports that it needs the 30-byte payload when running on firmware that predates
+`gpio_state`. (A short or truncated reply is reported distinctly from a USB I/O
+error.)
 
 ---
 
