@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -112,6 +112,23 @@ rx888_dsp: $(SRCDIR)/rx888_dsp.c
 iqrecord: $(SRCDIR)/iqrecord.c
 	$(CC) $(CFLAGS_REC) -I$(INCDIR) $< -o $@
 
+# --- fx3_cmd diagnostics CLI ---
+# Standalone bench/diagnostics tool built on the shared FX3 host core
+# (fx3_core/fx3_usb/fx3_stats), independent of librx888.  Linked against
+# libusb directly.  Shares the wire-protocol constants in include/rx888.h.
+# -Wno-unused-parameter matches the core's origin in the rx888-firmware
+# harness; -Wpedantic is dropped for the imported core.
+FX3CMD_DIR  := $(SRCDIR)/fx3_cmd
+FX3CMD_SRCS := $(FX3CMD_DIR)/fx3_cmd.c $(FX3CMD_DIR)/fx3_core.c \
+               $(FX3CMD_DIR)/fx3_usb.c $(FX3CMD_DIR)/fx3_stats.c
+FX3CMD_HDRS := $(wildcard $(FX3CMD_DIR)/*.h) $(INCDIR)/rx888.h
+CFLAGS_FX3CMD := $(filter-out -Wpedantic,$(CFLAGS_COMMON)) \
+                 -Wno-unused-parameter -D_DEFAULT_SOURCE $(LIBUSB_CFLAGS)
+
+fx3_cmd: $(FX3CMD_SRCS) $(FX3CMD_HDRS)
+	$(CC) $(CFLAGS_FX3CMD) -I$(FX3CMD_DIR) -I$(INCDIR) $(FX3CMD_SRCS) \
+	    $(SAN_LDFLAGS) -o $@ $(LIBUSB_LIBS)
+
 # --- non-hardware tests (CI) ---
 TESTS_DIR  := tests
 TEST_BINS  := $(TESTS_DIR)/librx888_api
@@ -120,9 +137,16 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream
-	$(TESTS_DIR)/librx888_api
-	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream
+check: $(TEST_BINS) rx888_stream fx3_cmd
+	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
+	if [ "$$present" = "1" ]; then \
+	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
+	  export RX888_HW_PRESENT=1; \
+	fi; \
+	set -e; \
+	$(TESTS_DIR)/librx888_api; \
+	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
+	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.
@@ -180,6 +204,9 @@ hw-check: all $(RX888_FW_FILE)
 	  $(TESTS_DIR)/hw_stop_start.sh
 	RX888_STREAM=$(CURDIR)/rx888_stream RX888_FW=$(CURDIR)/$(RX888_FW_FILE) \
 	  $(TESTS_DIR)/hw_sample_check.py
+	RX888_STREAM=$(CURDIR)/rx888_stream RX888_FX3=$(CURDIR)/fx3_cmd \
+	  RX888_FW=$(CURDIR)/$(RX888_FW_FILE) \
+	  $(TESTS_DIR)/hw_fx3_cmd.sh
 
 .PHONY: check check-asan check-valgrind firmware firmware-latest hw-check
 

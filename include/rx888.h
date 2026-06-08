@@ -4,13 +4,23 @@
 /*
  * RX888 / RX888 MkII protocol constants + streamer API.
  *
- * The FX3 command IDs, SETARG IDs, and GPIO bit assignments below match
- * KA9Q-radio (src/rx888.h). If you started from other RX888 streamer
+ * The FX3 command IDs, SETARG IDs, and GPIO bit assignments below track
+ * ringof/rx888-firmware (SDDC_FX3/protocol.h) — the firmware this toolset
+ * loads, and therefore the authority for the wire protocol. The names follow
+ * KA9Q-radio where the two agree; where they differ (notably the LED GPIO
+ * bits), the firmware wins. If you started from other RX888 streamer
  * codebases you may see different names/values; prefer these.
  */
 
 #include <stdint.h>
 #include <libusb-1.0/libusb.h>
+
+/* ------------------------------ USB identity ----------------------------- */
+/* Cypress FX3 vendor id; product id differs between the ROM bootloader and
+ * the loaded application firmware. */
+#define RX888_VID      0x04b4u
+#define RX888_PID_BOOT 0x00f3u   /* FX3 bootloader (firmware not yet loaded) */
+#define RX888_PID_APP  0x00f1u   /* SDDC_FX3 application firmware running */
 
 /* ------------------------------ FX3 commands ----------------------------- */
 /* (KA9Q-radio constants) */
@@ -59,6 +69,11 @@ enum FX3Command {
   // WRITE: UINT32 -> adc frequency
   STARTADC = 0xB2,
 
+  // Read firmware diagnostic counters (DMA/GPIF/PIB/I2C/Si5351/GPIO state).
+  // See struct fx3_stats in src/fx3_cmd/fx3_stats.h for the payload layout.
+  // READ: DATA
+  GETSTATS = 0xB3,
+
   // R82XX family Tuner functions
   // Initialize R82XX tuner
   // WRITE: NONE
@@ -100,9 +115,9 @@ enum ArgumentList {
     // Value: 0-63
     DAT31_ATT = 10,
 
-    // Set AD8340 chip vga
+    // Set AD8370 VGA gain
     // Value: 0-255
-    AD8340_VGA = 11,
+    AD8370_VGA = 11,
 
     // Preselector
     // Value: 0-2
@@ -111,6 +126,12 @@ enum ArgumentList {
     // VHFATT
     // Value: 0-15
     VHF_ATTENUATOR = 13,
+
+    // Watchdog max recovery count before escalating to reset (0 = unlimited)
+    WDG_MAX_RECOV = 14,
+
+    // Enable(!=0)/disable(0) cold-start reset escalation
+    WDG_RESET_ESCALATE = 15,
 };
 
 #define OUTXIO0 (1U << 0) 	// ATT_LE
@@ -133,22 +154,22 @@ enum ArgumentList {
 #define OUTXI16 (1U << 16)
 
 /* ------------------------------- GPIO bits ------------------------------- */
-/* (KA9Q-radio constants; names kept compatible with existing streamer code) */
+/* Matches enum GPIOPin in ringof/rx888-firmware SDDC_FX3/protocol.h — the
+ * firmware this toolset loads, and the authority for the GPIO control word
+ * (GPIOFX3) and the GETSTATS gpio_state readback.  Note this differs from the
+ * KA9Q-radio map, which assigns LED_YELLOW/LED_RED/LED_BLUE to bits 10/11/12;
+ * the firmware exposes only LED_BLUE, at bit 11. */
 enum GPIOPin {
-    SHDWN = OUTXIO5,
-    DITH = OUTXIO6,
-    RANDO = OUTXIO7,
-    BIAS_HF = OUTXIO8,
+    SHDWN    = OUTXIO5,
+    DITH     = OUTXIO6,
+    RANDO    = OUTXIO7,
+    BIAS_HF  = OUTXIO8,
     BIAS_VHF = OUTXIO9,
-    LED_YELLOW = OUTXI10,
-    LED_RED = OUTXI11,
-    LED_BLUE = OUTXI12,
+    LED_BLUE = OUTXI11,
     ATT_SEL0 = OUTXI13,
     ATT_SEL1 = OUTXI14,
-
-    // RX888r2
-    VHF_EN = OUTXI15,
-    PGA_EN = OUTXI16,
+    VHF_EN   = OUTXI15,
+    PGA_EN   = OUTXI16,
 };
 
 /* ----------------------------- Si5351 constants -------------------------- */

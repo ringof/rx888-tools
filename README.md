@@ -17,6 +17,15 @@ rx888_stream  →  rx888_dsp  →  iqrecord
 also what `gr-rx888` (a GNU Radio out-of-tree source block, planning docs
 under `doc/gr-rx888/`) will consume — same code path for both.
 
+Beside the streaming pipeline, **`fx3_cmd`** is a separate **control /
+diagnostics channel**: a standalone CLI that talks to the FX3's vendor-command
+endpoint (EP0) to probe the device, poke registers (GPIO, ADC clock,
+attenuator, VGA, I2C), read firmware `GETSTATS` counters, and recover a wedged
+device (`reset` / `usbreset` / `reload`). It is for bring-up and debugging, not
+the data path — it links libusb directly and is independent of `librx888`. Its
+read-only `--no-claim` mode can even query the device *while a streamer is
+running*. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
+
 ---
 
 ## Requirements
@@ -37,7 +46,7 @@ sudo apt install build-essential pkg-config libusb-1.0-0-dev
 ## Build
 
 ```bash
-make            # librx888.so + librx888.a + pkg-config + 3 binaries
+make            # librx888.so + librx888.a + pkg-config + 4 binaries
 make check      # non-hardware ABI / CLI tests (also runs in CI)
 ```
 
@@ -47,6 +56,7 @@ To build a single program:
 make rx888_stream    # links librx888.so
 make rx888_dsp
 make iqrecord
+make fx3_cmd         # standalone; links libusb directly (not librx888)
 ```
 
 ---
@@ -77,7 +87,8 @@ sudo make uninstall
 ```
 
 This installs `librx888.so`, `librx888.a`, `librx888.pc`, `librx888.h`,
-the three binaries, the firmware blob, and the udev rule. After installing:
+the four binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`), the
+firmware blob, and the udev rule. After installing:
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -129,15 +140,25 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 
+For device bring-up, diagnostics, and recovery outside the streaming chain,
+see the `fx3_cmd` channel: [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
+
 ---
 
 ## Tests
 
 ```bash
 make check         # non-hardware: librx888 ABI + CLI smoke. Run on every PR.
-make hw-check      # hardware: throughput, stop/start cycles, sample sanity.
+make hw-check      # hardware: throughput, stop/start cycles, sample sanity,
+                   # and fx3_cmd diagnostics + --no-claim concurrency.
                    # Requires RX888 + RX888_HW_TEST=1.
 ```
+
+`make check` is hardware-independent. If a **loaded** (application-mode) RX888
+happens to be attached, it auto-detects it and skips the negative "no-device"
+checks (which would otherwise fail and disturb the device); a fresh
+bootloader-mode device needs no special handling. Force the skip with
+`RX888_HW_PRESENT=1 make check`.
 
 Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 
@@ -150,6 +171,7 @@ Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 | `rx888_stream` | USB3 bulk capture (CLI over librx888) | RX888 device | int16 real samples on stdout |
 | `rx888_dsp`    | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
 | `iqrecord`     | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
+| `fx3_cmd`      | Vendor-command diagnostics CLI | RX888 device | `PASS`/`FAIL` + details |
 
 Per-program docs in `doc/`:
 
@@ -157,7 +179,54 @@ Per-program docs in `doc/`:
 - `doc/rx888_stream.md` — CLI options and pipeline examples
 - `doc/rx888_dsp.md` / `doc/rx888_dsp_arch.md`
 - `doc/iqrecord.md`
+- `doc/fx3_cmd.md` — vendor-command diagnostics CLI
 - `doc/gr-rx888/` — design plan for the GNU Radio source block
+
+### fx3_cmd — diagnostics CLI
+
+A bench/operator tool that sends individual SDDC_FX3 vendor commands and
+reports `PASS`/`FAIL`. Useful for bringing up hardware, poking registers, and
+recovering a wedged device. Built on a shared FX3 host core
+(`fx3_core`/`fx3_usb`/`fx3_stats`) imported from the
+[rx888-firmware](https://github.com/ringof/rx888-firmware) test harness; the
+firmware regression/fuzz/soak scenarios stay in that repo.
+
+```sh
+make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
+
+./fx3_cmd test                                 # probe device info (TESTFX3)
+./fx3_cmd gpio 0x20                            # write GPIO register (0x20 = SHDWN; see include/rx888.h)
+./fx3_cmd adc 64000000                         # set ADC clock to 64 MHz
+./fx3_cmd att 15                               # DAT-31 attenuator (0-63)
+./fx3_cmd vga 128                              # AD8370 VGA gain (0-255)
+./fx3_cmd start / stop                         # GPIF streaming on/off
+./fx3_cmd i2cr 0xC0 0 1                         # I2C read (Si5351 status)
+./fx3_cmd stats                                # GETSTATS diagnostic counters
+./fx3_cmd stats_pll                            # verify Si5351 PLL lock
+./fx3_cmd reset                                # reboot FX3 to bootloader
+./fx3_cmd usbreset                             # host-side USB port reset
+./fx3_cmd -F SDDC_FX3.img reload               # reset → re-upload → verify
+./fx3_cmd debug                                # interactive console (! for local cmds)
+./fx3_cmd --no-claim stats                     # read-only; safe while a streamer runs
+```
+
+`load`/`reload`/`-F` upload firmware via `rx888_stream`, found alongside the
+binary or on `PATH`. Run `./fx3_cmd` with no arguments for the full command
+list.
+
+`fx3_cmd` claims the USB interface exclusively, so its normal commands **cannot
+run while a streamer (`rx888_stream`, ka9q-radio, …) holds the device** — stop
+the streamer first. The exception is the read-only `--no-claim` mode (`test`,
+`stats`, `stats_pll`, `stack_check`), which peeks at EP0 without disturbing an
+active stream. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md#running-alongside-a-streamer-exclusive-access).
+
+`fx3_cmd` shares the wire-protocol constants in `include/rx888.h` with
+`librx888` — there is no separate protocol header. The GPIO bit map in
+`rx888.h` tracks the firmware's `protocol.h` (the authority for the device
+this toolset loads): the firmware exposes only `LED_BLUE`, at bit 11 — unlike
+the KA9Q-radio map, which places `LED_YELLOW`/`LED_RED`/`LED_BLUE` at bits
+10/11/12. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command reference
+and the firmware-upload model.
 
 ---
 
@@ -171,7 +240,12 @@ rx888_tools/
 │   ├── ezusb.c                   FX3 firmware upload (vendored, GPL-2.0+)
 │   ├── rx888_stream.c            Thin CLI over librx888 (~200 lines)
 │   ├── rx888_dsp.c               AVX2/FMA DSP pipeline
-│   └── iqrecord.c                SigMF recorder
+│   ├── iqrecord.c                SigMF recorder
+│   └── fx3_cmd/                  Vendor-command diagnostics CLI
+│       ├── fx3_cmd.c             Diagnostics CLI (dispatch + debug console)
+│       ├── fx3_core.{c,h}        Shared diagnostic primitives
+│       ├── fx3_usb.{c,h}         USB transport / device lifecycle
+│       └── fx3_stats.{c,h}       GETSTATS decoder
 ├── include/
 │   ├── librx888.h                Public library API
 │   ├── rx888.h                   FX3 protocol constants
@@ -197,3 +271,7 @@ Linux kernel `fxload` utility). Because `librx888.so` links them, the
 library and `rx888_stream` binary are distributed under GPL-3.0-or-later
 (compatible with GPL-2.0-or-later upstream and with GNU Radio downstream).
 `rx888_dsp` and `iqrecord` are MIT only.
+
+`fx3_cmd` (`src/fx3_cmd/`) is MIT. It links only libusb and does **not**
+link `ezusb`/`librx888`; firmware upload is done by spawning the installed
+`rx888_stream` binary, so no GPL code is linked into it.
