@@ -146,9 +146,13 @@ left alone.
 
 - `PASS <command> [details]` on success, exit `0`.
 - `FAIL <command> <reason>` on failure, exit `1`.
-- Usage error (no command / bad arg count) exits `2`.
+- Usage error (unknown command, wrong argument count, or `--no-claim` on a
+  non-allowlisted command) exits `2`.
 
-This makes `fx3_cmd` usable as a test predicate in shell scripts and CI.
+The command name and argument count are validated **before** the device is
+opened, so a typo or wrong arity is always a `2` — independent of whether a
+device is attached or a streamer holds it. This makes `fx3_cmd` usable as a
+test predicate in shell scripts and CI.
 
 ---
 

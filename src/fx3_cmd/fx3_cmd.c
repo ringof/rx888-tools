@@ -324,6 +324,49 @@ static void usage(const char *prog)
         prog);
 }
 
+/* Command table: name + allowed count of positional arguments (tokens after
+ * the command word; -F/--firmware and --no-claim are stripped first).
+ * max_args < 0 means unbounded (i2cw takes a variable number of data bytes).
+ * Used to validate the command line *before* opening the device, so a typo or
+ * wrong arity is a usage error (exit 2) regardless of whether a device is
+ * attached or a streamer holds the interface. */
+struct cmd_spec {
+    const char *name;
+    int min_args;
+    int max_args;   /* < 0 = unbounded */
+};
+
+static const struct cmd_spec COMMANDS[] = {
+    {"load",        0,  1},
+    {"reload",      0,  1},
+    {"test",        0,  0},
+    {"gpio",        1,  1},
+    {"adc",         1,  1},
+    {"att",         1,  1},
+    {"vga",         1,  1},
+    {"wdg_max",     1,  1},
+    {"start",       0,  0},
+    {"stop",        0,  0},
+    {"i2cr",        3,  3},
+    {"i2cw",        3, -1},
+    {"reset",       0,  0},
+    {"usbreset",    0,  0},
+    {"debug",       0,  0},
+    {"raw",         1,  1},
+    {"stats",       0,  0},
+    {"stats_pll",   0,  0},
+    {"stats_shdn",  0,  0},
+    {"stack_check", 0,  0},
+};
+
+static const struct cmd_spec *command_lookup(const char *name)
+{
+    for (size_t i = 0; i < sizeof(COMMANDS) / sizeof(COMMANDS[0]); i++)
+        if (strcmp(name, COMMANDS[i].name) == 0)
+            return &COMMANDS[i];
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     /* ---- Parse --no-claim flag (strip from argv) ---- */
@@ -365,6 +408,32 @@ int main(int argc, char **argv)
         strcmp(cmd, "help") == 0) {
         usage(argv[0]);
         return 0;
+    }
+
+    /* Validate the command name and argument count before touching libusb, so
+     * a typo or wrong arity is a usage error (exit 2) independent of whether a
+     * device is present or a streamer holds the interface.  The per-command
+     * arity guards in the dispatch below are now belt-and-suspenders. */
+    const struct cmd_spec *spec = command_lookup(cmd);
+    if (!spec) {
+        fprintf(stderr, "error: unknown command '%s'\n", cmd);
+        usage(argv[0]);
+        return 2;
+    }
+    int nargs = argc - 2;   /* positional args after the command name */
+    if (nargs < spec->min_args ||
+        (spec->max_args >= 0 && nargs > spec->max_args)) {
+        if (spec->max_args < 0)
+            fprintf(stderr, "error: command '%s' takes at least %d argument(s), got %d\n",
+                    cmd, spec->min_args, nargs);
+        else if (spec->min_args == spec->max_args)
+            fprintf(stderr, "error: command '%s' takes %d argument(s), got %d\n",
+                    cmd, spec->min_args, nargs);
+        else
+            fprintf(stderr, "error: command '%s' takes %d-%d arguments, got %d\n",
+                    cmd, spec->min_args, spec->max_args, nargs);
+        usage(argv[0]);
+        return 2;
     }
 
     /* --no-claim is only meaningful for the read-only EP0 commands.  Writes,
