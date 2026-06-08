@@ -158,6 +158,7 @@ Per-program docs in `doc/`:
 - `doc/rx888_stream.md` — CLI options and pipeline examples
 - `doc/rx888_dsp.md` / `doc/rx888_dsp_arch.md`
 - `doc/iqrecord.md`
+- `doc/fx3_cmd.md` — vendor-command diagnostics CLI
 - `doc/gr-rx888/` — design plan for the GNU Radio source block
 
 ### fx3_cmd — diagnostics CLI
@@ -173,7 +174,7 @@ firmware regression/fuzz/soak scenarios stay in that repo.
 make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
 
 ./fx3_cmd test                                 # probe device info (TESTFX3)
-./fx3_cmd gpio 0x1000                          # set GPIO word (LED_BLUE on)
+./fx3_cmd gpio 0x20                            # write GPIO register (0x20 = SHDWN; see include/rx888.h)
 ./fx3_cmd adc 64000000                         # set ADC clock to 64 MHz
 ./fx3_cmd att 15                               # DAT-31 attenuator (0-63)
 ./fx3_cmd vga 128                              # AD8370 VGA gain (0-255)
@@ -191,12 +192,18 @@ make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
 binary or on `PATH`. Run `./fx3_cmd` with no arguments for the full command
 list.
 
-> **Protocol header note:** `fx3_cmd` ships `tools/fx3_cmd/fx3_proto.h`, the
-> firmware-accurate mirror of `rx888-firmware`'s `protocol.h`. This currently
-> differs from `include/rx888.h` (which lacks `GETSTATS`/`WDG_MAX_RECOV` and
-> names the VGA arg `AD8340_VGA` vs the firmware's `AD8370_VGA`). Unifying the
-> two onto a single `rx888.h` is tracked as follow-up work — see the split plan
-> in rx888-firmware (`docs/fx3_cmd-split-plan.md`).
+`fx3_cmd` shares the wire-protocol constants in `include/rx888.h` with
+`librx888` — there is no separate protocol header. See
+[`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command reference and the
+firmware-upload model.
+
+> **Known GPIO caveat:** the LED bit positions in `include/rx888.h`
+> (`LED_YELLOW`/`LED_RED`/`LED_BLUE` at bits 10/11/12) follow the KA9Q-radio
+> GPIO map, which differs from `rx888-firmware`'s `protocol.h` (only
+> `LED_BLUE`, at bit 11). The constant is unused by code, so this is a
+> documentation discrepancy, not a functional bug — but don't rely on a
+> specific LED bit until the two maps are reconciled. The `SHDWN`/`DITH`/
+> `RANDO`/attenuator/`VHF_EN`/`PGA_EN` bits agree between the two.
 
 ---
 
@@ -241,3 +248,7 @@ Linux kernel `fxload` utility). Because `librx888.so` links them, the
 library and `rx888_stream` binary are distributed under GPL-3.0-or-later
 (compatible with GPL-2.0-or-later upstream and with GNU Radio downstream).
 `rx888_dsp` and `iqrecord` are MIT only.
+
+`fx3_cmd` (`src/fx3_cmd/`) is MIT. It links only libusb and does **not**
+link `ezusb`/`librx888`; firmware upload is done by spawning the installed
+`rx888_stream` binary, so no GPL code is linked into it.
