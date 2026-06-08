@@ -117,7 +117,7 @@ iqrecord: $(SRCDIR)/iqrecord.c
 # (fx3_core/fx3_usb/fx3_stats), independent of librx888.  Linked against
 # libusb directly.  -Wno-unused-parameter matches the core's origin in the
 # rx888-firmware harness; -Wpedantic is dropped for the imported core.
-FX3CMD_DIR  := tools/fx3_cmd
+FX3CMD_DIR  := $(SRCDIR)/fx3_cmd
 FX3CMD_SRCS := $(FX3CMD_DIR)/fx3_cmd.c $(FX3CMD_DIR)/fx3_core.c \
                $(FX3CMD_DIR)/fx3_usb.c $(FX3CMD_DIR)/fx3_stats.c
 FX3CMD_HDRS := $(wildcard $(FX3CMD_DIR)/*.h)

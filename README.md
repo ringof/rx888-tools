@@ -210,13 +210,12 @@ rx888_tools/
 │   ├── ezusb.c                   FX3 firmware upload (vendored, GPL-2.0+)
 │   ├── rx888_stream.c            Thin CLI over librx888 (~200 lines)
 │   ├── rx888_dsp.c               AVX2/FMA DSP pipeline
-│   └── iqrecord.c                SigMF recorder
-├── tools/fx3_cmd/               Vendor-command diagnostics CLI
-│   ├── fx3_cmd.c                Diagnostics CLI (dispatch + debug console)
-│   ├── fx3_core.{c,h}          Shared diagnostic primitives
-│   ├── fx3_usb.{c,h}           USB transport / device lifecycle
-│   ├── fx3_stats.{c,h}         GETSTATS decoder
-│   └── fx3_proto.h             FX3 vendor-protocol constants (firmware mirror)
+│   ├── iqrecord.c                SigMF recorder
+│   └── fx3_cmd/                  Vendor-command diagnostics CLI
+│       ├── fx3_cmd.c             Diagnostics CLI (dispatch + debug console)
+│       ├── fx3_core.{c,h}        Shared diagnostic primitives
+│       ├── fx3_usb.{c,h}         USB transport / device lifecycle
+│       └── fx3_stats.{c,h}       GETSTATS decoder
 ├── include/
 │   ├── librx888.h                Public library API
 │   ├── rx888.h                   FX3 protocol constants
