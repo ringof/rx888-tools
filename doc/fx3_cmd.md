@@ -8,7 +8,7 @@ device. It is **not** part of the streaming data path; `rx888_stream` /
 `librx888` own that.
 
 ```
-fx3_cmd [-F firmware.img] [--no-claim] <command> [args...]
+fx3_cmd [-F firmware.img] [--no-claim [--force]] <command> [args...]
 ```
 
 Unlike `rx888_stream`, `fx3_cmd` does **not** link `librx888`. It talks to
@@ -100,25 +100,57 @@ is running — but they are destructive**:
 
 These exist to recover a *wedged* device, not to coexist with a healthy stream.
 
-### `--no-claim` — read-only peeking during a stream
+### `--no-claim` — using stream-safe commands during a stream
 
-For the read-only, EP0-only commands — **`test`, `stats`, `stats_pll`,
-`stack_check`** — pass `--no-claim` to open the device *without* claiming
-interface 0 or touching the bulk endpoint. Vendor control transfers go to
-endpoint 0, which is not owned by any interface, so the firmware services them
-even while another process streams with interface 0 claimed:
+`--no-claim` opens the device *without* claiming interface 0 or touching the
+bulk endpoint. Vendor control transfers go to endpoint 0, which is not owned by
+any interface and is serviced on a **separate firmware thread** from the
+GPIF→DMA streaming path, so the firmware handles them even while another process
+streams with interface 0 claimed. (See the firmware concurrency contract,
+[`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170).)
+
+Per that contract, `--no-claim` allows the **stream-safe** EP0 commands:
+
+| Command(s) | Vendor request | Why it's safe |
+|---|---|---|
+| `test` | `TESTFX3` | read-only device info |
+| `stats`, `stats_pll` | `GETSTATS` | reads counters (non-coherent snapshot) |
+| `stack_check` | `TESTFX3` + `READINFODEBUG` | debug-log read, negligible interrupt |
+| `att`, `vga`, `wdg_max` | `SETARGFX3` | live gain/attenuator tuning; no stream impact |
 
 ```sh
-# ka9q-radio (or rx888_stream) is streaming; peek at firmware counters:
+# ka9q-radio (or rx888_stream) is streaming; peek and tune live:
 fx3_cmd --no-claim stats
 fx3_cmd --no-claim stats_pll
-fx3_cmd --no-claim test
+fx3_cmd --no-claim att 20        # adjust the attenuator without stopping the stream
 ```
 
-`--no-claim` is rejected (exit `2`) for any command that writes, recovers, or
-uploads — those need the claim or would perturb the stream. Note the reads are a
-non-coherent snapshot taken while the device is busy; treat them as monitoring,
-not ground truth.
+Reads are a non-coherent snapshot taken while the device is busy — treat them as
+monitoring, not ground truth.
+
+### `--force` — stream-unsafe commands and the full debug console
+
+The remaining commands are **stream-unsafe**: per the firmware contract,
+`GPIOFX3` (`gpio`), `STARTADC` (`adc`), `STARTFX3`/`STOPFX3` (`start`/`stop`,
+and `stats_shdn` which issues them), and `RESETFX3` (`reset`) stop or disrupt
+the GPIF/DMA stream. Under `--no-claim` they are rejected (exit `2`) unless you
+add **`--force`**:
+
+```sh
+fx3_cmd --no-claim gpio 0x20            # error: not stream-safe; re-run with --force
+fx3_cmd --no-claim --force gpio 0x20    # runs it; warns that it may disrupt the stream
+fx3_cmd --no-claim --force debug        # full interactive console during a stream
+```
+
+`--force` enables the **full `debug` console** (including its `!stop` / `!reset`
+/ `!gpio` / `!adc` local commands) alongside a running stream. Everything still
+goes over EP0 — no interface claim — so the firmware will not crash; the
+consequence you are accepting is that these commands **glitch, stop, or reset
+the device** out from under the streamer. `--force` only has meaning with
+`--no-claim`.
+
+`load`, `usbreset`, and `reload` are not part of `--no-claim` (they have their
+own non-claiming or recovery paths — run them without `--no-claim`).
 
 ---
 

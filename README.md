@@ -23,8 +23,9 @@ endpoint (EP0) to probe the device, poke registers (GPIO, ADC clock,
 attenuator, VGA, I2C), read firmware `GETSTATS` counters, and recover a wedged
 device (`reset` / `usbreset` / `reload`). It is for bring-up and debugging, not
 the data path — it links libusb directly and is independent of `librx888`. Its
-read-only `--no-claim` mode can even query the device *while a streamer is
-running*. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
+`--no-claim` mode can query and live-tune the device *while a streamer is
+running* (and, with `--force`, run the full debug console). See
+[`doc/fx3_cmd.md`](doc/fx3_cmd.md).
 
 ---
 
@@ -207,7 +208,9 @@ make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
 ./fx3_cmd usbreset                             # host-side USB port reset
 ./fx3_cmd -F SDDC_FX3.img reload               # reset → re-upload → verify
 ./fx3_cmd debug                                # interactive console (! for local cmds)
-./fx3_cmd --no-claim stats                     # read-only; safe while a streamer runs
+./fx3_cmd --no-claim stats                     # stream-safe; query while a streamer runs
+./fx3_cmd --no-claim att 20                    # stream-safe; live attenuator tuning
+./fx3_cmd --no-claim --force debug             # full console during a stream (knowingly disruptive)
 ```
 
 `load`/`reload`/`-F` upload firmware via `rx888_stream`, found alongside the
@@ -216,9 +219,13 @@ list.
 
 `fx3_cmd` claims the USB interface exclusively, so its normal commands **cannot
 run while a streamer (`rx888_stream`, ka9q-radio, …) holds the device** — stop
-the streamer first. The exception is the read-only `--no-claim` mode (`test`,
-`stats`, `stats_pll`, `stack_check`), which peeks at EP0 without disturbing an
-active stream. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md#running-alongside-a-streamer-exclusive-access).
+the streamer first. With `--no-claim` it opens without claiming and runs the
+**stream-safe** EP0 commands (`test`, `stats`, `stats_pll`, `stack_check`, plus
+live `att`/`vga`/`wdg_max` tuning) alongside an active stream; add `--force` to
+also run the stream-**unsafe** commands and the full `debug` console, accepting
+that they may glitch/stop/reset the device. The firmware concurrency contract is
+[`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170); see
+[`doc/fx3_cmd.md`](doc/fx3_cmd.md#running-alongside-a-streamer-exclusive-access).
 
 `fx3_cmd` shares the wire-protocol constants in `include/rx888.h` with
 `librx888` — there is no separate protocol header. The GPIO bit map in

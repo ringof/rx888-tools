@@ -179,8 +179,23 @@ else
     fail "stream stalled across --no-claim stack_check ($dma_sc1 -> $dma_sc2) (re #27)"
 fi
 
-# --- 5. --no-claim allowlist rejects a write command -------------------------
-check 2 "--no-claim gpio rejected" "$FX3" --no-claim gpio 0x20
+# att/vga are stream-SAFE per rx888-firmware#170 (SETARGFX3 live tuning): they
+# must succeed under --no-claim during a stream and not disrupt it.
+dma_t1="$(stat_field dma --no-claim)"
+check 0 "--no-claim att during stream" "$FX3" --no-claim att 0
+check 0 "--no-claim vga during stream" "$FX3" --no-claim vga 0
+sleep 1
+dma_t2="$(stat_field dma --no-claim)"
+if [[ -n "$dma_t1" && -n "$dma_t2" && "$dma_t2" -gt "$dma_t1" ]]; then
+    ok "--no-claim att/vga non-disruptive: dma $dma_t1 -> $dma_t2"
+else
+    fail "stream stalled across --no-claim att/vga ($dma_t1 -> $dma_t2)"
+fi
+
+# --- 5. --no-claim gating: stream-unsafe rejected without --force ------------
+# (We don't run --force write commands here — they'd intentionally disrupt the
+# stream; the smoke test covers that --force passes the gate.)
+check 2 "--no-claim gpio rejected (needs --force)" "$FX3" --no-claim gpio 0x20
 
 # --- 6. device healthy again once the streamer detaches ----------------------
 cleanup; STREAM_PID=""
