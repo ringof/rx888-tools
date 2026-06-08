@@ -17,6 +17,15 @@ rx888_stream  →  rx888_dsp  →  iqrecord
 also what `gr-rx888` (a GNU Radio out-of-tree source block, planning docs
 under `doc/gr-rx888/`) will consume — same code path for both.
 
+Beside the streaming pipeline, **`fx3_cmd`** is a separate **control /
+diagnostics channel**: a standalone CLI that talks to the FX3's vendor-command
+endpoint (EP0) to probe the device, poke registers (GPIO, ADC clock,
+attenuator, VGA, I2C), read firmware `GETSTATS` counters, and recover a wedged
+device (`reset` / `usbreset` / `reload`). It is for bring-up and debugging, not
+the data path — it links libusb directly and is independent of `librx888`. Its
+read-only `--no-claim` mode can even query the device *while a streamer is
+running*. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
+
 ---
 
 ## Requirements
@@ -37,7 +46,7 @@ sudo apt install build-essential pkg-config libusb-1.0-0-dev
 ## Build
 
 ```bash
-make            # librx888.so + librx888.a + pkg-config + 3 binaries
+make            # librx888.so + librx888.a + pkg-config + 4 binaries
 make check      # non-hardware ABI / CLI tests (also runs in CI)
 ```
 
@@ -47,6 +56,7 @@ To build a single program:
 make rx888_stream    # links librx888.so
 make rx888_dsp
 make iqrecord
+make fx3_cmd         # standalone; links libusb directly (not librx888)
 ```
 
 ---
@@ -77,7 +87,8 @@ sudo make uninstall
 ```
 
 This installs `librx888.so`, `librx888.a`, `librx888.pc`, `librx888.h`,
-the three binaries, the firmware blob, and the udev rule. After installing:
+the four binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`), the
+firmware blob, and the udev rule. After installing:
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -128,6 +139,24 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
 ```
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
+
+**5. Probe the device (diagnostics channel):**
+
+```bash
+fx3_cmd -F firmware/SDDC_FX3.img test    # upload if needed, then read device info
+fx3_cmd stats                            # firmware GETSTATS counters
+fx3_cmd stats_pll                        # verify the Si5351 PLL is locked
+```
+
+These need exclusive access. To peek while a streamer (above, or ka9q-radio)
+is running, use the read-only `--no-claim` mode:
+
+```bash
+fx3_cmd --no-claim stats                 # non-disruptive; works during a stream
+```
+
+See [`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command set, the
+exclusive-access rules, and firmware recovery (`reset` / `usbreset` / `reload`).
 
 ---
 
