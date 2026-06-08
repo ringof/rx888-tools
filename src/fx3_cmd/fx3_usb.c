@@ -3,7 +3,7 @@
  * Extracted verbatim from fx3_cmd.c (issue #139).
  */
 #include "fx3_usb.h"
-#include "fx3_proto.h"
+#include "rx888.h"
 
 #include <stdio.h>
 #include <stdlib.h>

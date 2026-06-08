@@ -12,6 +12,13 @@
 #include <stdint.h>
 #include <libusb-1.0/libusb.h>
 
+/* ------------------------------ USB identity ----------------------------- */
+/* Cypress FX3 vendor id; product id differs between the ROM bootloader and
+ * the loaded application firmware. */
+#define RX888_VID      0x04b4u
+#define RX888_PID_BOOT 0x00f3u   /* FX3 bootloader (firmware not yet loaded) */
+#define RX888_PID_APP  0x00f1u   /* SDDC_FX3 application firmware running */
+
 /* ------------------------------ FX3 commands ----------------------------- */
 /* (KA9Q-radio constants) */
 enum FX3Command {
@@ -59,6 +66,11 @@ enum FX3Command {
   // WRITE: UINT32 -> adc frequency
   STARTADC = 0xB2,
 
+  // Read firmware diagnostic counters (DMA/GPIF/PIB/I2C/Si5351/GPIO state).
+  // See struct fx3_stats in src/fx3_cmd/fx3_stats.h for the payload layout.
+  // READ: DATA
+  GETSTATS = 0xB3,
+
   // R82XX family Tuner functions
   // Initialize R82XX tuner
   // WRITE: NONE
@@ -100,9 +112,9 @@ enum ArgumentList {
     // Value: 0-63
     DAT31_ATT = 10,
 
-    // Set AD8340 chip vga
+    // Set AD8370 VGA gain
     // Value: 0-255
-    AD8340_VGA = 11,
+    AD8370_VGA = 11,
 
     // Preselector
     // Value: 0-2
@@ -111,6 +123,12 @@ enum ArgumentList {
     // VHFATT
     // Value: 0-15
     VHF_ATTENUATOR = 13,
+
+    // Watchdog max recovery count before escalating to reset (0 = unlimited)
+    WDG_MAX_RECOV = 14,
+
+    // Enable(!=0)/disable(0) cold-start reset escalation
+    WDG_RESET_ESCALATE = 15,
 };
 
 #define OUTXIO0 (1U << 0) 	// ATT_LE

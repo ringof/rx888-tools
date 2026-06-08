@@ -4,9 +4,10 @@
  *
  * These are the "operator diagnostics" primitives: probe, poke, recover, and
  * the read-only status reads.  They depend only on the USB transport
- * (fx3_usb.h), the GETSTATS decoder (fx3_stats.h), and the vendor-protocol
- * constants (fx3_proto.h) — never on the firmware regression/fuzz/soak
- * harness.  Both the diagnostics CLI and the firmware test harness link this
+ * (fx3_usb.h), the GETSTATS decoder (fx3_stats.h), and the shared
+ * vendor-protocol constants (include/rx888.h) — never on the firmware
+ * regression/fuzz/soak harness.  Both the diagnostics CLI and the firmware
+ * test harness link this
  * core (issue #139 modularization; fx3_cmd split).
  */
 #ifndef FX3_CORE_H

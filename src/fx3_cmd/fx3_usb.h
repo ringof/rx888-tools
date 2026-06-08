@@ -7,6 +7,11 @@
 #include <stdint.h>
 #include <libusb-1.0/libusb.h>
 
+/* Vendor control-transfer timeout (ms).  Host-side policy for the diagnostics
+ * tool, not a wire-protocol constant, so it lives here rather than in the
+ * shared rx888.h.  (librx888 uses its own, longer, configurable timeout.) */
+#define CTRL_TIMEOUT_MS 1000
+
 /* Global libusb context — needed by primed_start_and_read() and the soak
  * re-acquire path for libusb_handle_events*.  Set once in main(). */
 extern libusb_context *g_ctx;

@@ -4,7 +4,7 @@
  */
 #include "fx3_stats.h"
 #include "fx3_usb.h"
-#include "fx3_proto.h"
+#include "rx888.h"
 
 #include <stdio.h>
 #include <string.h>

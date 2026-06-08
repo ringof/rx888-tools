@@ -29,7 +29,7 @@
 #include <fcntl.h>
 #include <libusb-1.0/libusb.h>
 
-#include "fx3_proto.h"
+#include "rx888.h"
 #include "fx3_usb.h"
 #include "fx3_stats.h"
 #include "fx3_core.h"

@@ -48,10 +48,8 @@ int verbose = 0;
 
 #define LIBRX888_VERSION_STR "0.0.1"
 
-/* USB ids */
-static const uint16_t RX888_VID      = 0x04b4;
-static const uint16_t RX888_PID_BOOT = 0x00f3;
-static const uint16_t RX888_PID_APP  = 0x00f1;
+/* USB ids (RX888_VID / RX888_PID_BOOT / RX888_PID_APP) come from rx888.h,
+ * shared with the fx3_cmd diagnostics tool. */
 
 /* Library defaults; rx888_config_init_default() copies these into the
  * caller's config struct. rx888_open() validates the result. */
@@ -516,7 +514,7 @@ int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
 
     usleep(CFG_CTRL_SETTLE_US);
     uint16_t vga = (uint16_t)((cfg->gain & 0x7f) | (cfg->gain_high ? 0x80 : 0));
-    rc = rx888_set_arg(r->h, r->cfg.ctrl_timeout_ms, (uint16_t)AD8340_VGA, vga);
+    rc = rx888_set_arg(r->h, r->cfg.ctrl_timeout_ms, (uint16_t)AD8370_VGA, vga);
     if (rc != 0) goto fail;
 
     usleep(CFG_CTRL_SETTLE_US);
