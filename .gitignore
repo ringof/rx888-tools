@@ -1,8 +1,9 @@
-# Compiled binaries
-rx888_stream
-rx888_dsp
-iqrecord
-fx3_cmd
+# Compiled binaries (anchored to repo root so the rules don't also match the
+# src/fx3_cmd/ source directory)
+/rx888_stream
+/rx888_dsp
+/iqrecord
+/fx3_cmd
 
 # Library + pkg-config build outputs
 librx888.so
