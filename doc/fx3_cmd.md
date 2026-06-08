@@ -110,10 +110,10 @@ This makes `fx3_cmd` usable as a test predicate in shell scripts and CI.
 ## Protocol constants
 
 `fx3_cmd` shares [`include/rx888.h`](../include/rx888.h) with `librx888` —
-there is no separate protocol header. Note the LED GPIO-bit caveat described in
-the [README](../README.md#fx3_cmd--diagnostics-cli): the `LED_*` bit map in
-`rx888.h` follows KA9Q-radio and differs from the firmware's `protocol.h`. The
-constant is unused by `fx3_cmd` code; the other GPIO bits agree.
+there is no separate protocol header. Its constants (command IDs, SETARG IDs,
+and the GPIO bit map) track the firmware's `protocol.h`, so the `gpio` command
+and the `GETSTATS` `gpio_state` readback use the same bit positions the
+firmware does — including `LED_BLUE` at bit 11.
 
 ---
 

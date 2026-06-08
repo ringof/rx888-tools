@@ -4,8 +4,11 @@
 /*
  * RX888 / RX888 MkII protocol constants + streamer API.
  *
- * The FX3 command IDs, SETARG IDs, and GPIO bit assignments below match
- * KA9Q-radio (src/rx888.h). If you started from other RX888 streamer
+ * The FX3 command IDs, SETARG IDs, and GPIO bit assignments below track
+ * ringof/rx888-firmware (SDDC_FX3/protocol.h) — the firmware this toolset
+ * loads, and therefore the authority for the wire protocol. The names follow
+ * KA9Q-radio where the two agree; where they differ (notably the LED GPIO
+ * bits), the firmware wins. If you started from other RX888 streamer
  * codebases you may see different names/values; prefer these.
  */
 
@@ -151,22 +154,22 @@ enum ArgumentList {
 #define OUTXI16 (1U << 16)
 
 /* ------------------------------- GPIO bits ------------------------------- */
-/* (KA9Q-radio constants; names kept compatible with existing streamer code) */
+/* Matches enum GPIOPin in ringof/rx888-firmware SDDC_FX3/protocol.h — the
+ * firmware this toolset loads, and the authority for the GPIO control word
+ * (GPIOFX3) and the GETSTATS gpio_state readback.  Note this differs from the
+ * KA9Q-radio map, which assigns LED_YELLOW/LED_RED/LED_BLUE to bits 10/11/12;
+ * the firmware exposes only LED_BLUE, at bit 11. */
 enum GPIOPin {
-    SHDWN = OUTXIO5,
-    DITH = OUTXIO6,
-    RANDO = OUTXIO7,
-    BIAS_HF = OUTXIO8,
+    SHDWN    = OUTXIO5,
+    DITH     = OUTXIO6,
+    RANDO    = OUTXIO7,
+    BIAS_HF  = OUTXIO8,
     BIAS_VHF = OUTXIO9,
-    LED_YELLOW = OUTXI10,
-    LED_RED = OUTXI11,
-    LED_BLUE = OUTXI12,
+    LED_BLUE = OUTXI11,
     ATT_SEL0 = OUTXI13,
     ATT_SEL1 = OUTXI14,
-
-    // RX888r2
-    VHF_EN = OUTXI15,
-    PGA_EN = OUTXI16,
+    VHF_EN   = OUTXI15,
+    PGA_EN   = OUTXI16,
 };
 
 /* ----------------------------- Si5351 constants -------------------------- */

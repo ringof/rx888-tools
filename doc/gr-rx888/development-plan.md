@@ -77,7 +77,7 @@ the block exposes only HF-relevant SETARGs and GPIO bits.
 
 - `DITH`, `RANDO` — ADC dither / output randomizer
 - `BIAS_HF` — bias-T for HF antennas
-- `LED_YELLOW`, `LED_RED`, `LED_BLUE` — runtime status indicators
+- `LED_BLUE` — runtime status indicator (the only LED the firmware exposes)
 - `SHDWN` — managed internally, not user-facing
 
 **Dropped entirely:** all `R82XX_*` SETARGs, `PRESELECTOR`,

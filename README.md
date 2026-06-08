@@ -193,17 +193,12 @@ binary or on `PATH`. Run `./fx3_cmd` with no arguments for the full command
 list.
 
 `fx3_cmd` shares the wire-protocol constants in `include/rx888.h` with
-`librx888` — there is no separate protocol header. See
-[`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command reference and the
-firmware-upload model.
-
-> **Known GPIO caveat:** the LED bit positions in `include/rx888.h`
-> (`LED_YELLOW`/`LED_RED`/`LED_BLUE` at bits 10/11/12) follow the KA9Q-radio
-> GPIO map, which differs from `rx888-firmware`'s `protocol.h` (only
-> `LED_BLUE`, at bit 11). The constant is unused by code, so this is a
-> documentation discrepancy, not a functional bug — but don't rely on a
-> specific LED bit until the two maps are reconciled. The `SHDWN`/`DITH`/
-> `RANDO`/attenuator/`VHF_EN`/`PGA_EN` bits agree between the two.
+`librx888` — there is no separate protocol header. The GPIO bit map in
+`rx888.h` tracks the firmware's `protocol.h` (the authority for the device
+this toolset loads): the firmware exposes only `LED_BLUE`, at bit 11 — unlike
+the KA9Q-radio map, which places `LED_YELLOW`/`LED_RED`/`LED_BLUE` at bits
+10/11/12. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command reference
+and the firmware-upload model.
 
 ---
 
