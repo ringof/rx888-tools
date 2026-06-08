@@ -140,23 +140,8 @@ rx888_stream -f firmware/SDDC_FX3.img -s 135000000 \
 
 Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 
-**5. Probe the device (diagnostics channel):**
-
-```bash
-fx3_cmd -F firmware/SDDC_FX3.img test    # upload if needed, then read device info
-fx3_cmd stats                            # firmware GETSTATS counters
-fx3_cmd stats_pll                        # verify the Si5351 PLL is locked
-```
-
-These need exclusive access. To peek while a streamer (above, or ka9q-radio)
-is running, use the read-only `--no-claim` mode:
-
-```bash
-fx3_cmd --no-claim stats                 # non-disruptive; works during a stream
-```
-
-See [`doc/fx3_cmd.md`](doc/fx3_cmd.md) for the full command set, the
-exclusive-access rules, and firmware recovery (`reset` / `usbreset` / `reload`).
+For device bring-up, diagnostics, and recovery outside the streaming chain,
+see the `fx3_cmd` channel: [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
 
 ---
 
