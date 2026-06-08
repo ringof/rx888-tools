@@ -8,7 +8,7 @@ device. It is **not** part of the streaming data path; `rx888_stream` /
 `librx888` own that.
 
 ```
-fx3_cmd [-F firmware.img] [--no-claim [--force]] <command> [args...]
+fx3_cmd [-F firmware.img] [--no-claim | --force] <command> [args...]
 ```
 
 Unlike `rx888_stream`, `fx3_cmd` does **not** link `librx888`. It talks to
@@ -179,8 +179,8 @@ left alone.
 
 - `PASS <command> [details]` on success, exit `0`.
 - `FAIL <command> <reason>` on failure, exit `1`.
-- Usage error (unknown command, wrong argument count, or `--no-claim` on a
-  non-allowlisted command) exits `2`.
+- Usage error (unknown command, wrong argument count, or a stream-unsafe
+  command under `--no-claim` without `--force`) exits `2`.
 
 The command name and argument count are validated **before** the device is
 opened, so a typo or wrong arity is always a `2` — independent of whether a
@@ -226,10 +226,12 @@ runs `tests/hw_fx3_cmd.sh`, which exercises the real vendor commands and the
   `stats_shdn` graceful-degradation path on legacy 26-byte `GETSTATS` firmware.
 - **exclusive-access guard:** a normal command is refused (`Resource busy`,
   exit 1) while `rx888_stream` holds interface 0.
-- **`--no-claim` concurrency:** read-only commands succeed alongside the
-  stream, `GETSTATS` `dma_count` advances between two snapshots while
-  `boot_count` stays put, and `--no-claim stack_check` (the debug/EP0 channel)
-  does not stall the stream — early evidence for the observe-only-debug
+- **`--no-claim` concurrency:** stream-safe commands succeed alongside the
+  stream — including live `att`/`vga` tuning — with `GETSTATS` `dma_count`
+  advancing between snapshots while `boot_count` stays put; a stream-unsafe
+  command (`gpio`) is refused without `--force`; and `--no-claim stack_check`
+  (the debug/EP0 channel) does not stall the stream — early evidence for the
+  observe-only-debug
   question in issue #27.
 
 It is non-destructive (leaves the device loaded and idle); `usbreset`/`reload`

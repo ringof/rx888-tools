@@ -11,12 +11,14 @@
 #   3. exclusive-access guard          a normal fx3_cmd command is refused
 #                                      with "Resource busy" (exit 1) while
 #                                      rx888_stream holds interface 0
-#   4. --no-claim concurrency          read-only commands succeed alongside the
-#                                      stream, GETSTATS dma_count advances while
+#   4. --no-claim concurrency          stream-safe commands succeed alongside
+#                                      the stream (incl. live att/vga tuning),
+#                                      GETSTATS dma_count advances while
 #                                      boot_count stays put, and --no-claim
 #                                      stack_check (the debug/EP0 channel) does
 #                                      not stall the stream (probes issue #27)
-#   5. --no-claim allowlist            a write command is rejected (exit 2)
+#   5. --no-claim gating               a stream-unsafe command (gpio) is
+#                                      rejected without --force (exit 2)
 #   6. post-stream health              claim works again once the streamer
 #                                      detaches
 #
@@ -164,7 +166,7 @@ else
     fail "boot_count changed ($boot1 -> $boot2): device reset under the stream"
 fi
 
-# --no-claim stack_check is the one allowlisted no-claim command that drives the
+# --no-claim stack_check is the one stream-safe no-claim command that drives the
 # READINFODEBUG debug channel (EP0).  Running it mid-stream probes issue #27:
 # does the debug channel disturb an active stream?  We do not assert
 # stack_check's own result (its console parse may legitimately fail on some
