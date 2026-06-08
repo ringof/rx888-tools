@@ -138,8 +138,14 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
 check: $(TEST_BINS) rx888_stream fx3_cmd
-	$(TESTS_DIR)/librx888_api
-	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream
+	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
+	if [ "$$present" = "1" ]; then \
+	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
+	  export RX888_HW_PRESENT=1; \
+	fi; \
+	set -e; \
+	$(TESTS_DIR)/librx888_api; \
+	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
 	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.

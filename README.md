@@ -154,6 +154,12 @@ make hw-check      # hardware: throughput, stop/start cycles, sample sanity,
                    # Requires RX888 + RX888_HW_TEST=1.
 ```
 
+`make check` is hardware-independent. If a **loaded** (application-mode) RX888
+happens to be attached, it auto-detects it and skips the negative "no-device"
+checks (which would otherwise fail and disturb the device); a fresh
+bootloader-mode device needs no special handling. Force the skip with
+`RX888_HW_PRESENT=1 make check`.
+
 Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 
 ---

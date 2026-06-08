@@ -89,10 +89,14 @@ static void test_config_init_default(void) {
 }
 
 static void test_open_no_device(void) {
-    /* Assumes no RX888 on the host (CI runners qualify).  If you're
-     * running this on a bench with hardware connected, skip. */
-    if (getenv("RX888_HW_PRESENT")) {
-        fprintf(stderr, "skip rx888_open NO_DEVICE test (RX888_HW_PRESENT set)\n");
+    /* Assumes no RX888 on the host (CI runners qualify).  If a usable
+     * (application-mode) device is attached, `make check` sets
+     * RX888_HW_PRESENT=1 and we skip — opening it here would fail the
+     * assertion and disturb the device.  Skip only on the exact value "1",
+     * matching the shell smoke tests. */
+    const char *hw = getenv("RX888_HW_PRESENT");
+    if (hw && strcmp(hw, "1") == 0) {
+        fprintf(stderr, "skip rx888_open NO_DEVICE test (RX888_HW_PRESENT=1)\n");
         return;
     }
     rx888_config_t cfg;
