@@ -137,9 +137,10 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream
+check: $(TEST_BINS) rx888_stream fx3_cmd
 	$(TESTS_DIR)/librx888_api
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream
+	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.

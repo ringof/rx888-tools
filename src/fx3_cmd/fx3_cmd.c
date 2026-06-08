@@ -342,6 +342,14 @@ int main(int argc, char **argv)
 
     const char *cmd = argv[1];
 
+    /* Help is answered before touching libusb so it works with no device
+     * attached (and without needing usb permissions). */
+    if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0 ||
+        strcmp(cmd, "help") == 0) {
+        usage(argv[0]);
+        return 0;
+    }
+
     libusb_context *ctx = NULL;
     int r = libusb_init(&ctx);
     if (r < 0) {
