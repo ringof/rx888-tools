@@ -181,9 +181,20 @@ exits 2, and each command fails cleanly with exit 1 when no device is present).
 
 `make hw-check` (with `RX888_HW_TEST=1` and a device attached) additionally
 runs `tests/hw_fx3_cmd.sh`, which exercises the real vendor commands and the
-`--no-claim` concurrency path: load + probe, idle `stats`/`stats_pll`, the
-exclusive-access guard (a normal command is refused while `rx888_stream`
-streams), and proof that `--no-claim` reads run alongside the stream
-(`GETSTATS` `dma_count` advances between two snapshots while `boot_count`
-stays put). Broader firmware regression/fuzz/soak coverage lives in the
-`rx888-firmware` harness.
+`--no-claim` concurrency path:
+
+- **load + probe** (`-F … test`).
+- **idle diagnostics + config pokes:** `stats`/`stats_pll`, read-only
+  `i2cr` (Si5351 status), `adc`/`att`/`vga`, a `start`/`stop` pair, and the
+  `stats_shdn` graceful-degradation path on legacy 26-byte `GETSTATS` firmware.
+- **exclusive-access guard:** a normal command is refused (`Resource busy`,
+  exit 1) while `rx888_stream` holds interface 0.
+- **`--no-claim` concurrency:** read-only commands succeed alongside the
+  stream, `GETSTATS` `dma_count` advances between two snapshots while
+  `boot_count` stays put, and `--no-claim stack_check` (the debug/EP0 channel)
+  does not stall the stream — early evidence for the observe-only-debug
+  question in issue #27.
+
+It is non-destructive (leaves the device loaded and idle); `usbreset`/`reload`
+are destructive and remain manual. Broader firmware regression/fuzz/soak
+coverage lives in the `rx888-firmware` harness.
