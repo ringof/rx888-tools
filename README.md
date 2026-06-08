@@ -210,7 +210,7 @@ make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
 ./fx3_cmd debug                                # interactive console (! for local cmds)
 ./fx3_cmd --no-claim stats                     # stream-safe; query while a streamer runs
 ./fx3_cmd --no-claim att 20                    # stream-safe; live attenuator tuning
-./fx3_cmd --no-claim --force debug             # full console during a stream (knowingly disruptive)
+./fx3_cmd --force debug                        # full console during a stream (knowingly disruptive)
 ```
 
 `load`/`reload`/`-F` upload firmware via `rx888_stream`, found alongside the
@@ -221,9 +221,10 @@ list.
 run while a streamer (`rx888_stream`, ka9q-radio, …) holds the device** — stop
 the streamer first. With `--no-claim` it opens without claiming and runs the
 **stream-safe** EP0 commands (`test`, `stats`, `stats_pll`, `stack_check`, plus
-live `att`/`vga`/`wdg_max` tuning) alongside an active stream; add `--force` to
-also run the stream-**unsafe** commands and the full `debug` console, accepting
-that they may glitch/stop/reset the device. The firmware concurrency contract is
+live `att`/`vga`/`wdg_max` tuning) alongside an active stream; `--force` (which
+implies `--no-claim`) also runs the stream-**unsafe** commands and the full
+`debug` console, accepting that they may glitch/stop/reset the device. The
+firmware concurrency contract is
 [`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170); see
 [`doc/fx3_cmd.md`](doc/fx3_cmd.md#running-alongside-a-streamer-exclusive-access).
 

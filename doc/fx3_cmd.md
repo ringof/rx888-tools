@@ -134,23 +134,24 @@ The remaining commands are **stream-unsafe**: per the firmware contract,
 `GPIOFX3` (`gpio`), `STARTADC` (`adc`), `STARTFX3`/`STOPFX3` (`start`/`stop`,
 and `stats_shdn` which issues them), and `RESETFX3` (`reset`) stop or disrupt
 the GPIF/DMA stream. Under `--no-claim` they are rejected (exit `2`) unless you
-add **`--force`**:
+use **`--force`**, which **implies `--no-claim`** (you don't need both — you
+never claim the interface to disrupt a stream; the disruption is via EP0 vendor
+commands either way):
 
 ```sh
-fx3_cmd --no-claim gpio 0x20            # error: not stream-safe; re-run with --force
-fx3_cmd --no-claim --force gpio 0x20    # runs it; warns that it may disrupt the stream
-fx3_cmd --no-claim --force debug        # full interactive console during a stream
+fx3_cmd --no-claim gpio 0x20      # error: not stream-safe; re-run with --force
+fx3_cmd --force gpio 0x20         # runs it; warns that it may disrupt the stream
+fx3_cmd --force debug             # full interactive console during a stream
 ```
 
 `--force` enables the **full `debug` console** (including its `!stop` / `!reset`
 / `!gpio` / `!adc` local commands) alongside a running stream. Everything still
 goes over EP0 — no interface claim — so the firmware will not crash; the
 consequence you are accepting is that these commands **glitch, stop, or reset
-the device** out from under the streamer. `--force` only has meaning with
-`--no-claim`.
+the device** out from under the streamer.
 
-`load`, `usbreset`, and `reload` are not part of `--no-claim` (they have their
-own non-claiming or recovery paths — run them without `--no-claim`).
+`load`, `usbreset`, and `reload` are not part of `--no-claim`/`--force` (they
+have their own non-claiming or recovery paths — run them on their own).
 
 ---
 

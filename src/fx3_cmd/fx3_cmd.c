@@ -285,7 +285,7 @@ static unsigned long parse_num(const char *s)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-F firmware.img] [--no-claim [--force]] <command> [args...]\n"
+        "Usage: %s [-F firmware.img] [--no-claim | --force] <command> [args...]\n"
         "\n"
         "Options:\n"
         "  -F, --firmware <path>        Upload firmware first if device is in\n"
@@ -297,10 +297,10 @@ static void usage(const char *prog)
         "                               to run while another process (e.g.\n"
         "                               ka9q-radio) is streaming. (See firmware\n"
         "                               contract rx888-firmware#170.)\n"
-        "      --force                  With --no-claim, also allow the stream-\n"
-        "                               UNSAFE commands and the full debug console\n"
-        "                               during a stream. These can glitch, stop, or\n"
-        "                               reset the device — use knowingly.\n"
+        "      --force                  Implies --no-claim, and ALSO allows the\n"
+        "                               stream-UNSAFE commands and the full debug\n"
+        "                               console during a stream. These can glitch,\n"
+        "                               stop, or reset the device — use knowingly.\n"
         "\n"
         "Commands:\n"
         "  load <firmware.img>          Upload firmware and exit\n"
@@ -386,18 +386,26 @@ static const struct cmd_spec *command_lookup(const char *name)
 
 int main(int argc, char **argv)
 {
-    /* ---- Parse --no-claim / --force flags (strip from argv) ---- */
+    /* ---- Parse --no-claim / --force flags (strip from argv) ----
+     * --force implies --no-claim: you never open the interface to disrupt a
+     * stream — the disruption is via EP0 vendor commands either way — so there
+     * is no reason to require both.  --no-claim alone = stream-safe commands;
+     * --force = also the stream-unsafe ones (and the full debug console). */
     int force = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-claim") == 0 || strcmp(argv[i], "--force") == 0) {
-            if (strcmp(argv[i], "--force") == 0) force = 1;
-            else                                 g_no_claim = 1;
-            int remaining = argc - i - 1;
-            memmove(&argv[i], &argv[i + 1], remaining * sizeof(char *));
-            argc -= 1;
-            argv[argc] = NULL;
-            i -= 1;
+        if (strcmp(argv[i], "--force") == 0) {
+            force = 1;
+            g_no_claim = 1;
+        } else if (strcmp(argv[i], "--no-claim") == 0) {
+            g_no_claim = 1;
+        } else {
+            continue;
         }
+        int remaining = argc - i - 1;
+        memmove(&argv[i], &argv[i + 1], remaining * sizeof(char *));
+        argc -= 1;
+        argv[argc] = NULL;
+        i -= 1;
     }
 
     /* ---- Parse -F / --firmware option ---- */
@@ -455,27 +463,23 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* --no-claim opens the device without claiming interface 0, so EP0 vendor
-     * commands run alongside a stream (per the firmware concurrency contract,
-     * ringof/rx888-firmware#170).  Gate which commands are allowed there using
-     * the per-command stream-safety class; --force opts in to the stream-unsafe
-     * ones (and the full debug console), accepting that they may stop/disrupt
-     * the stream.  --force only makes sense together with --no-claim. */
-    if (force && !g_no_claim) {
-        fprintf(stderr, "error: --force only applies to --no-claim\n");
-        return 2;
-    }
+    /* --no-claim (and --force, which implies it) opens the device without
+     * claiming interface 0, so EP0 vendor commands run alongside a stream (per
+     * the firmware concurrency contract, ringof/rx888-firmware#170).  Gate
+     * which commands are allowed using the per-command stream-safety class;
+     * --force opts in to the stream-unsafe ones (and the full debug console),
+     * accepting that they may stop/disrupt the stream. */
     if (g_no_claim) {
         if (spec->nc == NC_NO) {
-            fprintf(stderr, "error: '%s' cannot run under --no-claim; "
-                            "run it without --no-claim\n", cmd);
+            fprintf(stderr, "error: '%s' does not run under --no-claim/--force; "
+                            "run it on its own\n", cmd);
             return 2;
         }
         if (spec->nc == NC_FORCE && !force) {
             fprintf(stderr,
                 "error: '%s' is not stream-safe (per rx888-firmware#170) and can\n"
-                "       disrupt or stop a running stream. Re-run with\n"
-                "       '--no-claim --force' to do it anyway.\n", cmd);
+                "       disrupt or stop a running stream. Re-run with --force\n"
+                "       to do it anyway.\n", cmd);
             return 2;
         }
         if (spec->nc == NC_FORCE && force)
