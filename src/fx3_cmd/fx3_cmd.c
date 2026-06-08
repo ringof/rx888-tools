@@ -285,11 +285,16 @@ static unsigned long parse_num(const char *s)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-F firmware.img] <command> [args...]\n"
+        "Usage: %s [-F firmware.img] [--no-claim] <command> [args...]\n"
         "\n"
         "Options:\n"
         "  -F, --firmware <path>        Upload firmware first if device is in\n"
         "                               bootloader mode (PID 0x00F3)\n"
+        "      --no-claim               Open without claiming interface 0 or\n"
+        "                               touching the bulk endpoint. Read-only EP0\n"
+        "                               commands only (test/stats/stats_pll/\n"
+        "                               stack_check). Safe to run while another\n"
+        "                               process (e.g. ka9q-radio) is streaming.\n"
         "\n"
         "Commands:\n"
         "  load <firmware.img>          Upload firmware and exit\n"
@@ -321,6 +326,18 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    /* ---- Parse --no-claim flag (strip from argv) ---- */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-claim") == 0) {
+            g_no_claim = 1;
+            int remaining = argc - i - 1;
+            memmove(&argv[i], &argv[i + 1], remaining * sizeof(char *));
+            argc -= 1;
+            argv[argc] = NULL;
+            i -= 1;
+        }
+    }
+
     /* ---- Parse -F / --firmware option ---- */
     const char *firmware_path = NULL;
     for (int i = 1; i < argc - 1; i++) {
@@ -348,6 +365,20 @@ int main(int argc, char **argv)
         strcmp(cmd, "help") == 0) {
         usage(argv[0]);
         return 0;
+    }
+
+    /* --no-claim is only meaningful for the read-only EP0 commands.  Writes,
+     * recovery, firmware upload, and the debug console all need a claimed
+     * interface (or would perturb a running stream), so reject them up front
+     * rather than silently producing a confusing libusb error. */
+    if (g_no_claim &&
+        strcmp(cmd, "test")       != 0 &&
+        strcmp(cmd, "stats")      != 0 &&
+        strcmp(cmd, "stats_pll")  != 0 &&
+        strcmp(cmd, "stack_check") != 0) {
+        fprintf(stderr, "error: --no-claim is only valid for read-only commands "
+                        "(test, stats, stats_pll, stack_check)\n");
+        return 2;
     }
 
     libusb_context *ctx = NULL;

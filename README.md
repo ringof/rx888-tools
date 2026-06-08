@@ -186,11 +186,18 @@ make fx3_cmd                                   # build (needs libusb-1.0-0-dev)
 ./fx3_cmd usbreset                             # host-side USB port reset
 ./fx3_cmd -F SDDC_FX3.img reload               # reset → re-upload → verify
 ./fx3_cmd debug                                # interactive console (! for local cmds)
+./fx3_cmd --no-claim stats                     # read-only; safe while a streamer runs
 ```
 
 `load`/`reload`/`-F` upload firmware via `rx888_stream`, found alongside the
 binary or on `PATH`. Run `./fx3_cmd` with no arguments for the full command
 list.
+
+`fx3_cmd` claims the USB interface exclusively, so its normal commands **cannot
+run while a streamer (`rx888_stream`, ka9q-radio, …) holds the device** — stop
+the streamer first. The exception is the read-only `--no-claim` mode (`test`,
+`stats`, `stats_pll`, `stack_check`), which peeks at EP0 without disturbing an
+active stream. See [`doc/fx3_cmd.md`](doc/fx3_cmd.md#running-alongside-a-streamer-exclusive-access).
 
 `fx3_cmd` shares the wire-protocol constants in `include/rx888.h` with
 `librx888` — there is no separate protocol header. The GPIO bit map in

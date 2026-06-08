@@ -44,6 +44,19 @@ done
 # No arguments prints usage and exits 2 (usage error).
 [[ "$(run_rc "$FX3")" -eq 2 ]] && ok "no-arg exits 2" || fail "no-arg expected rc=2"
 
+# --no-claim is only allowed for read-only EP0 commands; a write/recovery
+# command with --no-claim is rejected up front with rc=2 (no device needed).
+for c in gpio reset usbreset reload stats_shdn; do
+    if [[ "$(run_rc "$FX3" --no-claim "$c" 0)" -eq 2 ]]; then
+        ok "--no-claim '$c' rejected (rc=2)"
+    else
+        fail "--no-claim '$c' expected rc=2"
+    fi
+done
+# usage advertises the flag.
+grep -q -- "--no-claim" "$tmp_help" && ok "usage lists --no-claim" \
+    || fail "usage missing --no-claim"
+
 # Without hardware, a real command must fail cleanly (exit 1, device open
 # fails) — not segfault, not hang, not 0.  Skip if a device is attached.
 if [[ "${RX888_HW_PRESENT:-0}" != "1" ]]; then
@@ -55,6 +68,13 @@ if [[ "${RX888_HW_PRESENT:-0}" != "1" ]]; then
             fail "no-device '$c' expected rc=1, got rc=$rc"
         fi
     done
+    # A read-only command under --no-claim still fails cleanly with no device
+    # (open fails -> rc=1), exercising the allowlisted path.
+    if [[ "$(run_rc "$FX3" --no-claim test)" -eq 1 ]]; then
+        ok "no-device '--no-claim test' exits 1"
+    else
+        fail "no-device '--no-claim test' expected rc=1"
+    fi
 fi
 
 if [[ $failures -eq 0 ]]; then

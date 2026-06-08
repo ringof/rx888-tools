@@ -8,7 +8,7 @@ device. It is **not** part of the streaming data path; `rx888_stream` /
 `librx888` own that.
 
 ```
-fx3_cmd [-F firmware.img] <command> [args...]
+fx3_cmd [-F firmware.img] [--no-claim] <command> [args...]
 ```
 
 Unlike `rx888_stream`, `fx3_cmd` does **not** link `librx888`. It talks to
@@ -74,6 +74,51 @@ fx3_cmd usbreset                     # host-side USB port reset
 fx3_cmd -F SDDC_FX3.img reload       # reset -> re-upload -> verify
 fx3_cmd debug                        # interactive console
 ```
+
+---
+
+## Running alongside a streamer (exclusive access)
+
+By default `fx3_cmd` **claims USB interface 0** — the same exclusive claim a
+streamer (`rx888_stream` / `librx888`, or ka9q-radio's `rx888d`) needs for bulk
+transfers. The RX888 has a single bulk interface, so **the two cannot share it**:
+
+- If a streamer is already running, every normal `fx3_cmd` command fails to
+  claim the interface. It retries for ~2 s, then prints
+  `error: claim interface: Resource busy` and exits `1`.
+- Even if it could claim, `fx3_cmd` restarts the EP1-IN endpoint ring and
+  issues device-reconfiguring vendor commands — it is meant to have the device
+  to itself. Stop the streamer first.
+
+Two commands deliberately bypass the claim and therefore **work while a streamer
+is running — but they are destructive**:
+
+- `usbreset` — a raw `USBDEVFS_RESET` on the device node (no claim). It resets
+  the USB port, which reboots the FX3 and **kills the active stream** (and drops
+  the device to the bootloader, needing a re-flash).
+- `reload` — does the same reset, then re-uploads firmware.
+
+These exist to recover a *wedged* device, not to coexist with a healthy stream.
+
+### `--no-claim` — read-only peeking during a stream
+
+For the read-only, EP0-only commands — **`test`, `stats`, `stats_pll`,
+`stack_check`** — pass `--no-claim` to open the device *without* claiming
+interface 0 or touching the bulk endpoint. Vendor control transfers go to
+endpoint 0, which is not owned by any interface, so the firmware services them
+even while another process streams with interface 0 claimed:
+
+```sh
+# ka9q-radio (or rx888_stream) is streaming; peek at firmware counters:
+fx3_cmd --no-claim stats
+fx3_cmd --no-claim stats_pll
+fx3_cmd --no-claim test
+```
+
+`--no-claim` is rejected (exit `2`) for any command that writes, recovers, or
+uploads — those need the claim or would perturb the stream. Note the reads are a
+non-coherent snapshot taken while the device is busy; treat them as monitoring,
+not ground truth.
 
 ---
 
