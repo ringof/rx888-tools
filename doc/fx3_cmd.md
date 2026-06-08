@@ -178,5 +178,12 @@ error.)
 `make check` builds `fx3_cmd` and runs `tests/fx3_cmd_smoke.sh` — a
 no-hardware CLI smoke test (usage lists every command, `-h` exits 0, no-arg
 exits 2, and each command fails cleanly with exit 1 when no device is present).
-Hardware exercise of the actual vendor commands is out of scope for the
-in-repo tests; that lives in the `rx888-firmware` harness.
+
+`make hw-check` (with `RX888_HW_TEST=1` and a device attached) additionally
+runs `tests/hw_fx3_cmd.sh`, which exercises the real vendor commands and the
+`--no-claim` concurrency path: load + probe, idle `stats`/`stats_pll`, the
+exclusive-access guard (a normal command is refused while `rx888_stream`
+streams), and proof that `--no-claim` reads run alongside the stream
+(`GETSTATS` `dma_count` advances between two snapshots while `boot_count`
+stays put). Broader firmware regression/fuzz/soak coverage lives in the
+`rx888-firmware` harness.

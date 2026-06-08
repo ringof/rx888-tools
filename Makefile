@@ -198,6 +198,9 @@ hw-check: all $(RX888_FW_FILE)
 	  $(TESTS_DIR)/hw_stop_start.sh
 	RX888_STREAM=$(CURDIR)/rx888_stream RX888_FW=$(CURDIR)/$(RX888_FW_FILE) \
 	  $(TESTS_DIR)/hw_sample_check.py
+	RX888_STREAM=$(CURDIR)/rx888_stream RX888_FX3=$(CURDIR)/fx3_cmd \
+	  RX888_FW=$(CURDIR)/$(RX888_FW_FILE) \
+	  $(TESTS_DIR)/hw_fx3_cmd.sh
 
 .PHONY: check check-asan check-valgrind firmware firmware-latest hw-check
 

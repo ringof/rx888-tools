@@ -135,7 +135,8 @@ Configure GQRX to read from `/tmp/iq.fifo` (complex float32, 33.75 MHz).
 
 ```bash
 make check         # non-hardware: librx888 ABI + CLI smoke. Run on every PR.
-make hw-check      # hardware: throughput, stop/start cycles, sample sanity.
+make hw-check      # hardware: throughput, stop/start cycles, sample sanity,
+                   # and fx3_cmd diagnostics + --no-claim concurrency.
                    # Requires RX888 + RX888_HW_TEST=1.
 ```
 
