@@ -43,7 +43,7 @@ Built at the repo root next to `rx888_stream` (and installed into the same
 | `vga <0-255>` | `SETARGFX3`/`AD8370_VGA` | AD8370 VGA gain code |
 | `wdg_max <0-255>` | `SETARGFX3`/`WDG_MAX_RECOV` | Watchdog max recovery count (0 = unlimited) |
 | `start` / `stop` | `STARTFX3` / `STOPFX3` | Start / stop the GPIF streaming engine |
-| `i2cr <addr> <reg> <len>` | `I2CRFX3` | I2C read (hex) |
+| `i2cr <addr> <reg> <len>` | `I2CRFX3` | I2C read (hex). On failure, enables firmware debug and drains the I2C NAK reason (`ec=N`). |
 | `i2cw <addr> <reg> <byte>...` | `I2CWFX3` | I2C write (hex) |
 | `stats` | `GETSTATS` | Dump the firmware diagnostic counters |
 | `stats_pll` | `GETSTATS` | Verify the Si5351 PLL is locked |
