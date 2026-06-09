@@ -285,16 +285,22 @@ static unsigned long parse_num(const char *s)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-F firmware.img] [--no-claim] <command> [args...]\n"
+        "Usage: %s [-F firmware.img] [--no-claim | --force] <command> [args...]\n"
         "\n"
         "Options:\n"
         "  -F, --firmware <path>        Upload firmware first if device is in\n"
         "                               bootloader mode (PID 0x00F3)\n"
         "      --no-claim               Open without claiming interface 0 or\n"
-        "                               touching the bulk endpoint. Read-only EP0\n"
-        "                               commands only (test/stats/stats_pll/\n"
-        "                               stack_check). Safe to run while another\n"
-        "                               process (e.g. ka9q-radio) is streaming.\n"
+        "                               touching the bulk endpoint. Allows the\n"
+        "                               stream-safe EP0 commands (test, stats,\n"
+        "                               stats_pll, stack_check, att, vga, wdg_max)\n"
+        "                               to run while another process (e.g.\n"
+        "                               ka9q-radio) is streaming. (See firmware\n"
+        "                               contract rx888-firmware#170.)\n"
+        "      --force                  Implies --no-claim, and ALSO allows the\n"
+        "                               stream-UNSAFE commands and the full debug\n"
+        "                               console during a stream. These can glitch,\n"
+        "                               stop, or reset the device — use knowingly.\n"
         "\n"
         "Commands:\n"
         "  load <firmware.img>          Upload firmware and exit\n"
@@ -325,38 +331,49 @@ static void usage(const char *prog)
 }
 
 /* Command table: name + allowed count of positional arguments (tokens after
- * the command word; -F/--firmware and --no-claim are stripped first).
+ * the command word; -F/--firmware, --no-claim and --force are stripped first).
  * max_args < 0 means unbounded (i2cw takes a variable number of data bytes).
  * Used to validate the command line *before* opening the device, so a typo or
  * wrong arity is a usage error (exit 2) regardless of whether a device is
- * attached or a streamer holds the interface. */
+ * attached or a streamer holds the interface.
+ *
+ * `nc` is the command's behaviour under --no-claim while a stream may be
+ * running, per the firmware concurrency contract (ringof/rx888-firmware#170):
+ *   NC_SAFE  — stream-safe EP0 command; allowed under --no-claim.
+ *   NC_FORCE — stream-unsafe (stops/disrupts the GPIF/DMA stream); allowed
+ *              under --no-claim only with --force.
+ *   NC_NO    — not a stream-coexistence command (load/usbreset/reload have
+ *              their own non-claiming or recovery paths). */
+enum nc_class { NC_NO = 0, NC_SAFE = 1, NC_FORCE = 2 };
+
 struct cmd_spec {
     const char *name;
     int min_args;
     int max_args;   /* < 0 = unbounded */
+    int nc;         /* enum nc_class */
 };
 
 static const struct cmd_spec COMMANDS[] = {
-    {"load",        0,  1},
-    {"reload",      0,  1},
-    {"test",        0,  0},
-    {"gpio",        1,  1},
-    {"adc",         1,  1},
-    {"att",         1,  1},
-    {"vga",         1,  1},
-    {"wdg_max",     1,  1},
-    {"start",       0,  0},
-    {"stop",        0,  0},
-    {"i2cr",        3,  3},
-    {"i2cw",        3, -1},
-    {"reset",       0,  0},
-    {"usbreset",    0,  0},
-    {"debug",       0,  0},
-    {"raw",         1,  1},
-    {"stats",       0,  0},
-    {"stats_pll",   0,  0},
-    {"stats_shdn",  0,  0},
-    {"stack_check", 0,  0},
+    {"load",        0,  1, NC_NO},
+    {"reload",      0,  1, NC_NO},
+    {"test",        0,  0, NC_SAFE},
+    {"gpio",        1,  1, NC_FORCE},   /* GPIOFX3: clobbers stream pins */
+    {"adc",         1,  1, NC_FORCE},   /* STARTADC: resets GPIF/DMA */
+    {"att",         1,  1, NC_SAFE},    /* SETARGFX3: live gain tuning */
+    {"vga",         1,  1, NC_SAFE},    /* SETARGFX3: live gain tuning */
+    {"wdg_max",     1,  1, NC_SAFE},    /* SETARGFX3 */
+    {"start",       0,  0, NC_FORCE},   /* STARTFX3 */
+    {"stop",        0,  0, NC_FORCE},   /* STOPFX3 */
+    {"i2cr",        3,  3, NC_FORCE},   /* I2C: unclassified -> caution */
+    {"i2cw",        3, -1, NC_FORCE},
+    {"reset",       0,  0, NC_FORCE},   /* RESETFX3: reboots device */
+    {"usbreset",    0,  0, NC_NO},
+    {"debug",       0,  0, NC_FORCE},   /* console can issue unsafe commands */
+    {"raw",         1,  1, NC_FORCE},
+    {"stats",       0,  0, NC_SAFE},    /* GETSTATS */
+    {"stats_pll",   0,  0, NC_SAFE},    /* GETSTATS */
+    {"stats_shdn",  0,  0, NC_FORCE},   /* issues STARTADC/STARTFX3/STOPFX3 */
+    {"stack_check", 0,  0, NC_SAFE},    /* TESTFX3 + READINFODEBUG */
 };
 
 static const struct cmd_spec *command_lookup(const char *name)
@@ -369,16 +386,26 @@ static const struct cmd_spec *command_lookup(const char *name)
 
 int main(int argc, char **argv)
 {
-    /* ---- Parse --no-claim flag (strip from argv) ---- */
+    /* ---- Parse --no-claim / --force flags (strip from argv) ----
+     * --force implies --no-claim: you never open the interface to disrupt a
+     * stream — the disruption is via EP0 vendor commands either way — so there
+     * is no reason to require both.  --no-claim alone = stream-safe commands;
+     * --force = also the stream-unsafe ones (and the full debug console). */
+    int force = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-claim") == 0) {
+        if (strcmp(argv[i], "--force") == 0) {
+            force = 1;
             g_no_claim = 1;
-            int remaining = argc - i - 1;
-            memmove(&argv[i], &argv[i + 1], remaining * sizeof(char *));
-            argc -= 1;
-            argv[argc] = NULL;
-            i -= 1;
+        } else if (strcmp(argv[i], "--no-claim") == 0) {
+            g_no_claim = 1;
+        } else {
+            continue;
         }
+        int remaining = argc - i - 1;
+        memmove(&argv[i], &argv[i + 1], remaining * sizeof(char *));
+        argc -= 1;
+        argv[argc] = NULL;
+        i -= 1;
     }
 
     /* ---- Parse -F / --firmware option ---- */
@@ -436,18 +463,28 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* --no-claim is only meaningful for the read-only EP0 commands.  Writes,
-     * recovery, firmware upload, and the debug console all need a claimed
-     * interface (or would perturb a running stream), so reject them up front
-     * rather than silently producing a confusing libusb error. */
-    if (g_no_claim &&
-        strcmp(cmd, "test")       != 0 &&
-        strcmp(cmd, "stats")      != 0 &&
-        strcmp(cmd, "stats_pll")  != 0 &&
-        strcmp(cmd, "stack_check") != 0) {
-        fprintf(stderr, "error: --no-claim is only valid for read-only commands "
-                        "(test, stats, stats_pll, stack_check)\n");
-        return 2;
+    /* --no-claim (and --force, which implies it) opens the device without
+     * claiming interface 0, so EP0 vendor commands run alongside a stream (per
+     * the firmware concurrency contract, ringof/rx888-firmware#170).  Gate
+     * which commands are allowed using the per-command stream-safety class;
+     * --force opts in to the stream-unsafe ones (and the full debug console),
+     * accepting that they may stop/disrupt the stream. */
+    if (g_no_claim) {
+        if (spec->nc == NC_NO) {
+            fprintf(stderr, "error: '%s' does not run under --no-claim/--force; "
+                            "run it on its own\n", cmd);
+            return 2;
+        }
+        if (spec->nc == NC_FORCE && !force) {
+            fprintf(stderr,
+                "error: '%s' is not stream-safe (per rx888-firmware#170) and can\n"
+                "       disrupt or stop a running stream. Re-run with --force\n"
+                "       to do it anyway.\n", cmd);
+            return 2;
+        }
+        if (spec->nc == NC_FORCE && force)
+            fprintf(stderr, "warning: '%s' may disrupt or stop an active stream "
+                            "(--force)\n", cmd);
     }
 
     libusb_context *ctx = NULL;

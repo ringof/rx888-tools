@@ -52,11 +52,13 @@ for c in load reload test gpio adc att vga wdg_max start stop \
         fail "usage missing $c"
     fi
 done
-if grep -q -- "--no-claim" "$tmp_help"; then
-    ok "usage lists --no-claim"
-else
-    fail "usage missing --no-claim"
-fi
+for flag in --no-claim --force; do
+    if grep -q -- "$flag" "$tmp_help"; then
+        ok "usage lists $flag"
+    else
+        fail "usage missing $flag"
+    fi
+done
 
 # No arguments prints usage and exits 2 (usage error).
 check_rc 2 "no-arg" "$FX3"
@@ -69,13 +71,22 @@ check_rc 2 "missing arg (gpio)"  "$FX3" gpio
 check_rc 2 "too few args (i2cr)" "$FX3" i2cr 0xC0 0
 check_rc 2 "extra arg (test)"    "$FX3" test extra
 
-# --no-claim is only allowed for read-only EP0 commands; a valid-arity
-# write/recovery command with --no-claim is rejected by the allowlist with
-# rc=2 (no device needed).
-check_rc 2 "--no-claim gpio rejected" "$FX3" --no-claim gpio 0x20
-for c in reset usbreset reload stats_shdn; do
-    check_rc 2 "--no-claim $c rejected" "$FX3" --no-claim "$c"
-done
+# --no-claim allows only the stream-safe EP0 commands (per rx888-firmware#170).
+# A stream-UNSAFE command under --no-claim without --force is rejected (rc=2),
+# and so is a non-coexistence command (load/usbreset/reload) — all before any
+# device access. (Valid arity, so the stream-safety gate is what fires.)
+check_rc 2 "--no-claim gpio rejected (needs --force)"       "$FX3" --no-claim gpio 0x20
+check_rc 2 "--no-claim adc rejected (needs --force)"        "$FX3" --no-claim adc 32000000
+check_rc 2 "--no-claim start rejected (needs --force)"      "$FX3" --no-claim start
+check_rc 2 "--no-claim stop rejected (needs --force)"       "$FX3" --no-claim stop
+check_rc 2 "--no-claim debug rejected (needs --force)"      "$FX3" --no-claim debug
+check_rc 2 "--no-claim stats_shdn rejected (needs --force)" "$FX3" --no-claim stats_shdn
+check_rc 2 "--no-claim raw rejected (needs --force)"        "$FX3" --no-claim raw 0xAA
+check_rc 2 "--no-claim usbreset rejected (no-claim n/a)"    "$FX3" --no-claim usbreset
+check_rc 2 "--no-claim reload rejected (no-claim n/a)"      "$FX3" --no-claim reload
+check_rc 2 "--no-claim load rejected (no-claim n/a)"        "$FX3" --no-claim load
+# --force implies --no-claim, so it inherits the NC_NO rejection too.
+check_rc 2 "--force usbreset rejected (no-claim n/a)"       "$FX3" --force usbreset
 
 # Without hardware, a valid command with correct arity must fail cleanly at
 # device open (exit 1) — not segfault, not hang, not 0. (gpio needs an arg;
@@ -86,6 +97,15 @@ if [[ "${RX888_HW_PRESENT:-0}" != "1" ]]; then
     check_rc 1 "no-device gpio"            "$FX3" gpio 0x20
     check_rc 1 "no-device reset"           "$FX3" reset
     check_rc 1 "no-device --no-claim test" "$FX3" --no-claim test
+    # Stream-safe writes are now allowed under --no-claim: they pass the gate
+    # and fail at device open (rc=1), not at the gate (rc=2).
+    check_rc 1 "no-device --no-claim att"  "$FX3" --no-claim att 0
+    check_rc 1 "no-device --no-claim vga"  "$FX3" --no-claim vga 0
+    check_rc 1 "no-device --no-claim wdg_max" "$FX3" --no-claim wdg_max 0
+    # --force lets a stream-unsafe command past the gate (and implies --no-claim,
+    # so it works on its own); still fails at open with no device.
+    check_rc 1 "no-device --force gpio (implies --no-claim)" "$FX3" --force gpio 0x20
+    check_rc 1 "no-device --no-claim --force gpio"           "$FX3" --no-claim --force gpio 0x20
 fi
 
 if [[ $failures -eq 0 ]]; then

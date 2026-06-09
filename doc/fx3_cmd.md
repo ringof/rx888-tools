@@ -8,7 +8,7 @@ device. It is **not** part of the streaming data path; `rx888_stream` /
 `librx888` own that.
 
 ```
-fx3_cmd [-F firmware.img] [--no-claim] <command> [args...]
+fx3_cmd [-F firmware.img] [--no-claim | --force] <command> [args...]
 ```
 
 Unlike `rx888_stream`, `fx3_cmd` does **not** link `librx888`. It talks to
@@ -43,7 +43,7 @@ Built at the repo root next to `rx888_stream` (and installed into the same
 | `vga <0-255>` | `SETARGFX3`/`AD8370_VGA` | AD8370 VGA gain code |
 | `wdg_max <0-255>` | `SETARGFX3`/`WDG_MAX_RECOV` | Watchdog max recovery count (0 = unlimited) |
 | `start` / `stop` | `STARTFX3` / `STOPFX3` | Start / stop the GPIF streaming engine |
-| `i2cr <addr> <reg> <len>` | `I2CRFX3` | I2C read (hex) |
+| `i2cr <addr> <reg> <len>` | `I2CRFX3` | I2C read (hex). On failure, enables firmware debug and drains the I2C NAK reason (`ec=N`). |
 | `i2cw <addr> <reg> <byte>...` | `I2CWFX3` | I2C write (hex) |
 | `stats` | `GETSTATS` | Dump the firmware diagnostic counters |
 | `stats_pll` | `GETSTATS` | Verify the Si5351 PLL is locked |
@@ -100,25 +100,91 @@ is running — but they are destructive**:
 
 These exist to recover a *wedged* device, not to coexist with a healthy stream.
 
-### `--no-claim` — read-only peeking during a stream
+### Why this works — the Linux USB claiming model
 
-For the read-only, EP0-only commands — **`test`, `stats`, `stats_pll`,
-`stack_check`** — pass `--no-claim` to open the device *without* claiming
-interface 0 or touching the bulk endpoint. Vendor control transfers go to
-endpoint 0, which is not owned by any interface, so the firmware services them
-even while another process streams with interface 0 claimed:
+A common assumption is that opening a USB device is exclusive. On Linux it
+isn't. A device is a usbfs node (`/dev/bus/usb/BBB/DDD`) with three independent
+access layers, and **only the middle one is exclusive**:
+
+1. **Open** (`libusb_open`) — *not* exclusive. Multiple processes can hold the
+   same device open at once; opening claims nothing.
+2. **Claim an interface** (`libusb_claim_interface` → `USBDEVFS_CLAIMINTERFACE`)
+   — exclusive, one owner per interface. A second claim returns
+   `LIBUSB_ERROR_BUSY` (the `Resource busy` above).
+3. **Endpoint I/O** — bulk/interrupt/isochronous transfers require the claim on
+   the interface that owns the endpoint. Streaming is bulk-IN on EP1, hence the
+   claim.
+
+**Endpoint 0 sits outside all of this and cannot be claimed.** EP0 is the
+device's default *control* pipe, defined by the device descriptor — it is not
+listed in any interface descriptor, so there is no ioctl to take it. It is
+shared by every open handle, always. When the streamer claims interface 0 it
+gets interface 0's bulk endpoint exclusively; **EP0 was never — and cannot be —
+exclusively held by anyone.**
+
+The RX888's entire command set is vendor control transfers addressed to the
+*device* (recipient = device), which usbfs permits without consulting any
+interface claim. So `--no-claim` just opens the device (allowed), skips the
+claim, and pokes EP0 — concurrently with the streamer's bulk transfers on EP1,
+which it never touches. (Everyday proof that EP0 is shared: `lsusb -v` reads
+descriptors over EP0 from devices that already have drivers bound and interfaces
+claimed.)
+
+This is a property of *every* USB device, not just the RX888 — EP0 is mandatory
+and is how enumeration happens before any driver or claim exists. What is
+RX888-specific is only that its firmware (a) implements useful vendor commands
+on EP0 and (b) services them on a thread separate from the GPIF/DMA stream, so
+concurrent EP0 traffic doesn't disturb streaming — see the firmware concurrency
+contract, [`rx888-firmware#170`](https://github.com/ringof/rx888-firmware/issues/170).
+
+### `--no-claim` — using stream-safe commands during a stream
+
+`--no-claim` opens the device *without* claiming interface 0 or touching the
+bulk endpoint, so its EP0 vendor commands run while another process streams with
+interface 0 claimed (see *Why this works* above). Per the firmware contract,
+`--no-claim` allows the **stream-safe** EP0 commands:
+
+| Command(s) | Vendor request | Why it's safe |
+|---|---|---|
+| `test` | `TESTFX3` | read-only device info |
+| `stats`, `stats_pll` | `GETSTATS` | reads counters (non-coherent snapshot) |
+| `stack_check` | `TESTFX3` + `READINFODEBUG` | debug-log read, negligible interrupt |
+| `att`, `vga`, `wdg_max` | `SETARGFX3` | live gain/attenuator tuning; no stream impact |
 
 ```sh
-# ka9q-radio (or rx888_stream) is streaming; peek at firmware counters:
+# ka9q-radio (or rx888_stream) is streaming; peek and tune live:
 fx3_cmd --no-claim stats
 fx3_cmd --no-claim stats_pll
-fx3_cmd --no-claim test
+fx3_cmd --no-claim att 20        # adjust the attenuator without stopping the stream
 ```
 
-`--no-claim` is rejected (exit `2`) for any command that writes, recovers, or
-uploads — those need the claim or would perturb the stream. Note the reads are a
-non-coherent snapshot taken while the device is busy; treat them as monitoring,
-not ground truth.
+Reads are a non-coherent snapshot taken while the device is busy — treat them as
+monitoring, not ground truth.
+
+### `--force` — stream-unsafe commands and the full debug console
+
+The remaining commands are **stream-unsafe**: per the firmware contract,
+`GPIOFX3` (`gpio`), `STARTADC` (`adc`), `STARTFX3`/`STOPFX3` (`start`/`stop`,
+and `stats_shdn` which issues them), and `RESETFX3` (`reset`) stop or disrupt
+the GPIF/DMA stream. Under `--no-claim` they are rejected (exit `2`) unless you
+use **`--force`**, which **implies `--no-claim`** (you don't need both — you
+never claim the interface to disrupt a stream; the disruption is via EP0 vendor
+commands either way):
+
+```sh
+fx3_cmd --no-claim gpio 0x20      # error: not stream-safe; re-run with --force
+fx3_cmd --force gpio 0x20         # runs it; warns that it may disrupt the stream
+fx3_cmd --force debug             # full interactive console during a stream
+```
+
+`--force` enables the **full `debug` console** (including its `!stop` / `!reset`
+/ `!gpio` / `!adc` local commands) alongside a running stream. Everything still
+goes over EP0 — no interface claim — so the firmware will not crash; the
+consequence you are accepting is that these commands **glitch, stop, or reset
+the device** out from under the streamer.
+
+`load`, `usbreset`, and `reload` are not part of `--no-claim`/`--force` (they
+have their own non-claiming or recovery paths — run them on their own).
 
 ---
 
@@ -146,8 +212,8 @@ left alone.
 
 - `PASS <command> [details]` on success, exit `0`.
 - `FAIL <command> <reason>` on failure, exit `1`.
-- Usage error (unknown command, wrong argument count, or `--no-claim` on a
-  non-allowlisted command) exits `2`.
+- Usage error (unknown command, wrong argument count, or a stream-unsafe
+  command under `--no-claim` without `--force`) exits `2`.
 
 The command name and argument count are validated **before** the device is
 opened, so a typo or wrong arity is always a `2` — independent of whether a
@@ -193,10 +259,12 @@ runs `tests/hw_fx3_cmd.sh`, which exercises the real vendor commands and the
   `stats_shdn` graceful-degradation path on legacy 26-byte `GETSTATS` firmware.
 - **exclusive-access guard:** a normal command is refused (`Resource busy`,
   exit 1) while `rx888_stream` holds interface 0.
-- **`--no-claim` concurrency:** read-only commands succeed alongside the
-  stream, `GETSTATS` `dma_count` advances between two snapshots while
-  `boot_count` stays put, and `--no-claim stack_check` (the debug/EP0 channel)
-  does not stall the stream — early evidence for the observe-only-debug
+- **`--no-claim` concurrency:** stream-safe commands succeed alongside the
+  stream — including live `att`/`vga` tuning — with `GETSTATS` `dma_count`
+  advancing between snapshots while `boot_count` stays put; a stream-unsafe
+  command (`gpio`) is refused without `--force`; and `--no-claim stack_check`
+  (the debug/EP0 channel) does not stall the stream — early evidence for the
+  observe-only-debug
   question in issue #27.
 
 It is non-destructive (leaves the device loaded and idle); `usbreset`/`reload`
