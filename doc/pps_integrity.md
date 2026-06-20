@@ -288,6 +288,13 @@ loss-accounting design exists for.
 If a rate near the ceiling must be used, `-q`/`-p` increase in-flight
 buffering, which can absorb transient drain stalls; whether it actually
 moves the ceiling is hardware-dependent and worth measuring per host.
+`tests/pps_knob_sweep.sh` automates that measurement — it runs controls
+at a low rate, sweeps `-q` at the high rate, picks the depth with the
+least produced-vs-delivered loss, sweeps `-p` at that depth, and prints a
+summary table (loss MB, result, spurious, displaced per cell). It is a
+hardware test (needs a device); see the script header for env overrides
+(`RX888_FW`, `HIRATE`, `DUR_SWEEP`, `QSWEEP`, `PSWEEP`, …). Re-run the
+best cell for 1–3 h to confirm before trusting it.
 
 ### Main thread — 1 Hz toggle loop
 
