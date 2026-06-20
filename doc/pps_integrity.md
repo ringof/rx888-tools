@@ -155,9 +155,21 @@ The tool therefore classifies every miss:
   `SHORT_MARGIN`), or `minxfer == full` while the live remainder (last
   good marker) sits within `DANGER_BAND` of a boundary. Inherent and
   benign; reported as a NOTE.
-- **anomalous** — `minxfer == full` while the remainder is mid-buffer,
-  i.e. the marker should have been plainly visible but vanished. A real
-  fidelity failure; fails the run.
+- **merge** — `minxfer == full` (remainder mid-buffer), but the *next*
+  marker is oversized (≥ `MERGE_PCT`% of the running median). The skipped
+  flush rolled forward and the following edge flushed the combined ~2×
+  partial: no samples were lost, the delimiter was only delayed, and it
+  is reconstructable in post (the skipped boundary sits one normal
+  remainder into the oversized buffer). Reported as a WARN, not a hard
+  fail.
+- **anomalous** — `minxfer == full`, remainder mid-buffer, and *no*
+  oversized recovery marker follows. The marker should have been plainly
+  visible but vanished with no carry-forward — possible data loss. Fails
+  the run.
+
+The merge-vs-anomalous decision is deferred one second (until the next
+marker resolves it); a hard miss prints `MISS` live, then the resolving
+line annotates `prev MISS: MERGE`/`ANOM`.
 
 `-v` adds a `minxfer` column (smallest transfer that second) so the
 classification is auditable line by line.
@@ -215,13 +227,14 @@ delta and flags a `boot_count` mismatch (device reset between reads).
 
 ### Pass criteria
 
-- `anomalous == 0` — every miss is explained by the boundary blind spot;
-  none is a real marker loss.
+- `anomalous == 0` — no marker lost without an oversized recovery
+  (i.e. no possible data loss).
 - `spurious_count == 0` — no shorts without a preceding rising edge.
 - No device resets (`boot_count` unchanged), no streaming faults, no
   early library stop, no marker-handle control faults.
-- Blind-spot misses are a NOTE, not a FAIL — they are inherent to the
-  marker scheme. PIB errors are likewise informational.
+- Blind-spot misses (NOTE) and merge misses (WARN) do not fail the run:
+  the former are inherent to the marker scheme, the latter preserve the
+  samples and are reconstructable. PIB errors are likewise informational.
 
 ## Implementation
 

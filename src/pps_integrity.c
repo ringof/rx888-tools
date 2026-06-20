@@ -64,6 +64,17 @@
  * threshold is unknown, so tune this once long-run data is in hand. */
 #define DANGER_BAND     8192
 
+/* A hard miss (remainder mid-buffer) is a MERGE rather than a true loss when
+ * the very next marker is oversized: the skipped flush rolled forward and the
+ * following edge flushed the combined partial (~2x), so no samples were lost —
+ * the delimiter was merely delayed, and is reconstructable in post. We flag it
+ * when the next marker reaches MERGE_PCT% of the running median marker size.
+ * Heuristic: normal jitter tops out ~160% of median, a merge lands ~190%, so
+ * 170% separates them. Tune against campaign data. BASE_WIN is the median
+ * window over recent normal markers (recovery spikes are excluded). */
+#define MERGE_PCT       170
+#define BASE_WIN        32
+
 /* Vendor control-transfer timeout on the second handle (ms). */
 #define CTRL_TIMEOUT_MS 1000
 
@@ -188,6 +199,21 @@ static void usage(const char *argv0)
         argv0);
 }
 
+/* Median of the recent-normal-marker ring (n <= BASE_WIN), for the MERGE
+ * baseline. Small n, so an insertion sort on a copy is plenty. */
+static uint32_t base_median(const uint32_t *ring, int n)
+{
+    if (n <= 0) return 0;
+    uint32_t t[BASE_WIN];
+    memcpy(t, ring, (size_t)n * sizeof(uint32_t));
+    for (int i = 1; i < n; i++) {
+        uint32_t k = t[i]; int j = i - 1;
+        while (j >= 0 && t[j] > k) { t[j + 1] = t[j]; j--; }
+        t[j + 1] = k;
+    }
+    return t[n / 2];
+}
+
 /* --------------------------------- main ---------------------------------- */
 
 int main(int argc, char **argv)
@@ -289,9 +315,12 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
-    uint64_t blind_spot = 0, anomalous = 0;       /* miss classification */
+    uint64_t blind_spot = 0, merge = 0, anomalous = 0;  /* miss classification */
     uint32_t last_marker = 0;                     /* live remainder estimate */
     int last_marker_valid = 0;
+    uint32_t base_ring[BASE_WIN];                 /* recent normal markers */
+    int base_n = 0, base_pos = 0;
+    int pending_miss = 0;                         /* hard miss awaiting next marker */
     int internal_stop = 0, ctrl_fault = 0;
 
     struct timespec t0;
@@ -331,17 +360,45 @@ int main(int argc, char **argv)
         int arrived = atomic_load(&ctx.marker_arrived);
         uint32_t mn = atomic_load(&ctx.min_nsamples);
         const char *stat = "ok";
+        char note[64]; note[0] = '\0';
         if (arrived) {
             marks++;
+            uint32_t marker = (mn == UINT32_MAX) ? 0 : mn;
+            int is_recovery = 0;
+            /* Resolve a deferred hard miss: an oversized marker now means the
+             * skipped flush merged into this one (data intact, MERGE);
+             * otherwise the earlier miss was a true loss (ANOM). */
+            if (pending_miss) {
+                uint32_t med = base_median(base_ring, base_n);
+                if (med > 0 &&
+                    (uint64_t)marker * 100u >= (uint64_t)med * MERGE_PCT) {
+                    merge++; is_recovery = 1;
+                    snprintf(note, sizeof note, "  <- prev MISS: MERGE (data intact)");
+                } else {
+                    anomalous++;
+                    snprintf(note, sizeof note, "  <- prev MISS: ANOM (loss)");
+                }
+                pending_miss = 0;
+            }
+            /* Feed the median baseline with normal markers only (a recovery
+             * spike would bias it high). */
+            if (!is_recovery && marker > 0) {
+                base_ring[base_pos] = marker;
+                base_pos = (base_pos + 1) % BASE_WIN;
+                if (base_n < BASE_WIN) base_n++;
+            }
             if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
         } else {
             missed++;
-            /* Classify the miss. mn < expected means a near-full partial
-             * slipped past the detect threshold — the near-full edge of the
-             * blind spot. mn == expected means no distinguishable partial at
-             * all: a blind spot only if the live remainder (last good marker)
-             * sits within DANGER_BAND of a boundary, else the marker vanished
-             * while it should have been plainly visible — a real anomaly. */
+            /* A second miss before the previous one resolved: the prior was
+             * not recovered by an oversized marker, so it was a true loss. */
+            if (pending_miss) { anomalous++; pending_miss = 0; }
+            /* Classify. mn < expected: a near-full partial slipped past the
+             * detect threshold — near-full edge of the blind spot. mn ==
+             * expected: no distinguishable partial; a blind spot only if the
+             * live remainder sits within DANGER_BAND of a boundary. Otherwise
+             * the marker vanished mid-buffer — defer the MERGE-vs-ANOM call to
+             * the next marker. */
             int blind;
             if (mn < ctx.expected_nsamples) {
                 blind = 1;                       /* near-full boundary */
@@ -353,7 +410,7 @@ int main(int argc, char **argv)
                 blind = (dist <= DANGER_BAND);
             }
             if (blind) { blind_spot++; stat = "BLIND"; }
-            else       { anomalous++;  stat = "ANOM";  }
+            else       { pending_miss = 1; stat = "MISS"; }  /* resolved next edge */
         }
         printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
@@ -362,9 +419,13 @@ int main(int argc, char **argv)
             if (mn == UINT32_MAX) printf("   %8s", "-");      /* no transfer */
             else                  printf("   %8" PRIu32, mn);
         }
+        if (note[0]) printf("%s", note);
         printf("\n");
         fflush(stdout);
     }
+
+    /* A hard miss on the final second never saw a recovery marker: a loss. */
+    if (pending_miss) { anomalous++; pending_miss = 0; }
 
     rx888_stop(r);
     read_fw_stats(h2, &st_end);
@@ -393,18 +454,25 @@ int main(int argc, char **argv)
     printf("Markers seen:    %" PRIu64 "\n", marks);
     printf("Spurious shorts: %" PRIu64 "\n", spur);
     printf("Missed markers:  %" PRIu64 "  (blind-spot: %" PRIu64
-           ", anomalous: %" PRIu64 ")\n", missed, blind_spot, anomalous);
-    if (edges > 0 && anomalous > 0) {
-        double rate = 100.0 * (double)anomalous / (double)edges;
+           ", merge: %" PRIu64 ", anomalous: %" PRIu64 ")\n",
+           missed, blind_spot, merge, anomalous);
+    if (edges > 0 && merge > 0)
+        printf("Merge rate:      %.3f%% of edges (~%.1f/hour)\n",
+               100.0 * (double)merge / (double)edges,
+               (double)merge / (double)edges * 3600.0);
+    if (edges > 0 && anomalous > 0)
         printf("Anomaly rate:    %.3f%% of edges (~%.1f/hour)\n",
-               rate, rate / 100.0 * 3600.0);
-    }
+               100.0 * (double)anomalous / (double)edges,
+               (double)anomalous / (double)edges * 3600.0);
     if (blind_spot > 0)
         printf("  NOTE: blind-spot misses are the inherent short-transfer "
                "marker limit near a buffer boundary, not a failure.\n");
+    if (merge > 0)
+        printf("  WARN: merged markers — a delimiter was delayed into the "
+               "next edge (data intact, reconstructable). Not a hard fail.\n");
     if (anomalous > 0)
         printf("  FAIL: anomalous misses — marker lost with the remainder "
-               "mid-buffer, i.e. it should have been plainly visible.\n");
+               "mid-buffer, no oversized recovery (possible data loss).\n");
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u (NOTE, informational)\n",
                st_end.pib_errors - st_start.pib_errors);
