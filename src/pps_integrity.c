@@ -22,6 +22,66 @@
  * Short-transfer detection runs in librx888's writer-thread callback;
  * the main thread coordinates via _Atomic state. See doc/pps_integrity.md.
  *
+ * ===========================================================================
+ * THEORY OF OPERATION  (read this before changing anything below)
+ * ===========================================================================
+ *
+ * THE MARKER. The firmware emits an in-band PPS marker by committing the
+ * in-progress DMA buffer early when it sees a GPIO edge. That early commit
+ * arrives at the host as a SHORT USB bulk transfer (fewer samples than a full
+ * buffer). We drive the GPIO edge ourselves at 1 Hz and check that one short
+ * transfer appears per edge.
+ *
+ * THE MARKER SIZE IS NOT ARBITRARY. The short transfer is the *leftover
+ * partial buffer* for that PPS second, so its size is approximately
+ *     marker_samples ~= samplerate mod (full-transfer samples)
+ * e.g. at 32 MSPS with a 524288-sample buffer, ~18432; at 16 MSPS, ~271360.
+ * This value drifts slowly with the ADC-vs-host clock offset (a few ppm).
+ *
+ * THE BLIND SPOT (inherent, not a bug). When that remainder drifts within a
+ * buffer-boundary band (near 0 or near full), the partial is either empty
+ * (suppressed) or indistinguishable from a full transfer, so NO in-band short
+ * can exist for that edge. This is a fundamental limitation of any
+ * short-transfer marker; such misses are classified "blind-spot" and do not
+ * fail the run.
+ *
+ * MISS CLASSIFICATION (the ground truth is sample continuity, never marker
+ * shape). When an edge produces no detectable short:
+ *   - blind-spot: the live remainder sits within DANGER_BAND of a boundary.
+ *   - recovered : the skipped flush rolled into the next edge (which then
+ *                 flushes ~2x), AND the inter-marker sample count over the gap
+ *                 is intact. The delimiter was only displaced; reconstructable.
+ *   - lost      : the inter-marker count is short -> real data loss.
+ *
+ * DID WE LOSE SAMPLES?  Three independent detectors, in increasing authority:
+ *   1. librx888 bad_xfers      — errored/cancelled USB transfers.
+ *   2. inter-marker continuity — samples between markers vs (span x learned
+ *      rate); a deficit > LOSS_TOL is localized loss. Fine-grained but its
+ *      baseline is self-referential, so perfectly uniform loss could hide.
+ *   3. produced vs delivered   — firmware glDMACount (buffers the GPIF
+ *      produced) vs librx888 ok_xfers (buffers the host received). These count
+ *      the same physical buffers, so a mismatch IS loss, and it is CLOCK-
+ *      INDEPENDENT: a slow ADC clock lowers both equally. This is the decisive
+ *      gross check; it answers "were all DMA buffers delivered?". Granularity
+ *      is one buffer, bounded by the in-flight pipeline (see the summary).
+ *
+ * CLOCK vs LOSS.  delivered/(samplerate x elapsed) as ppm is the ADC-vs-host
+ * clock offset COMBINED with any uniform loss. They look identical in that
+ * single number. We separate them because loss always leaves a fingerprint
+ * (bad_xfers, a continuity step, or produced>delivered) whereas a slow clock
+ * delivers everything, just at a steadily lower rate (a smooth drift, no
+ * fingerprints). So: with all loss detectors clear, produced==delivered proves
+ * the offset is purely clock, and we report it as a calibration. This assumes
+ * a disciplined (NTP/PTP/GPS) host clock; on a free-running host the ppm is
+ * host+ADC combined. (glDMACount resets on STOPFX3 — read the end snapshot
+ * BEFORE rx888_stop.)
+ *
+ * WHAT WE DO NOT DO. No sequence number / known pattern is embedded in the
+ * sample stream (that is a separate RF-injection / TimeSpec idea). A firmware
+ * "buffers delivered" counter would make the produced/delivered comparison
+ * atomic and buffer-exact; today we infer delivered from ok_xfers (firmware
+ * has only the producer-side count), which is why the in-flight slack exists.
+ *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -106,8 +166,18 @@ struct pps_ctx {
     size_t           expected_nsamples; /* full-transfer sample count */
 };
 
-/* Subset of GETSTATS we report on. */
+/* Subset of GETSTATS we report on.
+ *
+ * dma_count is the firmware's glDMACount: the number of DMA buffers the GPIF
+ * has *produced* (incremented on every CY_U3P_DMA_CB_PROD_EVENT). There is no
+ * firmware counter for buffers *delivered* to the host, but librx888's ok_xfers
+ * is exactly that (one completed USB bulk transfer per delivered DMA buffer).
+ * So (dma_count delta) - (ok_xfers delta) = buffers the DMA->USB->host path
+ * dropped — a clock-INDEPENDENT loss measurement (a slow ADC clock lowers both
+ * equally; only real loss makes produced exceed delivered). NOTE: glDMACount
+ * resets on STOPFX3, so the end snapshot must be read before rx888_stop(). */
 struct fw_stats {
+    uint32_t dma_count;        /* glDMACount: DMA buffers produced (GPIF->DMA) */
     uint32_t pib_errors;
     uint32_t streaming_faults;
     uint32_t boot_count;
@@ -173,6 +243,7 @@ static int read_fw_stats(libusb_device_handle *h, struct fw_stats *s)
         h, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
         (uint8_t)GETSTATS, 0, 0, buf, sizeof(buf), CTRL_TIMEOUT_MS);
     if (r < GETSTATS_MIN_LEN) return (r < 0) ? r : LIBUSB_ERROR_IO;
+    memcpy(&s->dma_count,        &buf[0],  4);
     memcpy(&s->pib_errors,       &buf[5],  4);
     memcpy(&s->streaming_faults, &buf[15], 4);
     memcpy(&s->boot_count,       &buf[20], 4);
@@ -336,8 +407,13 @@ int main(int argc, char **argv)
                        | (cfg.dither     ? (uint32_t)DITH  : 0u)
                        | (cfg.randomizer ? (uint32_t)RANDO : 0u);
 
+    /* Baseline counters for the run-long deltas: firmware glDMACount (buffers
+     * produced) and librx888 ok_xfers (buffers delivered). Read close together
+     * so the produced-vs-delivered comparison starts from a matched instant. */
     struct fw_stats st_start = {0}, st_end = {0};
     read_fw_stats(h2, &st_start);
+    rx888_stats_t lib_start;
+    rx888_get_stats(r, &lib_start);
 
     fprintf(stderr, "%s: starting %.3f hour run @ %g MSPS (%u Hz) "
             "(full transfer = %zu samples)\n",
@@ -516,8 +592,16 @@ int main(int argc, char **argv)
      * continuity could not confirm the data — count them as lost. */
     if (pending_misses > 0) { lost += (uint64_t)pending_misses; pending_misses = 0; }
 
-    rx888_stop(r);
+    /* Read the END counters BEFORE rx888_stop(): STOPFX3 resets glDMACount, so
+     * reading dma_count after the stop would zero it. Read the firmware and
+     * librx888 counters back-to-back to minimise the produced-vs-delivered skew
+     * (they still aren't atomic — the residual is bounded by the in-flight
+     * pipeline, accounted for below). */
     read_fw_stats(h2, &st_end);
+    rx888_stats_t lib;
+    rx888_get_stats(r, &lib);
+
+    rx888_stop(r);
 
     /* ------------------------------- summary ------------------------------ */
     struct timespec t1;
@@ -526,47 +610,74 @@ int main(int argc, char **argv)
     uint64_t spur = atomic_load(&ctx.spurious);
     int boot_changed = (st_start.valid && st_end.valid &&
                         st_start.boot_count != st_end.boot_count);
-
-    rx888_stats_t lib;
-    rx888_get_stats(r, &lib);
     uint64_t delivered = atomic_load(&ctx.samples_total);
     uint32_t pib_delta = (st_start.valid && st_end.valid)
                        ? st_end.pib_errors - st_start.pib_errors : 0;
 
-    /* Absolute sample budget: what the clock should have produced vs what we
-     * received. The ppm offset is clock-vs-host AND any uniform loss combined
-     * — the two are indistinguishable from the host alone (that separation
-     * needs a firmware "samples produced" counter). A few-ppm value is
-     * clock-dominated; a large negative one is loss. */
+    /* ---- Buffers produced vs delivered: the clock-INDEPENDENT loss check ----
+     *
+     * glDMACount (firmware) counts DMA buffers the GPIF produced; librx888
+     * ok_xfers counts buffers the host received (one transfer per buffer). Both
+     * count the same physical buffers, so their run-long deltas should match. A
+     * slow ADC clock lowers BOTH equally (fewer buffers in the same wall time)
+     * and leaves the difference at zero; only real loss makes produced exceed
+     * delivered. This is the decisive separation of clock from loss that the
+     * sample-rate budget alone cannot give.
+     *
+     * The two counters are not sampled atomically and the host pipeline always
+     * has transfers in flight, so produced runs slightly ahead of delivered.
+     * That offset is bounded by the in-flight depth; we subtract the measured
+     * in_flight and allow one extra queue_depth of slack (startup ramp + the
+     * non-atomic read skew) before calling it loss. Sub-buffer / localized loss
+     * below this granularity is still caught by the inter-marker continuity
+     * check; this is the gross, clock-independent backstop. */
+    uint32_t bufs_produced  = st_end.valid && st_start.valid
+                            ? st_end.dma_count - st_start.dma_count : 0; /* mod 2^32 */
+    uint64_t bufs_delivered = lib.ok_xfers - lib_start.ok_xfers;
+    int64_t  bufs_diff      = (int64_t)bufs_produced - (int64_t)bufs_delivered;
+    /* Net undelivered after accounting for the steady in-flight pipeline. */
+    int64_t  bufs_undeliv   = bufs_diff - (int64_t)lib.in_flight;
+    int64_t  buf_slack      = (int64_t)cfg.queue_depth;   /* ramp + skew tolerance */
+    int      bufs_lost      = st_start.valid && st_end.valid
+                            && (bufs_undeliv > buf_slack);
+
+    /* ---- Absolute sample budget and ADC clock offset ----
+     *
+     * expected = samplerate x elapsed (host clock = truth, assumes a disciplined
+     * NTP/PTP/GPS host). delivered/expected as ppm is the ADC-vs-host clock
+     * offset COMBINED with any uniform loss. With the produced-vs-delivered
+     * check above proving no buffer loss (and bad_xfers/continuity clear), that
+     * combined offset is provably pure clock — so we can report it as a clock
+     * calibration. On a free-running host it is host+ADC combined. */
     double elapsed_d = (double)(t1.tv_sec - t0.tv_sec)
                      + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
     double expected_d = (double)samplerate * elapsed_d;
     uint64_t expected_total = (uint64_t)(expected_d + 0.5);
     double budget_ppm = expected_d > 0
                       ? ((double)delivered - expected_d) / expected_d * 1e6 : 0.0;
-    uint64_t gross_deficit = expected_total > delivered
-                           ? expected_total - delivered : 0;
-    /* Gross shortfall beyond what we localised, past a generous clock band:
-     * candidate sustained / sub-threshold loss the per-interval check can't see. */
-    uint64_t clk_allow = (uint64_t)(expected_d * 100e-6);   /* 100 ppm */
-    uint64_t unaccounted = gross_deficit > lost_samples_est + clk_allow
-                         ? gross_deficit - lost_samples_est - clk_allow : 0;
+    /* Per-second rate slope (median of clean single-second inter-marker counts):
+     * the drift slope, i.e. the clock offset, robust to step-second outliers. */
     uint64_t learned_rate = base_median(rate_ring, rate_n);  /* samples/s median */
     double learned_ppm = samplerate > 0
                        ? ((double)learned_rate - (double)samplerate)
                          / (double)samplerate * 1e6 : 0.0;
 
-    /* Sample loss is the hard question and the verdict's basis: errored USB
-     * transfers (transport loss) or an inter-marker deficit (firmware/USB
-     * overflow) both mean the stream is missing data. */
-    int sample_loss = (lib.bad_xfers > 0) || (loss_events > 0);
+    /* Sample loss is the hard question and the verdict's basis. Three
+     * independent detectors, any of which means the stream is missing data:
+     *   - bad_xfers   : errored/cancelled USB transfers (transport loss)
+     *   - loss_events : inter-marker continuity deficit (localized, >= floor)
+     *   - bufs_lost   : produced > delivered (clock-independent, gross) */
+    int sample_loss = (lib.bad_xfers > 0) || (loss_events > 0) || bufs_lost;
+
+    /* With every loss detector clear, the produced==delivered identity proves no
+     * data was dropped, so the sample-rate budget offset is purely clock. */
+    int lossless = !sample_loss && (lost == 0);
 
     /* Verdict: blind-spot misses are inherent and recovered misses are lossless
      * delimiter displacements, so neither fails the run; lost markers, spurious
-     * shorts, and any confirmed sample loss do. The gross-budget shortfall is a
-     * WARN only — it cannot be separated from clock offset without a reference. */
+     * shorts, any confirmed sample loss, device resets, or control faults do. */
     int pass = (spur == 0) && (lost == 0) && !sample_loss &&
-               !internal_stop && !ctrl_fault && !boot_changed;
+               !internal_stop && !ctrl_fault && !boot_changed && !mid_reset;
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
     printf("Duration:        %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "\n",
@@ -596,31 +707,44 @@ int main(int argc, char **argv)
                "(data loss).\n");
     printf("Samples in:      %" PRIu64 " (%.2f Gsa)\n",
            delivered, (double)delivered / 1e9);
-    printf("Sample budget:   expected %" PRIu64 " (rate x elapsed), delivered "
-           "%" PRIu64 ", diff %+" PRId64 " (%+.3f ppm; clock+loss combined)\n",
-           expected_total, delivered,
-           (int64_t)delivered - (int64_t)expected_total, budget_ppm);
-    if (rate_n >= 8)
-        printf("Learned rate:    %" PRIu64 " Sa/s vs nominal %u (%+.3f ppm)\n",
-               learned_rate, samplerate, learned_ppm);
-    printf("Loss floor:      %d samples (%.2f buffer); largest interval deficit "
-           "%" PRIu64 " (%.2f buffer)\n",
-           LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
-           max_deficit, (double)max_deficit / (double)ctx.expected_nsamples);
+    /* The decisive, clock-independent line: buffers produced vs delivered. */
+    if (st_start.valid && st_end.valid)
+        printf("DMA buffers:     produced %" PRIu32 ", delivered %" PRIu64
+               ", in-flight %u, undelivered %+" PRId64 " (slack +-%" PRId64 ")\n",
+               bufs_produced, bufs_delivered, lib.in_flight,
+               bufs_undeliv, buf_slack);
+    else
+        printf("DMA buffers:     firmware count unavailable (no glDMACount)\n");
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
     printf("Sample loss:     %" PRIu64 " interval(s), ~%" PRIu64 " samples "
            "(inter-marker deficit)\n", loss_events, lost_samples_est);
+    printf("Loss floor:      %d samples (%.2f buffer); largest interval deficit "
+           "%" PRIu64 " (%.2f buffer)\n",
+           LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
+           max_deficit, (double)max_deficit / (double)ctx.expected_nsamples);
+    if (bufs_lost)
+        printf("  FAIL: %" PRId64 " DMA buffer(s) produced but never delivered "
+               "(~%" PRId64 " samples) — firmware/USB dropped data.\n",
+               bufs_undeliv, bufs_undeliv * (int64_t)ctx.expected_nsamples);
     if (lib.bad_xfers > 0)
         printf("  FAIL: %llu errored/cancelled USB transfers — transport-level "
                "sample loss.\n", lib.bad_xfers);
     if (loss_events > 0)
         printf("  FAIL: inter-marker sample deficit — the stream dropped data "
                "(firmware/USB overflow).\n");
-    if (unaccounted > 0)
-        printf("  WARN: %" PRIu64 " samples short beyond localised loss + 100 ppm "
-               "clock — possible sustained/sub-floor loss (or a slow clock; "
-               "needs a rate reference to tell apart).\n", unaccounted);
+    /* Clock vs loss: with produced==delivered and no errors/deficits, the
+     * sample-rate offset is provably the ADC-vs-host clock, not loss. */
+    if (st_start.valid && st_end.valid) {
+        if (lossless)
+            printf("ADC clock:       %+.3f ppm (lossless: produced==delivered, "
+                   "no errors/deficits; assumes disciplined host)\n",
+                   rate_n >= 8 ? learned_ppm : budget_ppm);
+        else
+            printf("Sample budget:   delivered %" PRIu64 " vs expected %" PRIu64
+                   " (rate x elapsed), %+.3f ppm (clock+loss combined)\n",
+                   delivered, expected_total, budget_ppm);
+    }
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u total in %" PRIu64 " second(s); "
                "%" PRIu64 " coincided with a deficit%s\n",

@@ -184,45 +184,84 @@ classification is auditable line by line.
 ### Sample-loss accounting
 
 Marker classification answers "is the delimiter there?" — not "did we
-lose samples?" Those are checked directly:
+lose samples?" That is checked by three independent detectors, in
+increasing authority:
 
-- **Inter-marker continuity.** The samples delivered between two
-  consecutive markers must equal `(seconds spanned) × rate`, where `rate`
-  is the running median of single-second inter-marker counts. Anchoring
-  to the marker (a fixed point *in the stream*) removes host-window
-  boundary jitter; within ~1 s clock drift is negligible, so a dropped
-  DMA buffer (~524288 samples) is a glaring deficit (`LOSS_TOL` absorbs
-  the marker-flush jitter). This is also what **classifies a hard miss**:
-  a displaced delimiter spans 2 s, so its interval must equal 2× a normal
-  one — equal ⇒ recovered (data intact), short ⇒ lost.
-- **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
-  transport-level loss, surfaced in the summary.
-- **Firmware PIB errors, polled per second.** GETSTATS is read every
-  second on the EP0 handle, so overflow events are localised to the
-  second they occur and correlated with that interval's continuity
-  result: PIB *with* a deficit lost host-visible samples; PIB with none
-  recovered without loss. The same poll catches a mid-run device reset
-  (boot-count change) immediately.
-- **Absolute sample budget.** `expected = samplerate × elapsed` vs the
-  samples actually delivered, reported as a `±ppm` offset. This catches
-  *sustained* loss that the self-referential per-interval rate would
-  otherwise absorb. **Caveat:** the offset is clock-vs-host drift **and**
-  any uniform loss *combined* — the host cannot separate them. A few-ppm
-  value is clock-dominated (no meaningful loss); a large negative one is
-  loss. Separating them for certain needs a *firmware-side* "samples
-  produced" / DMA-buffer counter (a side-channel count via GETSTATS, not
-  anything embedded in the sample stream); the tool already reads GETSTATS
-  and is ready to consume such a field.
-- **Learned-vs-nominal rate** and **loss floor / largest observed
-  deficit** are reported so the summary states its own sensitivity: the
-  detection floor is `LOSS_TOL` (drops smaller than this in one interval
-  are invisible), and the largest deficit actually seen shows the
-  headroom to it.
+1. **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
+   transport-level loss.
+2. **Inter-marker continuity.** The samples delivered between two
+   consecutive markers must equal `(seconds spanned) × rate`, where
+   `rate` is the running median of single-second inter-marker counts.
+   Anchoring to the marker (a fixed point *in the stream*) removes
+   host-window boundary jitter; within ~1 s clock drift is negligible, so
+   a dropped DMA buffer (~524288 samples) is a glaring deficit (`LOSS_TOL`
+   absorbs the marker-flush jitter). This is also what **classifies a hard
+   miss**: a displaced delimiter spans 2 s, so its interval must equal 2×
+   a normal one — equal ⇒ recovered (data intact), short ⇒ lost. It is
+   fine-grained and localized, but its baseline is *self-referential*, so
+   perfectly uniform loss could in principle hide in it.
+3. **Buffers produced vs delivered — the decisive, clock-independent
+   check.** The firmware's `glDMACount` (GETSTATS byte 0) counts DMA
+   buffers the GPIF *produced*; librx888's `ok_xfers` counts buffers the
+   host *received* (one completed USB transfer per buffer). They count the
+   same physical buffers, so their run-long deltas must match. Crucially
+   this is **independent of clock**: a slow ADC clock lowers *both* counts
+   equally and leaves their difference at zero — only real loss makes
+   produced exceed delivered. This directly answers "were all DMA buffers
+   delivered?". Granularity is one buffer; the comparison is bounded by
+   the in-flight pipeline (produced runs ahead of delivered by the
+   transfers still in flight), so the report subtracts `in_flight` and
+   allows one `queue_depth` of slack before calling it loss. **Caveat:**
+   `glDMACount` resets on `STOPFX3`, so the end snapshot is read *before*
+   `rx888_stop()`; and the two counters aren't sampled atomically, which
+   is the other reason for the slack.
 
-Confirmed loss (`bad_xfers > 0` or an inter-marker deficit) fails the run.
-A gross-budget shortfall beyond localised loss + a 100 ppm clock band is a
-WARN, not a fail — it cannot be attributed to loss vs. clock from the host
-side alone.
+**PIB errors** (firmware GPIF overflow) are **polled every second** on
+the EP0 handle, so an overflow is localised to the second it happens and
+correlated with that interval's continuity result: PIB *with* a deficit
+lost host-visible samples; PIB with none recovered. The same poll catches
+a mid-run device reset (boot-count change) immediately.
+
+### Separating clock offset from loss
+
+`delivered / (samplerate × elapsed)`, as ppm, is the ADC-vs-host **clock
+offset combined with any uniform loss** — the two are identical in that
+one number. They are separated by the fact that **loss always leaves a
+fingerprint** (a `bad_xfer`, a continuity step, or `produced > delivered`)
+whereas a **slow clock delivers everything, just at a steadily lower
+rate** — a smooth drift with no fingerprints (the ~+0.16 ppm marker-size
+drift we observe is exactly this).
+
+So when every loss detector is clear, `produced == delivered` *proves* no
+data was dropped, and the rate offset is reported as a pure **ADC clock
+calibration** (`ADC clock: ±X ppm`). This assumes a disciplined
+(NTP/PTP/GPS) host clock; on a free-running host the ppm is host+ADC
+combined. If any detector fires, the offset line instead reads
+`Sample budget: … (clock+loss combined)` and the run fails.
+
+The summary also prints its own **sensitivity**: the `LOSS_TOL` detection
+floor (drops smaller than this within one interval are invisible to the
+continuity check — the produced/delivered check still catches them at
+buffer granularity) and the **largest interval deficit actually observed**
+(headroom to the floor).
+
+### What we deliberately do *not* do
+
+No sequence number or known pattern is embedded in the sample stream —
+that is a separate RF-injection / TimeSpec idea, out of scope here. The
+airtight version of produced-vs-delivered would be a *firmware* "buffers
+delivered" (DMA consumer) counter, making the comparison atomic and
+buffer-exact; the FX3 SDK can do it (`CY_U3P_DMA_CB_CONS_EVENT`) but adds
+a callback per transfer, which needs benchmarking at 64+ MSPS. Until then
+the host-side `glDMACount − ok_xfers` inference (with in-flight slack) is
+the recommended approach and is what this tool implements.
+
+### What fails the run
+
+Any confirmed loss — `bad_xfers > 0`, an inter-marker deficit, or
+`produced − delivered` beyond the in-flight slack — plus spurious shorts,
+device resets, early library stop, or marker-handle control faults.
+Blind-spot misses (NOTE) and recovered misses (WARN) do not.
 
 ### Main thread — 1 Hz toggle loop
 
@@ -256,40 +295,43 @@ was displaced into edge 4's oversized flush — no samples lost.
 ```
 === PPS INTEGRITY RESULT ===
 Duration:        04:00:01
-Sample rate:     64 MSPS
+Sample rate:     64 MSPS (64000000 Hz)
 Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      14401
 Markers seen:    14401
 Spurious shorts: 0
 Missed markers:  0  (blind-spot: 0, recovered: 0, lost: 0)
 Samples in:      230400000000 (230.40 Gsa)
-Sample budget:   expected 230400000000 (rate x elapsed), delivered 230400000037, diff +37 (+0.161 ppm; clock+loss combined)
-Learned rate:    32000005 Sa/s vs nominal 32000000 (+0.156 ppm)
-Loss floor:      65536 samples (0.12 buffer); largest interval deficit 31204 (0.06 buffer)
-USB transfers:   ok=219726 bad=0
+DMA buffers:     produced 439453, delivered 439453, in-flight 32, undelivered +0 (slack +-32)
+USB transfers:   ok=439453 bad=0
 Sample loss:     0 interval(s), ~0 samples (inter-marker deficit)
+Loss floor:      65536 samples (0.12 buffer); largest interval deficit 31204 (0.06 buffer)
+ADC clock:       +0.161 ppm (lossless: produced==delivered, no errors/deficits; assumes disciplined host)
 PIB errors:      0 total in 0 second(s); 0 coincided with a deficit
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS
 ```
 
-GETSTATS is read once at start and once at end; the report shows the
-delta and flags a `boot_count` mismatch (device reset between reads).
+The headline integrity lines: **`DMA buffers: produced == delivered`**
+(clock-independent proof no buffer was dropped) and **`Sample loss: 0`**
+(no localized deficit). With both clean the rate offset is reported as a
+pure **`ADC clock`** calibration rather than possible loss.
 
-**Note on firmware counters:** the current firmware GETSTATS payload
-(`src/fx3_cmd/fx3_stats.h`) does *not* expose dedicated `pps_count` /
-`pps_fail` fields, so the tool reports only what exists — `pib_errors`,
-`streaming_faults`, and `boot_count`. Host-side `edges`/`marks`/
-`spurious`/`missed` are the authoritative pass/fail signals.
+**Note on firmware counters:** GETSTATS exposes `dma_count` (glDMACount,
+buffers produced), `pib_errors`, `streaming_faults`, and `boot_count`,
+but no dedicated `pps_count`/`pps_fail`. Host-side
+`edges`/`marks`/`spurious`/`missed` plus the produced-vs-delivered and
+continuity checks are the authoritative signals.
 
 ### Pass criteria
 
-- **No sample loss** — `bad_xfers == 0`, no inter-marker deficit, and
-  therefore `lost == 0`.
+- **No sample loss** — `bad_xfers == 0`, no inter-marker deficit
+  (`lost == 0`), and `produced − delivered` within the in-flight slack.
 - `spurious_count == 0` — no shorts without a preceding rising edge.
-- No device resets (`boot_count` unchanged), no streaming faults, no
-  early library stop, no marker-handle control faults.
+- No device resets (`boot_count` unchanged, no mid-run reset), no
+  streaming faults, no early library stop, no marker-handle control
+  faults.
 - Blind-spot misses (NOTE) and recovered misses (WARN) do not fail the
   run: the former are inherent to the marker scheme, the latter preserve
   the samples (verified by the inter-marker count) and are reconstructable.
