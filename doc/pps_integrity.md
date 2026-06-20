@@ -268,33 +268,45 @@ library stop, or marker-handle control faults. Blind-spot and displaced
 misses do not (marker timing only); an uncorroborated continuity dip does
 not.
 
-### Throughput ceiling (empirical) and why the clock check matters
+### The loss is caused by marker injection, not throughput (empirical)
 
-Measured on real hardware: **64 MSPS (128 MB/s) is lossless** over 3 h
-(`produced == delivered`), but **129 MSPS (258 MB/s) drops ~30 ppm**
-sustained — ~82 MB over 3 h — with **`PIB = 0` and `bad_xfers = 0`**. The
-GPIF producer never stalls (no PIB) and every USB transfer that ships is
-intact (no `bad_xfers`); the loss is on the **DMA→USB consumer side** (the
-FX3 can't drain DMA buffers to USB fast enough, so buffers are overwritten
-before shipping). Only `glDMACount` (produced) vs delivered bytes sees it.
+Measured on real hardware, 3 h each:
 
-Critically, the sample-rate **budget alone would have missed it**: with a
-+28 ppm fast ADC clock and ~30 ppm loss, the budget read **−1.2 ppm** —
-apparently fine. The clock-independent produced-vs-delivered check is what
-exposed the loss; the report prints the *implied* clock (`budget + loss
-added back`) so the masking is visible. This is the case the whole
-loss-accounting design exists for.
+| run | rate | throughput | short xfers | loss |
+|-----|------|-----------|-------------|------|
+| `stream_soak` (no marker) | 64 MSPS | 128 MB/s | 0 | 0 |
+| `stream_soak` (no marker) | 129.6 MSPS | 259 MB/s | 0 | 0 |
+| `pps_integrity` (1 Hz marker) | 129 MSPS | 258 MB/s | 333 | ~82 MB |
 
-If a rate near the ceiling must be used, `-q`/`-p` increase in-flight
-buffering, which can absorb transient drain stalls; whether it actually
-moves the ceiling is hardware-dependent and worth measuring per host.
-`tests/pps_knob_sweep.sh` automates that measurement — it runs controls
-at a low rate, sweeps `-q` at the high rate, picks the depth with the
-least produced-vs-delivered loss, sweeps `-p` at that depth, and prints a
-summary table (loss MB, result, spurious, displaced per cell). It is a
-hardware test (needs a device); see the script header for env overrides
-(`RX888_FW`, `HIRATE`, `DUR_SWEEP`, `QSWEEP`, `PSWEEP`, …). Re-run the
-best cell for 1–3 h to confirm before trusting it.
+The bare stream sustains **259 MB/s losslessly with zero short transfers**
+(`produced == delivered`, `PIB = 0`, `bad_xfers = 0`), so 129.6 is **not**
+a throughput ceiling — the hardware/USB/host drain it fine. The loss in
+the marker run comes from the **PPS marker injection** itself: the
+firmware's forced partial-buffer commit perturbs the near-capacity DMA→USB
+pipeline and drops buffers around the flush. The direction is conclusive —
+the *lossy* run was at the *lower* throughput (129 < 129.6) *with* the
+marker, while the *higher* bare rate was clean; a drain limit would fail
+the higher rate first.
+
+Implication: the in-band short-transfer marker is **actively harmful at
+high rates**. Prefer an out-of-band PPS epoch (FX3 MCU latching the
+sample/buffer count at the GPIO edge, exposed via GETSTATS) which does not
+touch the data path; with a GPS-disciplined clock it is needed only
+rarely. The in-band marker is best kept as a coarse, low-rate fallback.
+
+Critically, the sample-rate **budget alone would have missed the loss**:
+with a +28 ppm fast ADC clock and ~30 ppm loss the budget read **−1.2 ppm**,
+apparently fine. The clock-independent produced-vs-delivered check exposed
+it; the report prints the *implied* clock (`budget + loss added back`) so
+the masking is visible. This is the case the whole loss-accounting design
+exists for.
+
+`-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
+out the marker perturbation at a high rate; `tests/pps_knob_sweep.sh`
+measures whether it does (runs low-rate controls, sweeps `-q` then `-p`,
+picks the least-loss depth, prints a summary). It is a hardware test; see
+the script header for env overrides. The cleaner fix, though, is to move
+PPS off the data path entirely (above).
 
 ### Main thread — 1 Hz toggle loop
 
