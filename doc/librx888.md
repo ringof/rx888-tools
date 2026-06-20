@@ -40,10 +40,23 @@ void        rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
 int         rx888_is_running(const rx888_t *r);
 const char *rx888_strerror(int err);
 const char *rx888_version(void);
+
+/* Planned (pps_integrity) */
+size_t      rx888_get_transfer_bytes(const rx888_t *r);
 ```
 
 Full type and field documentation lives in
 [`include/librx888.h`](../include/librx888.h).
+
+> **Planned addition.** `rx888_get_transfer_bytes()` is a one-line
+> read-only accessor returning `buf_bytes` (`req_packets * max_packet`,
+> the size of a full bulk transfer). It is **not implemented yet** — it
+> arrives with the `pps_integrity` tool, which needs the full-transfer
+> size to distinguish short PPS-marker transfers. The value is only
+> populated after `rx888_start()`; the getter returns 0 before then. See
+> [`doc/pps_integrity.md`](pps_integrity.md). When it lands it becomes
+> the only public-API change for that feature and must be added to the
+> exported-symbol assertion in CI.
 
 ### Typical sequence
 
