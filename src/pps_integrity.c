@@ -6,8 +6,11 @@
  * that each rising edge produces one short USB bulk transfer (the in-band
  * marker). Misses are classified: "blind-spot" misses (the marker partial
  * buffer drifted within a buffer boundary, where no in-band short can
- * exist) are inherent and benign; "anomalous" misses (marker lost with the
- * remainder mid-buffer) and spurious shorts are real fidelity failures.
+ * exist) are inherent and benign; a hard miss whose samples are all present
+ * (inter-marker continuity intact) is "recovered" — the delimiter was
+ * displaced one edge, reconstructable in post; a hard miss with a sample
+ * deficit (or errored USB transfers) is "lost" — real data loss, the only
+ * thing that fails the run alongside spurious shorts and device faults.
  *
  * Two handles by design:
  *   - librx888 owns interface 0 and the async bulk EP1-IN stream.
@@ -59,20 +62,19 @@
  * indistinguishable from a full transfer, so no in-band short can exist — an
  * inherent blind spot of a short-transfer marker, not a fidelity failure. A
  * miss is "blind-spot" when the live remainder (last good marker) sits in that
- * band, "anomalous" otherwise. The band must exceed the per-second remainder
+ * band; otherwise it is a hard miss, resolved to recovered/lost by the
+ * continuity check. The band must exceed the per-second remainder
  * jitter (~2k samples observed); the firmware's empty-partial suppression
  * threshold is unknown, so tune this once long-run data is in hand. */
 #define DANGER_BAND     8192
 
-/* A hard miss (remainder mid-buffer) is a MERGE rather than a true loss when
- * the very next marker is oversized: the skipped flush rolled forward and the
- * following edge flushed the combined partial (~2x), so no samples were lost —
- * the delimiter was merely delayed, and is reconstructable in post. We flag it
- * when the next marker reaches MERGE_PCT% of the running median marker size.
- * Heuristic: normal jitter tops out ~160% of median, a merge lands ~190%, so
- * 170% separates them. Tune against campaign data. BASE_WIN is the median
- * window over recent normal markers (recovery spikes are excluded). */
-#define MERGE_PCT       170
+/* A hard miss (remainder mid-buffer) is resolved when the next marker arrives,
+ * using the inter-marker continuity (sample-loss) check below as the ground
+ * truth: if the spanning interval has no sample deficit the delimiter was
+ * merely displaced one edge with the data intact ("recovered", WARN, and
+ * reconstructable in post); if it shows a deficit, samples were genuinely
+ * lost ("lost", FAIL). BASE_WIN is the median window for the continuity rate
+ * estimate. */
 #define BASE_WIN        32
 
 /* Vendor control-transfer timeout on the second handle (ms). */
@@ -333,12 +335,10 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
-    uint64_t blind_spot = 0, merge = 0, anomalous = 0;  /* miss classification */
+    uint64_t blind_spot = 0, recovered = 0, lost = 0;  /* miss classification */
     uint32_t last_marker = 0;                     /* live remainder estimate */
     int last_marker_valid = 0;
-    uint32_t base_ring[BASE_WIN];                 /* recent normal markers */
-    int base_n = 0, base_pos = 0;
-    int pending_miss = 0;                         /* hard miss awaiting next marker */
+    int pending_misses = 0;                       /* hard misses awaiting next marker */
     /* Inter-marker sample-loss continuity. */
     uint64_t prev_marker_samples = 0, prev_marker_edge = 0;
     int have_prev_marker = 0;
@@ -387,43 +387,19 @@ int main(int argc, char **argv)
         char note[128]; note[0] = '\0';
         if (arrived) {
             marks++;
-            uint32_t marker = (mn == UINT32_MAX) ? 0 : mn;
-            int is_recovery = 0;
-            /* Resolve a deferred hard miss: an oversized marker now means the
-             * skipped flush merged into this one (data intact, MERGE);
-             * otherwise the earlier miss was a true loss (ANOM). */
-            if (pending_miss) {
-                uint32_t med = base_median(base_ring, base_n);
-                if (med > 0 &&
-                    (uint64_t)marker * 100u >= (uint64_t)med * MERGE_PCT) {
-                    merge++; is_recovery = 1;
-                    snprintf(note, sizeof note, "  <- prev MISS: MERGE (data intact)");
-                } else {
-                    anomalous++;
-                    snprintf(note, sizeof note, "  <- prev MISS: ANOM (loss)");
-                }
-                pending_miss = 0;
-            }
-            /* Feed the median baseline with normal markers only (a recovery
-             * spike would bias it high). */
-            if (!is_recovery && marker > 0) {
-                base_ring[base_pos] = marker;
-                base_pos = (base_pos + 1) % BASE_WIN;
-                if (base_n < BASE_WIN) base_n++;
-            }
             if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
 
             /* Inter-marker continuity: samples between consecutive markers
              * should be (seconds spanned) x the learned per-second rate. A
              * shortfall beyond LOSS_TOL means samples went missing from the
              * stream (USB/firmware overflow) — the direct "did we lose data?"
-             * check, and the cross-validation of MERGE (a merge spans 2 s, so
-             * its interval must equal 2x a normal one to be truly lossless). */
+             * check, and the ground truth for resolving deferred misses. */
             uint64_t cur_ms = atomic_load(&ctx.samples_at_marker);
+            int interval_lost = 0;
             if (have_prev_marker) {
                 uint64_t interval = cur_ms - prev_marker_samples;
                 uint64_t span = edges - prev_marker_edge;     /* seconds */
-                if (span == 1) {
+                if (span == 1) {              /* clean interval: learn the rate */
                     uint32_t iv = interval > UINT32_MAX ? UINT32_MAX
                                                         : (uint32_t)interval;
                     rate_ring[rate_pos] = iv;
@@ -437,6 +413,7 @@ int main(int argc, char **argv)
                         uint64_t deficit = expected - interval;
                         loss_events++;
                         lost_samples_est += deficit;
+                        interval_lost = 1;
                         snprintf(note + strlen(note), sizeof note - strlen(note),
                                  "  LOSS ~%" PRIu64 " samples", deficit);
                     }
@@ -445,17 +422,32 @@ int main(int argc, char **argv)
             prev_marker_samples = cur_ms;
             prev_marker_edge = edges;
             have_prev_marker = 1;
+
+            /* Resolve deferred hard miss(es) by the continuity ground truth:
+             * no deficit over the spanning interval -> the delimiter(s) were
+             * displaced but the data is intact (recovered); a deficit -> real
+             * loss. */
+            if (pending_misses > 0) {
+                if (interval_lost) {
+                    lost += (uint64_t)pending_misses;
+                    snprintf(note + strlen(note), sizeof note - strlen(note),
+                             "  <- prev %d MISS: LOST", pending_misses);
+                } else {
+                    recovered += (uint64_t)pending_misses;
+                    snprintf(note + strlen(note), sizeof note - strlen(note),
+                             "  <- prev %d MISS: recovered (data intact)",
+                             pending_misses);
+                }
+                pending_misses = 0;
+            }
         } else {
             missed++;
-            /* A second miss before the previous one resolved: the prior was
-             * not recovered by an oversized marker, so it was a true loss. */
-            if (pending_miss) { anomalous++; pending_miss = 0; }
             /* Classify. mn < expected: a near-full partial slipped past the
              * detect threshold — near-full edge of the blind spot. mn ==
              * expected: no distinguishable partial; a blind spot only if the
              * live remainder sits within DANGER_BAND of a boundary. Otherwise
-             * the marker vanished mid-buffer — defer the MERGE-vs-ANOM call to
-             * the next marker. */
+             * the marker vanished mid-buffer — defer the recovered-vs-lost
+             * call to the continuity check when the next marker arrives. */
             int blind;
             if (mn < ctx.expected_nsamples) {
                 blind = 1;                       /* near-full boundary */
@@ -467,7 +459,7 @@ int main(int argc, char **argv)
                 blind = (dist <= DANGER_BAND);
             }
             if (blind) { blind_spot++; stat = "BLIND"; }
-            else       { pending_miss = 1; stat = "MISS"; }  /* resolved next edge */
+            else       { pending_misses++; stat = "MISS"; }  /* resolved next edge */
         }
         printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
@@ -481,8 +473,9 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    /* A hard miss on the final second never saw a recovery marker: a loss. */
-    if (pending_miss) { anomalous++; pending_miss = 0; }
+    /* Trailing hard miss(es) the run ended on never saw a recovery marker, so
+     * continuity could not confirm the data — count them as lost. */
+    if (pending_misses > 0) { lost += (uint64_t)pending_misses; pending_misses = 0; }
 
     rx888_stop(r);
     read_fw_stats(h2, &st_end);
@@ -501,15 +494,15 @@ int main(int argc, char **argv)
     uint32_t pib_delta = (st_start.valid && st_end.valid)
                        ? st_end.pib_errors - st_start.pib_errors : 0;
 
-    /* Sample loss is the hard question: errored USB transfers (transport
-     * loss) or an inter-marker deficit (firmware/USB overflow) both mean the
-     * stream is missing data. */
+    /* Sample loss is the hard question and the verdict's basis: errored USB
+     * transfers (transport loss) or an inter-marker deficit (firmware/USB
+     * overflow) both mean the stream is missing data. */
     int sample_loss = (lib.bad_xfers > 0) || (loss_events > 0);
 
-    /* Verdict: blind-spot misses are inherent and merges are recoverable, so
-     * neither fails the run; anomalous misses, spurious shorts, and any
-     * sample loss do. */
-    int pass = (spur == 0) && (anomalous == 0) && !sample_loss &&
+    /* Verdict: blind-spot misses are inherent and recovered misses are lossless
+     * delimiter displacements, so neither fails the run; lost markers, spurious
+     * shorts, and any confirmed sample loss do. */
+    int pass = (spur == 0) && (lost == 0) && !sample_loss &&
                !internal_stop && !ctrl_fault && !boot_changed;
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
@@ -522,25 +515,22 @@ int main(int argc, char **argv)
     printf("Markers seen:    %" PRIu64 "\n", marks);
     printf("Spurious shorts: %" PRIu64 "\n", spur);
     printf("Missed markers:  %" PRIu64 "  (blind-spot: %" PRIu64
-           ", merge: %" PRIu64 ", anomalous: %" PRIu64 ")\n",
-           missed, blind_spot, merge, anomalous);
-    if (edges > 0 && merge > 0)
-        printf("Merge rate:      %.3f%% of edges (~%.1f/hour)\n",
-               100.0 * (double)merge / (double)edges,
-               (double)merge / (double)edges * 3600.0);
-    if (edges > 0 && anomalous > 0)
-        printf("Anomaly rate:    %.3f%% of edges (~%.1f/hour)\n",
-               100.0 * (double)anomalous / (double)edges,
-               (double)anomalous / (double)edges * 3600.0);
+           ", recovered: %" PRIu64 ", lost: %" PRIu64 ")\n",
+           missed, blind_spot, recovered, lost);
+    if (edges > 0 && recovered > 0)
+        printf("Recovered rate:  %.3f%% of edges (~%.1f/hour) — delimiter "
+               "displaced one edge, data intact\n",
+               100.0 * (double)recovered / (double)edges,
+               (double)recovered / (double)edges * 3600.0);
     if (blind_spot > 0)
         printf("  NOTE: blind-spot misses are the inherent short-transfer "
                "marker limit near a buffer boundary, not a failure.\n");
-    if (merge > 0)
-        printf("  WARN: merged markers — a delimiter was delayed into the "
-               "next edge (data intact, reconstructable). Not a hard fail.\n");
-    if (anomalous > 0)
-        printf("  FAIL: anomalous misses — marker lost with the remainder "
-               "mid-buffer, no oversized recovery (possible data loss).\n");
+    if (recovered > 0)
+        printf("  WARN: recovered misses — delimiter displaced to the next "
+               "edge, samples intact (continuity verified), reconstructable.\n");
+    if (lost > 0)
+        printf("  FAIL: lost markers — a miss coincided with a sample deficit "
+               "(data loss).\n");
     printf("Samples in:      %" PRIu64 " (%.2f Gsa)\n",
            delivered, (double)delivered / 1e9);
     printf("USB transfers:   ok=%llu bad=%llu\n",

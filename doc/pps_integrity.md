@@ -155,21 +155,24 @@ The tool therefore classifies every miss:
   `SHORT_MARGIN`), or `minxfer == full` while the live remainder (last
   good marker) sits within `DANGER_BAND` of a boundary. Inherent and
   benign; reported as a NOTE.
-- **merge** — `minxfer == full` (remainder mid-buffer), but the *next*
-  marker is oversized (≥ `MERGE_PCT`% of the running median). The skipped
-  flush rolled forward and the following edge flushed the combined ~2×
-  partial: no samples were lost, the delimiter was only delayed, and it
-  is reconstructable in post (the skipped boundary sits one normal
-  remainder into the oversized buffer). Reported as a WARN, not a hard
-  fail.
-- **anomalous** — `minxfer == full`, remainder mid-buffer, and *no*
-  oversized recovery marker follows. The marker should have been plainly
-  visible but vanished with no carry-forward — possible data loss. Fails
-  the run.
+- **recovered** — a hard miss (`minxfer == full`, remainder mid-buffer)
+  whose spanning inter-marker interval shows **no sample deficit**. The
+  skipped flush rolled forward and the next edge flushed the combined
+  partial: the delimiter was displaced one edge but no samples were lost,
+  and the skipped boundary is reconstructable in post (it sits one normal
+  remainder into the oversized buffer). Reported as a WARN, not a fail.
+- **lost** — a hard miss whose spanning interval shows a sample
+  **deficit** (or the run ended on it, so continuity could not confirm).
+  Real data loss; fails the run.
 
-The merge-vs-anomalous decision is deferred one second (until the next
-marker resolves it); a hard miss prints `MISS` live, then the resolving
-line annotates `prev MISS: MERGE`/`ANOM`.
+The recovered-vs-lost decision is made by the inter-marker continuity
+check (below) — the *measured* sample count, not the marker's size — when
+the next marker arrives. A hard miss prints `MISS` live, then the
+resolving line annotates `prev N MISS: recovered`/`LOST`. (An earlier
+build split these by recovery-marker size against a `MERGE_PCT` threshold;
+3 h of data showed that threshold cut a single continuous population
+arbitrarily while continuity proved every case lossless, so the size
+heuristic was dropped in favour of the deficit measurement.)
 
 `-v` adds a `minxfer` column (smallest transfer that second) so the
 classification is auditable line by line.
@@ -185,9 +188,9 @@ lose samples?" Those are checked directly:
   to the marker (a fixed point *in the stream*) removes host-window
   boundary jitter; within ~1 s clock drift is negligible, so a dropped
   DMA buffer (~524288 samples) is a glaring deficit (`LOSS_TOL` absorbs
-  the marker-flush jitter). This also **cross-validates MERGE**: a merge
-  spans 2 s, so its interval must equal 2× a normal one — if it is short,
-  the "merge" actually dropped data.
+  the marker-flush jitter). This is also what **classifies a hard miss**:
+  a displaced delimiter spans 2 s, so its interval must equal 2× a normal
+  one — equal ⇒ recovered (data intact), short ⇒ lost.
 - **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
   transport-level loss, surfaced in the summary.
 - **Firmware PIB errors** — overflow events. PIB > 0 *with* an
@@ -214,13 +217,15 @@ pps_integrity: starting 0.033 hour run @ 32 MSPS
 #time             stat   edges  marks  spur  miss   minxfer
  14:23:01.384521  ok         1      1     0     0      18432
  14:23:02.384892  ok         2      2     0     0      19960
- 14:23:03.385201  ANOM       3      2     0     1     524288
+ 14:23:03.385201  MISS       3      2     0     1     524288
+ 14:23:04.385600  ok         4      3     0     1      37120  <- prev 1 MISS: recovered (data intact)
 ```
 
 Wall-clock microsecond timestamps so the operator can visually catch
-cadence skips. `stat` is `ok`, `BLIND`, or `ANOM`; the `minxfer` column
-(samples) appears under `-v`. Here edge 3's marker vanished while the
-remainder was healthy (~18k–20k) — an anomalous miss.
+cadence skips. `stat` is `ok`, `BLIND`, or `MISS` (a hard miss, resolved
+to `recovered`/`LOST` on the next marker line by the continuity check);
+the `minxfer` column (samples) appears under `-v`. Here edge 3's marker
+was displaced into edge 4's oversized flush — no samples lost.
 
 ### Final report
 
@@ -232,7 +237,7 @@ Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      14401
 Markers seen:    14401
 Spurious shorts: 0
-Missed markers:  0  (blind-spot: 0, merge: 0, anomalous: 0)
+Missed markers:  0  (blind-spot: 0, recovered: 0, lost: 0)
 Samples in:      230400000000 (230.40 Gsa)
 USB transfers:   ok=219726 bad=0
 Sample loss:     0 interval(s), ~0 samples (inter-marker deficit)
@@ -253,14 +258,14 @@ delta and flags a `boot_count` mismatch (device reset between reads).
 
 ### Pass criteria
 
-- `anomalous == 0` — no marker lost without an oversized recovery.
-- **No sample loss** — `bad_xfers == 0` and no inter-marker deficit.
+- **No sample loss** — `bad_xfers == 0`, no inter-marker deficit, and
+  therefore `lost == 0`.
 - `spurious_count == 0` — no shorts without a preceding rising edge.
 - No device resets (`boot_count` unchanged), no streaming faults, no
   early library stop, no marker-handle control faults.
-- Blind-spot misses (NOTE) and merge misses (WARN) do not fail the run:
-  the former are inherent to the marker scheme, the latter preserve the
-  samples (verified by the inter-marker count) and are reconstructable.
+- Blind-spot misses (NOTE) and recovered misses (WARN) do not fail the
+  run: the former are inherent to the marker scheme, the latter preserve
+  the samples (verified by the inter-marker count) and are reconstructable.
   PIB errors are informational unless paired with a sample deficit.
 
 ## Implementation
