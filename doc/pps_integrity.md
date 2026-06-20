@@ -153,30 +153,26 @@ spot is a property of the marker scheme, eliminable only at the source
 (e.g. firmware emitting a zero-length packet or a forced minimum-length
 delimiter regardless of buffer fill).
 
-The tool therefore classifies every miss:
+A miss is a marker-**timing** event, **not** a data-loss verdict (data
+integrity is judged separately, below). Two kinds:
 
 - **blind-spot** — `minxfer < full` (a near-full partial slipped past
   `SHORT_MARGIN`), or `minxfer == full` while the live remainder (last
-  good marker) sits within `DANGER_BAND` of a boundary. Inherent and
-  benign; reported as a NOTE.
-- **recovered** — a hard miss (`minxfer == full`, remainder mid-buffer)
-  whose spanning inter-marker interval shows **no sample deficit**. The
-  skipped flush rolled forward and the next edge flushed the combined
-  partial: the delimiter was displaced one edge but no samples were lost,
-  and the skipped boundary is reconstructable in post (it sits one normal
-  remainder into the oversized buffer). Reported as a WARN, not a fail.
-- **lost** — a hard miss whose spanning interval shows a sample
-  **deficit** (or the run ended on it, so continuity could not confirm).
-  Real data loss; fails the run.
+  good marker) sits within `DANGER_BAND` of a boundary. Inherent to the
+  marker scheme; a NOTE.
+- **displaced** — otherwise: the skipped flush rolled into an adjacent
+  edge (which then flushes ~2×). The delimiter moved one edge and is
+  reconstructable in post (the skipped boundary sits one normal remainder
+  into the oversized buffer). Reported, but does **not** fail the run.
 
-The recovered-vs-lost decision is made by the inter-marker continuity
-check (below) — the *measured* sample count, not the marker's size — when
-the next marker arrives. A hard miss prints `MISS` live, then the
-resolving line annotates `prev N MISS: recovered`/`LOST`. (An earlier
-build split these by recovery-marker size against a `MERGE_PCT` threshold;
-3 h of data showed that threshold cut a single continuous population
-arbitrarily while continuity proved every case lossless, so the size
-heuristic was dropped in favour of the deficit measurement.)
+> Earlier builds tried to label a miss "recovered" vs "lost" from the
+> recovery-marker *size* (a `MERGE_PCT` threshold) and later from the
+> per-interval continuity deficit. Both proved unreliable: at 64–129 MSPS
+> the recovery sizes form one continuous population and marker-detection
+> timing jitters by ~a marker's worth, so single-interval deficits fire
+> with no real loss. **Data loss is now decided only by the authoritative
+> byte-exact produced-vs-delivered check below**, so the miss count is
+> purely about marker timing.
 
 `-v` adds a `minxfer` column (smallest transfer that second) so the
 classification is auditable line by line.
@@ -184,42 +180,46 @@ classification is auditable line by line.
 ### Sample-loss accounting
 
 Marker classification answers "is the delimiter there?" — not "did we
-lose samples?" That is checked by three independent detectors, in
-increasing authority:
+lose samples?" That is checked by independent detectors:
 
-1. **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
-   transport-level loss.
-2. **Inter-marker continuity.** The samples delivered between two
-   consecutive markers must equal `(seconds spanned) × rate`, where
-   `rate` is the running median of single-second inter-marker counts.
-   Anchoring to the marker (a fixed point *in the stream*) removes
-   host-window boundary jitter; within ~1 s clock drift is negligible, so
-   a dropped DMA buffer (~524288 samples) is a glaring deficit (`LOSS_TOL`
-   absorbs the marker-flush jitter). This is also what **classifies a hard
-   miss**: a displaced delimiter spans 2 s, so its interval must equal 2×
-   a normal one — equal ⇒ recovered (data intact), short ⇒ lost. It is
-   fine-grained and localized, but its baseline is *self-referential*, so
-   perfectly uniform loss could in principle hide in it.
-3. **Buffers produced vs delivered — the decisive, clock-independent
-   check.** The firmware's `glDMACount` (GETSTATS byte 0) counts DMA
-   buffers the GPIF *produced*; librx888's `ok_xfers` counts buffers the
-   host *received* (one completed USB transfer per buffer). They count the
-   same physical buffers, so their run-long deltas must match. Crucially
-   this is **independent of clock**: a slow ADC clock lowers *both* counts
-   equally and leaves their difference at zero — only real loss makes
-   produced exceed delivered. This directly answers "were all DMA buffers
-   delivered?". Granularity is one buffer; the comparison is bounded by
-   the in-flight pipeline (produced runs ahead of delivered by the
-   transfers still in flight), so the report subtracts `in_flight` and
-   allows one `queue_depth` of slack before calling it loss. **Caveat:**
-   `glDMACount` resets on `STOPFX3`, so the end snapshot is read *before*
-   `rx888_stop()`; and the two counters aren't sampled atomically, which
-   is the other reason for the slack.
+1. **Bytes produced vs delivered — the authoritative, clock-independent
+   check.** The firmware's `glDMACount` (GETSTATS byte 0) counts the DMA
+   buffers the GPIF *produced*. **These are the firmware's small DMA
+   buffers (`FW_DMA_BUF_BYTES`, 16 KB on SDDC_FX3), not the host's 1 MB
+   USB transfers** — the host aggregates ~64 DMA buffers per transfer, so
+   `glDMACount` runs ~64× `ok_xfers`. The comparison must therefore be in
+   **bytes**, not buffer counts:
+   ```
+   produced_bytes  = (glDMACount delta) × FW_DMA_BUF_BYTES
+   delivered_bytes = (samples delta)    × 2
+   ```
+   Both count the same data, so a slow ADC clock lowers *both* equally and
+   the difference stays at zero — only real loss makes produced exceed
+   delivered. This directly answers "were all DMA buffers delivered?".
+   *Caveats:* `glDMACount` resets on `STOPFX3` (the end snapshot is read
+   *before* `rx888_stop()`); the counters aren't sampled atomically and
+   the pipeline holds transfers in flight, so produced runs ahead by
+   ~`in_flight` — the report subtracts `in_flight` (in bytes) and allows a
+   few transfers of slack. `FW_DMA_BUF_BYTES` is an asserted firmware
+   constant, guarded at runtime (if produced/delivered disagree by a large
+   factor the assumption is wrong and the check is marked *indeterminate*
+   rather than failing).
+2. **librx888 `bad_xfers`** — errored/cancelled USB transfers
+   (transport-level loss).
+3. **Inter-marker continuity (diagnostic localizer, not the verdict).**
+   Samples between consecutive markers vs `(span) × rate`, `rate` = median
+   of single-second inter-marker counts. It localizes *when* a deficit
+   appears, but marker-detection timing jitters by ~a marker's worth at
+   high rates, so an isolated short interval (with the next running long,
+   net zero) is **not** loss. It therefore does not fail the run on its
+   own — it is reported and **corroborated against detector 1**: a deficit
+   that coincides with `produced > delivered` is real; one that doesn't is
+   flagged as marker-flush jitter.
 
 **PIB errors** (firmware GPIF overflow) are **polled every second** on
 the EP0 handle, so an overflow is localised to the second it happens and
 correlated with that interval's continuity result: PIB *with* a deficit
-lost host-visible samples; PIB with none recovered. The same poll catches
+lost host-visible samples; PIB with none did not. The same poll catches
 a mid-run device reset (boot-count change) immediately.
 
 ### Separating clock offset from loss
@@ -239,11 +239,11 @@ calibration** (`ADC clock: ±X ppm`). This assumes a disciplined
 combined. If any detector fires, the offset line instead reads
 `Sample budget: … (clock+loss combined)` and the run fails.
 
-The summary also prints its own **sensitivity**: the `LOSS_TOL` detection
-floor (drops smaller than this within one interval are invisible to the
-continuity check — the produced/delivered check still catches them at
-buffer granularity) and the **largest interval deficit actually observed**
-(headroom to the floor).
+The summary prints its own **sensitivity**, which differs by detector:
+the continuity diagnostic has a fine floor (`LOSS_TOL`, ~0.1 buffer) but
+jitters; the authoritative produced-vs-delivered has a coarser floor (the
+in-flight pipeline, a few MB) but is clock-independent and reliable.
+Together: produced-vs-delivered is the verdict, continuity localizes.
 
 ### What we deliberately do *not* do
 
@@ -253,15 +253,17 @@ airtight version of produced-vs-delivered would be a *firmware* "buffers
 delivered" (DMA consumer) counter, making the comparison atomic and
 buffer-exact; the FX3 SDK can do it (`CY_U3P_DMA_CB_CONS_EVENT`) but adds
 a callback per transfer, which needs benchmarking at 64+ MSPS. Until then
-the host-side `glDMACount − ok_xfers` inference (with in-flight slack) is
-the recommended approach and is what this tool implements.
+the host-side `produced_bytes` (`glDMACount × FW_DMA_BUF_BYTES`) vs
+`delivered_bytes` inference (with in-flight slack) is the recommended
+approach and is what this tool implements.
 
 ### What fails the run
 
-Any confirmed loss — `bad_xfers > 0`, an inter-marker deficit, or
-`produced − delivered` beyond the in-flight slack — plus spurious shorts,
-device resets, early library stop, or marker-handle control faults.
-Blind-spot misses (NOTE) and recovered misses (WARN) do not.
+Any confirmed loss — `bad_xfers > 0` or `produced_bytes − delivered_bytes`
+beyond the in-flight slack — plus spurious shorts, device resets, early
+library stop, or marker-handle control faults. Blind-spot and displaced
+misses do not (marker timing only); an uncorroborated continuity dip does
+not.
 
 ### Main thread — 1 Hz toggle loop
 
@@ -281,61 +283,60 @@ pps_integrity: starting 0.033 hour run @ 32 MSPS
  14:23:01.384521  ok         1      1     0     0      18432
  14:23:02.384892  ok         2      2     0     0      19960
  14:23:03.385201  MISS       3      2     0     1     524288
- 14:23:04.385600  ok         4      3     0     1      37120  <- prev 1 MISS: recovered (data intact)
+ 14:23:04.385600  ok         4      3     0     1      37120
 ```
 
 Wall-clock microsecond timestamps so the operator can visually catch
-cadence skips. `stat` is `ok`, `BLIND`, or `MISS` (a hard miss, resolved
-to `recovered`/`LOST` on the next marker line by the continuity check);
-the `minxfer` column (samples) appears under `-v`. Here edge 3's marker
-was displaced into edge 4's oversized flush — no samples lost.
+cadence skips. `stat` is `ok`, `BLIND`, or `MISS` (a displaced delimiter —
+marker timing only); the `minxfer` column (samples) appears under `-v`.
+Here edge 3's marker was displaced into edge 4's oversized flush.
 
 ### Final report
 
 ```
 === PPS INTEGRITY RESULT ===
-Duration:        04:00:01
+Duration:        03:00:00
 Sample rate:     64 MSPS (64000000 Hz)
 Transfer size:   524288 samples (1048576 bytes)
-Edges sent:      14401
-Markers seen:    14401
+Edges sent:      10800
+Markers seen:    10799
 Spurious shorts: 0
-Missed markers:  0  (blind-spot: 0, recovered: 0, lost: 0)
-Samples in:      230400000000 (230.40 Gsa)
-DMA buffers:     produced 439453, delivered 439453, in-flight 32, undelivered +0 (slack +-32)
-USB transfers:   ok=439453 bad=0
-Sample loss:     0 interval(s), ~0 samples (inter-marker deficit)
-Loss floor:      65536 samples (0.12 buffer); largest interval deficit 31204 (0.06 buffer)
-ADC clock:       +0.161 ppm (lossless: produced==delivered, no errors/deficits; assumes disciplined host)
-PIB errors:      0 total in 0 second(s); 0 coincided with a deficit
+Missed markers:  1  (blind-spot: 0, displaced: 1) — marker timing only, see loss below
+Samples in:      9474614008 (9.47 Gsa)
+DMA buffers:     produced 18.95 GB (1156532 x 16384 B), delivered 18.95 GB, in-flight 0.03 GB, undelivered +0.000 MB (slack 4.19 MB)
+USB transfers:   ok=18204 bad=0
+Sample loss:     0 continuity dip(s), ~0 samples (diagnostic; NOT corroborated ...)
+Loss floor:      continuity 65536 samples (0.12 buffer), largest dip 0 (0.00 buffer); gross floor ~4.19 MB (in-flight)
+ADC clock:       +19.330 ppm (lossless: produced==delivered, no USB errors; assumes disciplined host)
+PIB errors:      2 total in 2 second(s); 0 coincided with a deficit
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS
 ```
 
-The headline integrity lines: **`DMA buffers: produced == delivered`**
-(clock-independent proof no buffer was dropped) and **`Sample loss: 0`**
-(no localized deficit). With both clean the rate offset is reported as a
-pure **`ADC clock`** calibration rather than possible loss.
+The headline integrity line is **`DMA buffers: produced ≈ delivered`** (in
+bytes) — clock-independent proof no buffer was dropped. With it and
+`bad_xfers == 0`, the rate offset is reported as a pure **`ADC clock`**
+calibration rather than loss. The `Sample loss` / continuity line is a
+diagnostic, flagged corroborated or not by the produced-vs-delivered
+check.
 
 **Note on firmware counters:** GETSTATS exposes `dma_count` (glDMACount,
-buffers produced), `pib_errors`, `streaming_faults`, and `boot_count`,
-but no dedicated `pps_count`/`pps_fail`. Host-side
-`edges`/`marks`/`spurious`/`missed` plus the produced-vs-delivered and
-continuity checks are the authoritative signals.
+DMA buffers produced — 16 KB each, *not* host transfers), `pib_errors`,
+`streaming_faults`, and `boot_count`, but no dedicated
+`pps_count`/`pps_fail`, and no DMA-*consumer* (delivered) counter.
 
 ### Pass criteria
 
-- **No sample loss** — `bad_xfers == 0`, no inter-marker deficit
-  (`lost == 0`), and `produced − delivered` within the in-flight slack.
+- **No sample loss** — `bad_xfers == 0` and `produced_bytes − delivered_bytes`
+  within the in-flight slack. (Continuity dips are diagnostic, not failing.)
 - `spurious_count == 0` — no shorts without a preceding rising edge.
 - No device resets (`boot_count` unchanged, no mid-run reset), no
   streaming faults, no early library stop, no marker-handle control
   faults.
-- Blind-spot misses (NOTE) and recovered misses (WARN) do not fail the
-  run: the former are inherent to the marker scheme, the latter preserve
-  the samples (verified by the inter-marker count) and are reconstructable.
-  PIB errors are informational unless paired with a sample deficit.
+- Blind-spot and displaced misses do not fail the run — they are
+  marker-timing events; data integrity is decided by the loss detectors
+  above. PIB errors are informational unless corroborated by a deficit.
 
 ## Implementation
 

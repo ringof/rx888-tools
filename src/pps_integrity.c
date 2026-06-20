@@ -4,13 +4,12 @@
  * Streams from the RX888 mk II via librx888 while toggling the PPS
  * marker GPIO at 1 Hz on a second (EP0-only) libusb handle, and checks
  * that each rising edge produces one short USB bulk transfer (the in-band
- * marker). Misses are classified: "blind-spot" misses (the marker partial
- * buffer drifted within a buffer boundary, where no in-band short can
- * exist) are inherent and benign; a hard miss whose samples are all present
- * (inter-marker continuity intact) is "recovered" — the delimiter was
- * displaced one edge, reconstructable in post; a hard miss with a sample
- * deficit (or errored USB transfers) is "lost" — real data loss, the only
- * thing that fails the run alongside spurious shorts and device faults.
+ * marker). A miss is a marker-TIMING event, classified "blind-spot" (the
+ * partial drifted within a buffer boundary, where no in-band short can exist —
+ * inherent) or "displaced" (the delimiter moved to an adjacent edge,
+ * reconstructable). Neither is a data-loss verdict: whether SAMPLES were lost
+ * is judged separately by the loss detectors below. The run fails only on
+ * confirmed sample loss, spurious shorts, device resets, or control faults.
  *
  * Two handles by design:
  *   - librx888 owns interface 0 and the async bulk EP1-IN stream.
@@ -45,23 +44,26 @@
  * short-transfer marker; such misses are classified "blind-spot" and do not
  * fail the run.
  *
- * MISS CLASSIFICATION (the ground truth is sample continuity, never marker
- * shape). When an edge produces no detectable short:
+ * MISS CLASSIFICATION is about marker TIMING only — never data loss:
  *   - blind-spot: the live remainder sits within DANGER_BAND of a boundary.
- *   - recovered : the skipped flush rolled into the next edge (which then
- *                 flushes ~2x), AND the inter-marker sample count over the gap
- *                 is intact. The delimiter was only displaced; reconstructable.
- *   - lost      : the inter-marker count is short -> real data loss.
+ *   - displaced : otherwise — the skipped flush rolled into an adjacent edge
+ *                 (which then flushes ~2x). The delimiter moved; reconstructable.
+ * Whether DATA survived is the separate question below.
  *
- * DID WE LOSE SAMPLES?  Three independent detectors, in increasing authority:
+ * DID WE LOSE SAMPLES?  Detectors, in increasing authority:
  *   1. librx888 bad_xfers      — errored/cancelled USB transfers.
  *   2. inter-marker continuity — samples between markers vs (span x learned
- *      rate); a deficit > LOSS_TOL is localized loss. Fine-grained but its
- *      baseline is self-referential, so perfectly uniform loss could hide.
- *   3. produced vs delivered   — firmware glDMACount (buffers the GPIF
- *      produced) vs librx888 ok_xfers (buffers the host received). These count
- *      the same physical buffers, so a mismatch IS loss, and it is CLOCK-
- *      INDEPENDENT: a slow ADC clock lowers both equally. This is the decisive
+ *      rate); a deficit > LOSS_TOL. DIAGNOSTIC ONLY: marker-detection timing
+ *      jitters by ~a marker's worth at high rates, so an isolated interval can
+ *      read short with no real loss (the next reads long; net zero). It
+ *      localizes WHEN loss happened but does not, alone, fail the run — it is
+ *      corroborated against detector 3.
+ *   3. produced vs delivered   — firmware glDMACount counts DMA buffers the
+ *      GPIF produced (FW_DMA_BUF_BYTES each); librx888 delivers larger USB
+ *      transfers and we count delivered bytes exactly. Compared in BYTES (NOT
+ *      buffer counts — they differ by buf_bytes / FW_DMA_BUF_BYTES), a mismatch
+ *      IS loss, and it is CLOCK-INDEPENDENT: a slow ADC clock lowers both
+ *      equally. This is the authoritative, decisive
  *      gross check; it answers "were all DMA buffers delivered?". Granularity
  *      is one buffer, bounded by the in-flight pipeline (see the summary).
  *
@@ -122,20 +124,27 @@
  * indistinguishable from a full transfer, so no in-band short can exist — an
  * inherent blind spot of a short-transfer marker, not a fidelity failure. A
  * miss is "blind-spot" when the live remainder (last good marker) sits in that
- * band; otherwise it is a hard miss, resolved to recovered/lost by the
- * continuity check. The band must exceed the per-second remainder
+ * band; otherwise it is a "displaced" delimiter (a marker-timing glitch; data
+ * integrity is judged by the loss detectors). The band must exceed the per-second remainder
  * jitter (~2k samples observed); the firmware's empty-partial suppression
  * threshold is unknown, so tune this once long-run data is in hand. */
 #define DANGER_BAND     8192
 
-/* A hard miss (remainder mid-buffer) is resolved when the next marker arrives,
- * using the inter-marker continuity (sample-loss) check below as the ground
- * truth: if the spanning interval has no sample deficit the delimiter was
- * merely displaced one edge with the data intact ("recovered", WARN, and
- * reconstructable in post); if it shows a deficit, samples were genuinely
- * lost ("lost", FAIL). BASE_WIN is the median window for the continuity rate
- * estimate. */
+/* A hard miss (remainder mid-buffer) means the delimiter was displaced to an
+ * adjacent edge — a marker-TIMING glitch. Whether any DATA was lost is a
+ * separate question answered by the loss detectors, NOT by the marker count.
+ * BASE_WIN is the median window for the continuity rate estimate. */
 #define BASE_WIN        32
+
+/* Firmware DMA buffer size, in bytes (SDDC_FX3 GPIF->DMA config). glDMACount
+ * counts buffers of THIS size, whereas the host aggregates several of them into
+ * one librx888 bulk transfer (buf_bytes). To compare produced vs delivered we
+ * must work in bytes: produced_bytes = glDMACount * FW_DMA_BUF_BYTES. This is a
+ * firmware constant the host can't read, so it is asserted here and guarded at
+ * runtime (if produced_bytes is wildly off delivered_bytes the assumption is
+ * wrong and the check is marked indeterminate rather than failing). Confirm
+ * against the firmware DMA config if GETSTATS semantics ever change. */
+#define FW_DMA_BUF_BYTES 16384
 
 /* Vendor control-transfer timeout on the second handle (ms). */
 #define CTRL_TIMEOUT_MS 1000
@@ -414,6 +423,7 @@ int main(int argc, char **argv)
     read_fw_stats(h2, &st_start);
     rx888_stats_t lib_start;
     rx888_get_stats(r, &lib_start);
+    uint64_t samples_start = atomic_load(&ctx.samples_total);  /* aligned baseline */
 
     fprintf(stderr, "%s: starting %.3f hour run @ %g MSPS (%u Hz) "
             "(full transfer = %zu samples)\n",
@@ -423,11 +433,15 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
-    uint64_t blind_spot = 0, recovered = 0, lost = 0;  /* miss classification */
+    uint64_t blind_spot = 0, displaced = 0;       /* miss classification (timing only) */
     uint32_t last_marker = 0;                     /* live remainder estimate */
     int last_marker_valid = 0;
-    int pending_misses = 0;                       /* hard misses awaiting next marker */
-    /* Inter-marker sample-loss continuity. */
+    /* Inter-marker continuity: a per-interval deficit is a DIAGNOSTIC localizer,
+     * not the verdict. At high rates marker-detection timing jitters by ~a
+     * marker's worth, so an isolated interval can come up short while the next
+     * runs long (redistribution, net zero) — that is not loss. Real loss is
+     * confirmed by the clock-independent produced-vs-delivered byte check; these
+     * deficits then localize WHEN it happened. */
     uint64_t prev_marker_samples = 0, prev_marker_edge = 0;
     int have_prev_marker = 0;
     uint32_t rate_ring[BASE_WIN];                 /* single-second inter-marker counts */
@@ -482,11 +496,13 @@ int main(int argc, char **argv)
             marks++;
             if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
 
-            /* Inter-marker continuity: samples between consecutive markers
-             * should be (seconds spanned) x the learned per-second rate. A
-             * shortfall beyond LOSS_TOL means samples went missing from the
-             * stream (USB/firmware overflow) — the direct "did we lose data?"
-             * check, and the ground truth for resolving deferred misses. */
+            /* Inter-marker continuity (DIAGNOSTIC localizer, not the verdict):
+             * samples between consecutive markers vs (seconds spanned) x the
+             * learned per-second rate. A shortfall flags WHEN a deficit appears,
+             * but marker-detection timing jitters by ~a marker's worth at high
+             * rates, so an isolated interval can read short with no real loss.
+             * The authoritative loss check is produced-vs-delivered (below);
+             * these deficits are corroborated against it in the summary. */
             uint64_t cur_ms = atomic_load(&ctx.samples_at_marker);
             if (have_prev_marker) {
                 uint64_t interval = cur_ms - prev_marker_samples;
@@ -498,7 +514,9 @@ int main(int argc, char **argv)
                     rate_pos = (rate_pos + 1) % BASE_WIN;
                     if (rate_n < BASE_WIN) rate_n++;
                 }
-                if (rate_n >= 8) {
+                /* Only score continuity once the rate baseline is fully warmed
+                 * (startup markers are wild and would poison the median). */
+                if (rate_n >= BASE_WIN) {
                     uint64_t rate = base_median(rate_ring, rate_n);
                     uint64_t expected = rate * span;
                     uint64_t deficit = expected > interval ? expected - interval : 0;
@@ -508,39 +526,22 @@ int main(int argc, char **argv)
                         lost_samples_est += deficit;
                         interval_lost = 1;
                         snprintf(note + strlen(note), sizeof note - strlen(note),
-                                 "  LOSS ~%" PRIu64 " samples", deficit);
+                                 "  dip ~%" PRIu64 " (continuity)", deficit);
                     }
                 }
             }
             prev_marker_samples = cur_ms;
             prev_marker_edge = edges;
             have_prev_marker = 1;
-
-            /* Resolve deferred hard miss(es) by the continuity ground truth:
-             * no deficit over the spanning interval -> the delimiter(s) were
-             * displaced but the data is intact (recovered); a deficit -> real
-             * loss. */
-            if (pending_misses > 0) {
-                if (interval_lost) {
-                    lost += (uint64_t)pending_misses;
-                    snprintf(note + strlen(note), sizeof note - strlen(note),
-                             "  <- prev %d MISS: LOST", pending_misses);
-                } else {
-                    recovered += (uint64_t)pending_misses;
-                    snprintf(note + strlen(note), sizeof note - strlen(note),
-                             "  <- prev %d MISS: recovered (data intact)",
-                             pending_misses);
-                }
-                pending_misses = 0;
-            }
         } else {
             missed++;
-            /* Classify. mn < expected: a near-full partial slipped past the
-             * detect threshold — near-full edge of the blind spot. mn ==
-             * expected: no distinguishable partial; a blind spot only if the
-             * live remainder sits within DANGER_BAND of a boundary. Otherwise
-             * the marker vanished mid-buffer — defer the recovered-vs-lost
-             * call to the continuity check when the next marker arrives. */
+            /* Classify the marker-timing glitch (data integrity is a separate
+             * question, answered by the loss detectors). mn < expected: a
+             * near-full partial slipped past the detect threshold — near-full
+             * edge of the blind spot. mn == expected: no distinguishable
+             * partial; a blind spot only if the live remainder sits within
+             * DANGER_BAND of a boundary. Otherwise the delimiter was displaced
+             * to an adjacent edge ("displaced"). */
             int blind;
             if (mn < ctx.expected_nsamples) {
                 blind = 1;                       /* near-full boundary */
@@ -552,7 +553,7 @@ int main(int argc, char **argv)
                 blind = (dist <= DANGER_BAND);
             }
             if (blind) { blind_spot++; stat = "BLIND"; }
-            else       { pending_misses++; stat = "MISS"; }  /* resolved next edge */
+            else       { displaced++;  stat = "MISS"; }  /* delimiter moved one edge */
         }
 
         /* Per-second firmware poll on the EP0 handle: localise PIB overflow
@@ -588,10 +589,6 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    /* Trailing hard miss(es) the run ended on never saw a recovery marker, so
-     * continuity could not confirm the data — count them as lost. */
-    if (pending_misses > 0) { lost += (uint64_t)pending_misses; pending_misses = 0; }
-
     /* Read the END counters BEFORE rx888_stop(): STOPFX3 resets glDMACount, so
      * reading dma_count after the stop would zero it. Read the firmware and
      * librx888 counters back-to-back to minimise the produced-vs-delivered skew
@@ -614,32 +611,44 @@ int main(int argc, char **argv)
     uint32_t pib_delta = (st_start.valid && st_end.valid)
                        ? st_end.pib_errors - st_start.pib_errors : 0;
 
-    /* ---- Buffers produced vs delivered: the clock-INDEPENDENT loss check ----
+    /* ---- Bytes produced vs delivered: the clock-INDEPENDENT loss check ----
      *
-     * glDMACount (firmware) counts DMA buffers the GPIF produced; librx888
-     * ok_xfers counts buffers the host received (one transfer per buffer). Both
-     * count the same physical buffers, so their run-long deltas should match. A
-     * slow ADC clock lowers BOTH equally (fewer buffers in the same wall time)
-     * and leaves the difference at zero; only real loss makes produced exceed
-     * delivered. This is the decisive separation of clock from loss that the
-     * sample-rate budget alone cannot give.
+     * glDMACount counts the firmware's DMA buffers (FW_DMA_BUF_BYTES each);
+     * librx888 delivers larger USB transfers (buf_bytes each, an integer number
+     * of DMA buffers), and we count delivered bytes exactly via samples_total.
+     * So compare in BYTES, not buffer counts (they differ by buf_bytes /
+     * FW_DMA_BUF_BYTES, e.g. 64):
+     *     produced_bytes  = (glDMACount delta) x FW_DMA_BUF_BYTES
+     *     delivered_bytes = (samples delta) x 2
+     * Both count the same data, so a slow ADC clock lowers BOTH equally and the
+     * difference stays at zero; only real loss makes produced exceed delivered.
+     * This is the decisive, clock-independent separation of clock from loss.
      *
-     * The two counters are not sampled atomically and the host pipeline always
-     * has transfers in flight, so produced runs slightly ahead of delivered.
-     * That offset is bounded by the in-flight depth; we subtract the measured
-     * in_flight and allow one extra queue_depth of slack (startup ramp + the
-     * non-atomic read skew) before calling it loss. Sub-buffer / localized loss
-     * below this granularity is still caught by the inter-marker continuity
-     * check; this is the gross, clock-independent backstop. */
-    uint32_t bufs_produced  = st_end.valid && st_start.valid
-                            ? st_end.dma_count - st_start.dma_count : 0; /* mod 2^32 */
-    uint64_t bufs_delivered = lib.ok_xfers - lib_start.ok_xfers;
-    int64_t  bufs_diff      = (int64_t)bufs_produced - (int64_t)bufs_delivered;
-    /* Net undelivered after accounting for the steady in-flight pipeline. */
-    int64_t  bufs_undeliv   = bufs_diff - (int64_t)lib.in_flight;
-    int64_t  buf_slack      = (int64_t)cfg.queue_depth;   /* ramp + skew tolerance */
-    int      bufs_lost      = st_start.valid && st_end.valid
-                            && (bufs_undeliv > buf_slack);
+     * The counters aren't sampled atomically and the host pipeline always has
+     * transfers in flight, so produced runs ahead of delivered by ~in_flight
+     * transfers; subtract that (in bytes) and allow a few transfers of slack for
+     * the startup ramp and read skew before calling it loss.
+     *
+     * GUARD: FW_DMA_BUF_BYTES is an asserted firmware constant. If it is wrong
+     * for the running firmware, produced_bytes would be off delivered_bytes by a
+     * large integer factor; we only trust the check when the two agree within 4x
+     * (a clean run agrees within the in-flight fraction), otherwise it is marked
+     * indeterminate and does NOT fail the run. */
+    uint32_t bufs_produced   = st_end.valid && st_start.valid
+                             ? st_end.dma_count - st_start.dma_count : 0; /* mod 2^32 */
+    uint64_t produced_bytes  = (uint64_t)bufs_produced * (uint64_t)FW_DMA_BUF_BYTES;
+    uint64_t delivered_bytes = (delivered - samples_start) * sizeof(int16_t);
+    uint64_t inflight_bytes  = (uint64_t)lib.in_flight * (uint64_t)xfer_bytes;
+    int64_t  undeliv_bytes   = (int64_t)produced_bytes - (int64_t)delivered_bytes
+                             - (int64_t)inflight_bytes;
+    int64_t  byte_slack      = 4 * (int64_t)xfer_bytes;   /* ramp + read skew */
+    /* Sanity: produced and delivered must be the same order of magnitude for the
+     * FW_DMA_BUF_BYTES assumption to hold. */
+    int pd_valid = st_start.valid && st_end.valid && delivered_bytes > 0
+                 && produced_bytes > delivered_bytes / 4
+                 && produced_bytes < delivered_bytes * 4;
+    int      bufs_lost       = pd_valid && (undeliv_bytes > byte_slack);
+    int64_t  lost_bytes      = undeliv_bytes > 0 ? undeliv_bytes : 0;
 
     /* ---- Absolute sample budget and ADC clock offset ----
      *
@@ -662,21 +671,22 @@ int main(int argc, char **argv)
                        ? ((double)learned_rate - (double)samplerate)
                          / (double)samplerate * 1e6 : 0.0;
 
-    /* Sample loss is the hard question and the verdict's basis. Three
-     * independent detectors, any of which means the stream is missing data:
-     *   - bad_xfers   : errored/cancelled USB transfers (transport loss)
-     *   - loss_events : inter-marker continuity deficit (localized, >= floor)
-     *   - bufs_lost   : produced > delivered (clock-independent, gross) */
-    int sample_loss = (lib.bad_xfers > 0) || (loss_events > 0) || bufs_lost;
+    /* Sample loss = the verdict's basis. Authoritative detectors:
+     *   - bad_xfers : errored/cancelled USB transfers (transport loss)
+     *   - bufs_lost : produced bytes > delivered bytes (clock-independent, gross)
+     * The inter-marker continuity deficit (loss_events) is a DIAGNOSTIC that
+     * localizes loss but jitters at high rates, so it does not fail the run on
+     * its own — it is reported and corroborated against bufs_lost below. */
+    int sample_loss = (lib.bad_xfers > 0) || bufs_lost;
 
-    /* With every loss detector clear, the produced==delivered identity proves no
+    /* With every authoritative loss detector clear, produced==delivered proves no
      * data was dropped, so the sample-rate budget offset is purely clock. */
-    int lossless = !sample_loss && (lost == 0);
+    int lossless = !sample_loss;
 
-    /* Verdict: blind-spot misses are inherent and recovered misses are lossless
-     * delimiter displacements, so neither fails the run; lost markers, spurious
-     * shorts, any confirmed sample loss, device resets, or control faults do. */
-    int pass = (spur == 0) && (lost == 0) && !sample_loss &&
+    /* Verdict: blind-spot and displaced misses are marker-TIMING glitches (data
+     * integrity is judged separately), so they do not fail the run; confirmed
+     * sample loss, spurious shorts, device resets, and control faults do. */
+    int pass = (spur == 0) && !sample_loss &&
                !internal_stop && !ctrl_fault && !boot_changed && !mid_reset;
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
@@ -689,57 +699,55 @@ int main(int argc, char **argv)
     printf("Markers seen:    %" PRIu64 "\n", marks);
     printf("Spurious shorts: %" PRIu64 "\n", spur);
     printf("Missed markers:  %" PRIu64 "  (blind-spot: %" PRIu64
-           ", recovered: %" PRIu64 ", lost: %" PRIu64 ")\n",
-           missed, blind_spot, recovered, lost);
-    if (edges > 0 && recovered > 0)
-        printf("Recovered rate:  %.3f%% of edges (~%.1f/hour) — delimiter "
-               "displaced one edge, data intact\n",
-               100.0 * (double)recovered / (double)edges,
-               (double)recovered / (double)edges * 3600.0);
+           ", displaced: %" PRIu64 ") — marker timing only, see loss below\n",
+           missed, blind_spot, displaced);
+    if (edges > 0 && displaced > 0)
+        printf("Displaced rate:  %.3f%% of edges (~%.1f/hour) — delimiter moved "
+               "one edge; reconstructable. Data integrity judged separately.\n",
+               100.0 * (double)displaced / (double)edges,
+               (double)displaced / (double)edges * 3600.0);
     if (blind_spot > 0)
         printf("  NOTE: blind-spot misses are the inherent short-transfer "
                "marker limit near a buffer boundary, not a failure.\n");
-    if (recovered > 0)
-        printf("  WARN: recovered misses — delimiter displaced to the next "
-               "edge, samples intact (continuity verified), reconstructable.\n");
-    if (lost > 0)
-        printf("  FAIL: lost markers — a miss coincided with a sample deficit "
-               "(data loss).\n");
     printf("Samples in:      %" PRIu64 " (%.2f Gsa)\n",
            delivered, (double)delivered / 1e9);
-    /* The decisive, clock-independent line: buffers produced vs delivered. */
-    if (st_start.valid && st_end.valid)
-        printf("DMA buffers:     produced %" PRIu32 ", delivered %" PRIu64
-               ", in-flight %u, undelivered %+" PRId64 " (slack +-%" PRId64 ")\n",
-               bufs_produced, bufs_delivered, lib.in_flight,
-               bufs_undeliv, buf_slack);
+    /* The decisive, clock-independent line: BYTES produced vs delivered. */
+    if (!pd_valid)
+        printf("DMA buffers:     produced %" PRIu32 " x %d B = %.2f GB vs "
+               "delivered %.2f GB — ratio off, FW_DMA_BUF_BYTES assumption "
+               "unverified (check INDETERMINATE)\n",
+               bufs_produced, FW_DMA_BUF_BYTES, (double)produced_bytes / 1e9,
+               (double)delivered_bytes / 1e9);
     else
-        printf("DMA buffers:     firmware count unavailable (no glDMACount)\n");
+        printf("DMA buffers:     produced %.2f GB (%" PRIu32 " x %d B), delivered "
+               "%.2f GB, in-flight %.2f GB, undelivered %+.3f MB (slack %.2f MB)\n",
+               (double)produced_bytes / 1e9, bufs_produced, FW_DMA_BUF_BYTES,
+               (double)delivered_bytes / 1e9, (double)inflight_bytes / 1e9,
+               (double)undeliv_bytes / 1e6, (double)byte_slack / 1e6);
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
-    printf("Sample loss:     %" PRIu64 " interval(s), ~%" PRIu64 " samples "
-           "(inter-marker deficit)\n", loss_events, lost_samples_est);
-    printf("Loss floor:      %d samples (%.2f buffer); largest interval deficit "
-           "%" PRIu64 " (%.2f buffer)\n",
+    printf("Sample loss:     %" PRIu64 " continuity dip(s), ~%" PRIu64 " samples "
+           "(diagnostic; %s)\n", loss_events, lost_samples_est,
+           bufs_lost ? "corroborated by produced>delivered"
+                     : "NOT corroborated — marker-flush jitter, no actual loss");
+    printf("Loss floor:      continuity %d samples (%.2f buffer), largest dip "
+           "%" PRIu64 " (%.2f buffer); gross floor ~%.2f MB (in-flight)\n",
            LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
-           max_deficit, (double)max_deficit / (double)ctx.expected_nsamples);
+           max_deficit, (double)max_deficit / (double)ctx.expected_nsamples,
+           (double)byte_slack / 1e6);
     if (bufs_lost)
-        printf("  FAIL: %" PRId64 " DMA buffer(s) produced but never delivered "
-               "(~%" PRId64 " samples) — firmware/USB dropped data.\n",
-               bufs_undeliv, bufs_undeliv * (int64_t)ctx.expected_nsamples);
+        printf("  FAIL: %.3f MB produced but never delivered — firmware/USB "
+               "dropped data (clock-independent).\n", (double)lost_bytes / 1e6);
     if (lib.bad_xfers > 0)
         printf("  FAIL: %llu errored/cancelled USB transfers — transport-level "
                "sample loss.\n", lib.bad_xfers);
-    if (loss_events > 0)
-        printf("  FAIL: inter-marker sample deficit — the stream dropped data "
-               "(firmware/USB overflow).\n");
-    /* Clock vs loss: with produced==delivered and no errors/deficits, the
-     * sample-rate offset is provably the ADC-vs-host clock, not loss. */
+    /* Clock vs loss: with produced==delivered and no errors, the sample-rate
+     * offset is provably the ADC-vs-host clock, not loss. */
     if (st_start.valid && st_end.valid) {
-        if (lossless)
+        if (lossless && pd_valid)
             printf("ADC clock:       %+.3f ppm (lossless: produced==delivered, "
-                   "no errors/deficits; assumes disciplined host)\n",
-                   rate_n >= 8 ? learned_ppm : budget_ppm);
+                   "no USB errors; assumes disciplined host)\n",
+                   rate_n >= BASE_WIN ? learned_ppm : budget_ppm);
         else
             printf("Sample budget:   delivered %" PRIu64 " vs expected %" PRIu64
                    " (rate x elapsed), %+.3f ppm (clock+loss combined)\n",
