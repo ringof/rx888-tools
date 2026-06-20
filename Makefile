@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord fx3_cmd
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -106,6 +106,15 @@ rx888_stream: $(SRCDIR)/rx888_stream.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/rx888_stream.c \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN' $(SAN_LDFLAGS) -o $@
 
+# pps_integrity: PPS in-band marker fidelity test. Statically linked against
+# librx888.a (no .so deployment concern) and libusb directly for its second
+# EP0-only handle. CFLAGS_STREAM lacks LIBUSB_CFLAGS, so add them — this file
+# includes libusb.h itself.
+pps_integrity: $(SRCDIR)/pps_integrity.c $(LIBRX_A) $(LIBRX_HDR)
+	$(CC) $(CFLAGS_STREAM) $(LIBUSB_CFLAGS) -I$(INCDIR) \
+	    $(SRCDIR)/pps_integrity.c \
+	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -o $@
+
 rx888_dsp: $(SRCDIR)/rx888_dsp.c
 	$(CC) $(CFLAGS_DSP) -I$(INCDIR) $< -o $@ -lm -lpthread
 
@@ -137,7 +146,7 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream fx3_cmd
+check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity
 	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
 	if [ "$$present" = "1" ]; then \
 	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
@@ -146,7 +155,8 @@ check: $(TEST_BINS) rx888_stream fx3_cmd
 	set -e; \
 	$(TESTS_DIR)/librx888_api; \
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
-	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
+	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd; \
+	$(TESTS_DIR)/pps_integrity_smoke.sh ./pps_integrity
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.

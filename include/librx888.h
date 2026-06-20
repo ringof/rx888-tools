@@ -180,6 +180,14 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
 int rx888_is_running(const rx888_t *r);
 
 /*
+ * Bytes per full bulk transfer (req_packets * negotiated max_packet).
+ * A short transfer (fewer bytes) is how the firmware's in-band markers
+ * appear to the sample callback. Valid only after rx888_start() has
+ * sized the transfer ring; returns 0 before then, or for a NULL handle.
+ */
+size_t rx888_get_transfer_bytes(const rx888_t *r);
+
+/*
  * Format a libusb error code as a human-readable string.
  * Returned pointer is to static storage; do not free.
  */

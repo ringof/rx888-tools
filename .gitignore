@@ -4,6 +4,7 @@
 /rx888_dsp
 /iqrecord
 /fx3_cmd
+/pps_integrity
 
 # Library + pkg-config build outputs
 librx888.so

@@ -454,6 +454,11 @@ int rx888_is_running(const rx888_t *r) {
     return atomic_load(&r->stop_flag) ? 0 : 1;
 }
 
+size_t rx888_get_transfer_bytes(const rx888_t *r) {
+    /* buf_bytes is computed in rx888_start(); 0 before the ring is sized. */
+    return r ? (size_t)r->buf_bytes : 0;
+}
+
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {
     if (!out) return LIBUSB_ERROR_INVALID_PARAM;
     *out = NULL;

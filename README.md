@@ -58,6 +58,7 @@ make rx888_stream    # links librx888.so
 make rx888_dsp
 make iqrecord
 make fx3_cmd         # standalone; links libusb directly (not librx888)
+make pps_integrity   # PPS marker fidelity test; static-links librx888.a
 ```
 
 ---
@@ -88,8 +89,8 @@ sudo make uninstall
 ```
 
 This installs `librx888.so`, `librx888.a`, `librx888.pc`, `librx888.h`,
-the four binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`), the
-firmware blob, and the udev rule. After installing:
+the five binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`,
+`pps_integrity`), the firmware blob, and the udev rule. After installing:
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -173,6 +174,7 @@ Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 | `rx888_dsp`    | DSP decimation (4:1) | int16 real on stdin | cf32 IQ on stdout or FIFO |
 | `iqrecord`     | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
 | `fx3_cmd`      | Vendor-command diagnostics CLI | RX888 device | `PASS`/`FAIL` + details |
+| `pps_integrity` | PPS in-band marker fidelity test | RX888 device | per-second status + `PASS`/`FAIL` |
 
 Per-program docs in `doc/`:
 
@@ -181,6 +183,7 @@ Per-program docs in `doc/`:
 - `doc/rx888_dsp.md` / `doc/rx888_dsp_arch.md`
 - `doc/iqrecord.md`
 - `doc/fx3_cmd.md` — vendor-command diagnostics CLI
+- `doc/pps_integrity.md` — PPS marker fidelity test
 - `doc/gr-rx888/` — design plan for the GNU Radio source block
 
 ### fx3_cmd — diagnostics CLI

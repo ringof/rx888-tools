@@ -1,8 +1,8 @@
 # `pps_integrity` — long-duration PPS marker fidelity tool
 
-> Implementation plan. Refined from `PLAN_PPS_INTEGRITY.md` against the
-> current tree, with the open questions resolved. See "Decisions" below
-> for what changed from the original draft.
+> Refined from `PLAN_PPS_INTEGRITY.md` against the current tree, with the
+> open questions resolved, then implemented as `src/pps_integrity.c`.
+> See "Decisions" below for what changed from the original draft.
 
 ## Problem
 
@@ -32,16 +32,16 @@ edge.
 
 ## Decisions (resolving the draft's open questions)
 
-1. **Full-transfer size** — add a one-line read-only getter to
+1. **Full-transfer size** — added a one-line read-only getter to
    librx888 (`rx888_get_transfer_bytes()`) rather than runtime-learning
    or hard-coding. The value `buf_bytes = req_packets * ep.max_packet`
-   is already computed and stored in `struct rx888` (`librx888.c:329`,
-   set in `rx888_start()` at line 543). Exposing it is the smallest
-   correct API surface, is robust to USB 2.0/3.0 negotiation and any
-   `req_packets`, and is useful to any consumer that cares about
-   transfer boundaries. **Caveat:** `buf_bytes` is only populated after
-   `rx888_start()`; the getter returns 0 before then, so the tool must
-   read it after `start()` and before arming the first GPIO edge.
+   is already computed and stored in `struct rx888`, set in
+   `rx888_start()`. Exposing it is the smallest correct API surface, is
+   robust to USB 2.0/3.0 negotiation and any `req_packets`, and is
+   useful to any consumer that cares about transfer boundaries.
+   **Caveat:** `buf_bytes` is only populated after `rx888_start()`; the
+   getter returns 0 before then, so the tool reads it after `start()`
+   and before arming the first GPIO edge.
 
 2. **GETSTATS decoder** — copy the ~25-line decode into
    `pps_integrity.c` rather than refactoring `fx3_stats`. The firmware
@@ -146,13 +146,13 @@ cadence skips.
 ```
 === PPS INTEGRITY RESULT ===
 Duration:        04:00:01
+Sample rate:     64 MSPS
+Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      14401
 Markers seen:    14401
-FW pps_count:    14401
-FW pps_fail:     0
 Spurious shorts: 0
 Missed markers:  0
-PIB errors:      0
+PIB errors:      0 (NOTE, informational)
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS
@@ -161,14 +161,20 @@ Result: PASS
 GETSTATS is read once at start and once at end; the report shows the
 delta and flags a `boot_count` mismatch (device reset between reads).
 
+**Note on firmware counters:** the current firmware GETSTATS payload
+(`src/fx3_cmd/fx3_stats.h`) does *not* expose dedicated `pps_count` /
+`pps_fail` fields, so the tool reports only what exists — `pib_errors`,
+`streaming_faults`, and `boot_count`. Host-side `edges`/`marks`/
+`spurious`/`missed` are the authoritative pass/fail signals.
+
 ### Pass criteria
 
 - `spurious_count == 0` — no shorts without a preceding rising edge.
-- `missed_count == 0` — every edge produced a marker.
-- `markers_seen` within ±2 of `edges_sent` — startup/shutdown tolerance.
-- No device resets (`boot_count` unchanged), no streaming faults.
-- PIB errors and firmware `pps_count` are informational (NOTE), not
-  FAIL.
+- `markers_seen` within ±2 of `edges_sent` — every edge produced a
+  marker, modulo startup/shutdown tolerance (this subsumes "no misses").
+- No device resets (`boot_count` unchanged), no streaming faults, no
+  early library stop, no marker-handle control faults.
+- PIB errors are informational (NOTE), not FAIL.
 
 ## Implementation
 
