@@ -174,6 +174,29 @@ line annotates `prev MISS: MERGE`/`ANOM`.
 `-v` adds a `minxfer` column (smallest transfer that second) so the
 classification is auditable line by line.
 
+### Sample-loss accounting
+
+Marker classification answers "is the delimiter there?" — not "did we
+lose samples?" Those are checked directly:
+
+- **Inter-marker continuity.** The samples delivered between two
+  consecutive markers must equal `(seconds spanned) × rate`, where `rate`
+  is the running median of single-second inter-marker counts. Anchoring
+  to the marker (a fixed point *in the stream*) removes host-window
+  boundary jitter; within ~1 s clock drift is negligible, so a dropped
+  DMA buffer (~524288 samples) is a glaring deficit (`LOSS_TOL` absorbs
+  the marker-flush jitter). This also **cross-validates MERGE**: a merge
+  spans 2 s, so its interval must equal 2× a normal one — if it is short,
+  the "merge" actually dropped data.
+- **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
+  transport-level loss, surfaced in the summary.
+- **Firmware PIB errors** — overflow events. PIB > 0 *with* an
+  inter-marker deficit means the overflow lost host-visible samples;
+  PIB > 0 with no deficit recovered without loss (NOTE).
+
+Any confirmed loss (`bad_xfers > 0` or an inter-marker deficit) fails the
+run.
+
 ### Main thread — 1 Hz toggle loop
 
 1. `clock_gettime(CLOCK_REALTIME)` — wall-clock timestamp per edge.
@@ -209,8 +232,11 @@ Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      14401
 Markers seen:    14401
 Spurious shorts: 0
-Missed markers:  0  (blind-spot: 0, anomalous: 0)
-PIB errors:      0 (NOTE, informational)
+Missed markers:  0  (blind-spot: 0, merge: 0, anomalous: 0)
+Samples in:      230400000000 (230.40 Gsa)
+USB transfers:   ok=219726 bad=0
+Sample loss:     0 interval(s), ~0 samples (inter-marker deficit)
+PIB errors:      0
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS
@@ -227,14 +253,15 @@ delta and flags a `boot_count` mismatch (device reset between reads).
 
 ### Pass criteria
 
-- `anomalous == 0` — no marker lost without an oversized recovery
-  (i.e. no possible data loss).
+- `anomalous == 0` — no marker lost without an oversized recovery.
+- **No sample loss** — `bad_xfers == 0` and no inter-marker deficit.
 - `spurious_count == 0` — no shorts without a preceding rising edge.
 - No device resets (`boot_count` unchanged), no streaming faults, no
   early library stop, no marker-handle control faults.
 - Blind-spot misses (NOTE) and merge misses (WARN) do not fail the run:
   the former are inherent to the marker scheme, the latter preserve the
-  samples and are reconstructable. PIB errors are likewise informational.
+  samples (verified by the inter-marker count) and are reconstructable.
+  PIB errors are informational unless paired with a sample deficit.
 
 ## Implementation
 

@@ -80,6 +80,15 @@
 
 #define MARKER_DWELL_MS 10      /* rising-edge high time before falling edge */
 
+/* Sample-loss continuity: the samples delivered between two consecutive
+ * markers should equal (seconds spanned) x the per-second sample rate, which
+ * we learn as the running median of single-second inter-marker counts. Over a
+ * 1 s interval clock drift is negligible, so a dropped DMA buffer (~524288
+ * samples) is a glaring deficit. LOSS_TOL absorbs the marker-flush jitter
+ * (the partial size varies ~+/-12k, so the interval boundary does too) while
+ * staying far below a buffer's worth. */
+#define LOSS_TOL        65536
+
 /* GETSTATS payload (see src/fx3_cmd/fx3_stats.h — the firmware layout
  * authority; keep these offsets in sync with it). */
 #define GETSTATS_LEN     30
@@ -90,6 +99,8 @@ struct pps_ctx {
     _Atomic int      marker_arrived;    /* set by the first short in the window */
     _Atomic uint64_t spurious;          /* shorts with no edge / extra shorts */
     _Atomic uint32_t min_nsamples;      /* smallest transfer seen this window */
+    _Atomic uint64_t samples_total;     /* cumulative samples delivered */
+    _Atomic uint64_t samples_at_marker; /* samples_total snapshot at last marker */
     size_t           expected_nsamples; /* full-transfer sample count */
 };
 
@@ -120,13 +131,20 @@ static void sample_cb(const int16_t *samples, size_t nsamples, void *user)
            !atomic_compare_exchange_weak(&c->min_nsamples, &cur, n32))
         ;
 
+    /* Running sample count for the inter-marker continuity (loss) check. */
+    uint64_t total = atomic_fetch_add(&c->samples_total, nsamples) + nsamples;
+
     if (nsamples + SHORT_MARGIN < c->expected_nsamples) {
         /* A short transfer. If we armed for a marker, the first short
          * closes the window; any further short this second is spurious. */
-        if (atomic_exchange(&c->expecting_marker, 0))
+        if (atomic_exchange(&c->expecting_marker, 0)) {
             atomic_store(&c->marker_arrived, 1);
-        else
+            /* Anchor the sample count to this marker (a fixed point in the
+             * stream) so inter-marker deltas are free of host-window jitter. */
+            atomic_store(&c->samples_at_marker, total);
+        } else {
             atomic_fetch_add(&c->spurious, 1);
+        }
     }
 }
 
@@ -321,6 +339,12 @@ int main(int argc, char **argv)
     uint32_t base_ring[BASE_WIN];                 /* recent normal markers */
     int base_n = 0, base_pos = 0;
     int pending_miss = 0;                         /* hard miss awaiting next marker */
+    /* Inter-marker sample-loss continuity. */
+    uint64_t prev_marker_samples = 0, prev_marker_edge = 0;
+    int have_prev_marker = 0;
+    uint32_t rate_ring[BASE_WIN];                 /* single-second inter-marker counts */
+    int rate_n = 0, rate_pos = 0;
+    uint64_t loss_events = 0, lost_samples_est = 0;
     int internal_stop = 0, ctrl_fault = 0;
 
     struct timespec t0;
@@ -360,7 +384,7 @@ int main(int argc, char **argv)
         int arrived = atomic_load(&ctx.marker_arrived);
         uint32_t mn = atomic_load(&ctx.min_nsamples);
         const char *stat = "ok";
-        char note[64]; note[0] = '\0';
+        char note[128]; note[0] = '\0';
         if (arrived) {
             marks++;
             uint32_t marker = (mn == UINT32_MAX) ? 0 : mn;
@@ -388,6 +412,39 @@ int main(int argc, char **argv)
                 if (base_n < BASE_WIN) base_n++;
             }
             if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
+
+            /* Inter-marker continuity: samples between consecutive markers
+             * should be (seconds spanned) x the learned per-second rate. A
+             * shortfall beyond LOSS_TOL means samples went missing from the
+             * stream (USB/firmware overflow) — the direct "did we lose data?"
+             * check, and the cross-validation of MERGE (a merge spans 2 s, so
+             * its interval must equal 2x a normal one to be truly lossless). */
+            uint64_t cur_ms = atomic_load(&ctx.samples_at_marker);
+            if (have_prev_marker) {
+                uint64_t interval = cur_ms - prev_marker_samples;
+                uint64_t span = edges - prev_marker_edge;     /* seconds */
+                if (span == 1) {
+                    uint32_t iv = interval > UINT32_MAX ? UINT32_MAX
+                                                        : (uint32_t)interval;
+                    rate_ring[rate_pos] = iv;
+                    rate_pos = (rate_pos + 1) % BASE_WIN;
+                    if (rate_n < BASE_WIN) rate_n++;
+                }
+                if (rate_n >= 8) {
+                    uint64_t rate = base_median(rate_ring, rate_n);
+                    uint64_t expected = rate * span;
+                    if (interval + LOSS_TOL < expected) {
+                        uint64_t deficit = expected - interval;
+                        loss_events++;
+                        lost_samples_est += deficit;
+                        snprintf(note + strlen(note), sizeof note - strlen(note),
+                                 "  LOSS ~%" PRIu64 " samples", deficit);
+                    }
+                }
+            }
+            prev_marker_samples = cur_ms;
+            prev_marker_edge = edges;
+            have_prev_marker = 1;
         } else {
             missed++;
             /* A second miss before the previous one resolved: the prior was
@@ -438,11 +495,22 @@ int main(int argc, char **argv)
     int boot_changed = (st_start.valid && st_end.valid &&
                         st_start.boot_count != st_end.boot_count);
 
-    /* Verdict is about marker fidelity: blind-spot misses are an inherent,
-     * phase-dependent property of the short-transfer marker and do not fail
-     * the run; anomalous misses (and spurious shorts) do. */
-    int pass = (spur == 0) && (anomalous == 0) && !internal_stop &&
-               !ctrl_fault && !boot_changed;
+    rx888_stats_t lib;
+    rx888_get_stats(r, &lib);
+    uint64_t delivered = atomic_load(&ctx.samples_total);
+    uint32_t pib_delta = (st_start.valid && st_end.valid)
+                       ? st_end.pib_errors - st_start.pib_errors : 0;
+
+    /* Sample loss is the hard question: errored USB transfers (transport
+     * loss) or an inter-marker deficit (firmware/USB overflow) both mean the
+     * stream is missing data. */
+    int sample_loss = (lib.bad_xfers > 0) || (loss_events > 0);
+
+    /* Verdict: blind-spot misses are inherent and merges are recoverable, so
+     * neither fails the run; anomalous misses, spurious shorts, and any
+     * sample loss do. */
+    int pass = (spur == 0) && (anomalous == 0) && !sample_loss &&
+               !internal_stop && !ctrl_fault && !boot_changed;
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
     printf("Duration:        %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "\n",
@@ -473,9 +541,25 @@ int main(int argc, char **argv)
     if (anomalous > 0)
         printf("  FAIL: anomalous misses — marker lost with the remainder "
                "mid-buffer, no oversized recovery (possible data loss).\n");
+    printf("Samples in:      %" PRIu64 " (%.2f Gsa)\n",
+           delivered, (double)delivered / 1e9);
+    printf("USB transfers:   ok=%llu bad=%llu\n",
+           lib.ok_xfers, lib.bad_xfers);
+    printf("Sample loss:     %" PRIu64 " interval(s), ~%" PRIu64 " samples "
+           "(inter-marker deficit)\n", loss_events, lost_samples_est);
+    if (lib.bad_xfers > 0)
+        printf("  FAIL: %llu errored/cancelled USB transfers — transport-level "
+               "sample loss.\n", lib.bad_xfers);
+    if (loss_events > 0)
+        printf("  FAIL: inter-marker sample deficit — the stream dropped data "
+               "(firmware/USB overflow).\n");
     if (st_start.valid && st_end.valid) {
-        printf("PIB errors:      %u (NOTE, informational)\n",
-               st_end.pib_errors - st_start.pib_errors);
+        printf("PIB errors:      %u%s\n", pib_delta,
+               pib_delta > 0 && loss_events == 0
+                 ? "  (NOTE: overflow flagged but no inter-marker deficit — "
+                   "recovered without host-visible loss)"
+                 : (pib_delta > 0 ? "  (overflow — see sample loss above)"
+                                  : ""));
         printf("Stream faults:   %u\n",
                st_end.streaming_faults - st_start.streaming_faults);
         printf("Boot count:      %s\n",
