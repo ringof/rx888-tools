@@ -268,7 +268,7 @@ library stop, or marker-handle control faults. Blind-spot and displaced
 misses do not (marker timing only); an uncorroborated continuity dip does
 not.
 
-### The loss is caused by marker injection, not throughput (empirical)
+### Marker injection, not throughput, perturbs the stream (and the loss is anomalously large — root cause OPEN)
 
 Measured on real hardware, 3 h each:
 
@@ -278,35 +278,52 @@ Measured on real hardware, 3 h each:
 | `stream_soak` (no marker) | 129.6 MSPS | 259 MB/s | 0 | 0 |
 | `pps_integrity` (1 Hz marker) | 129 MSPS | 258 MB/s | 333 | ~82 MB |
 
-The bare stream sustains **259 MB/s losslessly with zero short transfers**
-(`produced == delivered`, `PIB = 0`, `bad_xfers = 0`), so 129.6 is **not**
-a throughput ceiling — the hardware/USB/host drain it fine. The loss in
-the marker run comes from the **PPS marker injection** itself: the
-firmware's forced partial-buffer commit perturbs the near-capacity DMA→USB
-pipeline and drops buffers around the flush. The direction is conclusive —
-the *lossy* run was at the *lower* throughput (129 < 129.6) *with* the
-marker, while the *higher* bare rate was clean; a drain limit would fail
-the higher rate first.
+Two firm conclusions and one open question:
 
-Implication: the in-band short-transfer marker is **actively harmful at
-high rates**. Prefer an out-of-band PPS epoch (FX3 MCU latching the
-sample/buffer count at the GPIO edge, exposed via GETSTATS) which does not
-touch the data path; with a GPS-disciplined clock it is needed only
-rarely. The in-band marker is best kept as a coarse, low-rate fallback.
+**Firm: it is not a throughput ceiling.** The bare stream sustains 259 MB/s
+losslessly with zero short transfers (`produced == delivered`, `PIB = 0`,
+`bad_xfers = 0`). The direction is conclusive — the *lossy* run was at the
+*lower* throughput (129) *with* the marker, while the *higher* bare rate
+(129.6) was clean; a drain limit would fail the higher rate first. The
+loss is associated with the PPS marker mechanism, not the data rate.
 
-Critically, the sample-rate **budget alone would have missed the loss**:
-with a +28 ppm fast ADC clock and ~30 ppm loss the budget read **−1.2 ppm**,
+**Firm: the budget alone would have missed it.** With a +28 ppm fast ADC
+clock and ~30 ppm loss, the sample-rate budget read **−1.2 ppm** —
 apparently fine. The clock-independent produced-vs-delivered check exposed
-it; the report prints the *implied* clock (`budget + loss added back`) so
-the masking is visible. This is the case the whole loss-accounting design
-exists for.
+it (and prints the *implied* clock, `budget + loss added back`). This is
+the case the whole loss-accounting design exists for.
+
+**OPEN: the loss magnitude says this is a fixable rig artifact, not an
+intrinsic cost of marking.** A correct forced buffer commit costs ~0
+samples (it ships a partial early, then continues). But the measured loss
+is **~140–250 KB per event ≈ 0.5–1 ms of stream lost each time** — ~500×
+longer than a clean commit should take. That is a stall/glitch, not "a
+sample or two," and points at **fixable input conditions, not the in-band
+concept**:
+
+- **Edge quality.** The PPS reaches the FX3 through a 100 kΩ series
+  resistor → a ~4 µs RC edge, which dwells in the input threshold for
+  *hundreds* of clocks at 129.6 MSPS — a textbook way to induce
+  metastability. Untested with a fast/buffered (<1 clock) edge.
+- **Clock-domain crossing.** An asynchronous PPS into the GPIF state
+  machine needs a real (2-flop) synchronizer; "the GPIF is clocked" only
+  means it *samples* the input, and a single sample of an async signal can
+  go metastable. A slow edge makes this far worse. Whether the FX3 GPIF
+  synchronizes CTL inputs before they drive the commit is open.
+
+So this is **not** a verdict that in-band marking is unworkable. The
+investigation sequence is: (1) matched 129 MSPS baseline on the current
+rig; (2) fast/buffered edge; (3) GPIF input-synchronization. If (2)+(3)
+bring the per-marker cost to the expected ~0–2 samples, in-band marking is
+viable — and it is the *finest* time source available (the short
+transfer's length encodes the edge's sample index sample-exactly, with no
+firmware machinery), so it is worth recovering. Until then, the
+out-of-band MCU latch (buffer-level, plus an optional byte-offset for
+sample-exactness) remains the safe fallback.
 
 `-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
-out the marker perturbation at a high rate; `tests/pps_knob_sweep.sh`
-measures whether it does (runs low-rate controls, sweeps `-q` then `-p`,
-picks the least-loss depth, prints a summary). It is a hardware test; see
-the script header for env overrides. The cleaner fix, though, is to move
-PPS off the data path entirely (above).
+out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
+But the real questions are edge quality and input synchronization, above.
 
 ### Main thread — 1 Hz toggle loop
 
