@@ -63,6 +63,7 @@ struct pps_ctx {
     _Atomic int      expecting_marker;  /* armed before each rising edge */
     _Atomic int      marker_arrived;    /* set by the first short in the window */
     _Atomic uint64_t spurious;          /* shorts with no edge / extra shorts */
+    _Atomic uint32_t min_nsamples;      /* smallest transfer seen this window */
     size_t           expected_nsamples; /* full-transfer sample count */
 };
 
@@ -83,6 +84,16 @@ static void sample_cb(const int16_t *samples, size_t nsamples, void *user)
 {
     (void)samples;
     struct pps_ctx *c = user;
+
+    /* Track the smallest transfer this window so -v can show the marker
+     * size (and, on a miss, whether a near-full short slipped past the
+     * threshold vs. no short arriving at all). */
+    uint32_t n32 = nsamples > UINT32_MAX ? UINT32_MAX : (uint32_t)nsamples;
+    uint32_t cur = atomic_load(&c->min_nsamples);
+    while (n32 < cur &&
+           !atomic_compare_exchange_weak(&c->min_nsamples, &cur, n32))
+        ;
+
     if (nsamples + SHORT_MARGIN < c->expected_nsamples) {
         /* A short transfer. If we armed for a marker, the first short
          * closes the window; any further short this second is spurious. */
@@ -151,10 +162,13 @@ static void fmt_wallclock(char *out, size_t n)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [hours] [--rate MSPS] [--firmware FILE]\n"
+        "Usage: %s [hours] [--rate MSPS] [--firmware FILE] [-v]\n"
         "  hours              Run duration in hours (default 4; fractional ok)\n"
         "  --rate MSPS        Sample rate in MSPS (default 16)\n"
         "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
+        "  -v, --verbose      Add a per-second 'minxfer' column (smallest\n"
+        "                     transfer that second, in samples; = the marker\n"
+        "                     size on an ok second)\n"
         "  -h, --help         Show this help\n",
         argv0);
 }
@@ -166,18 +180,21 @@ int main(int argc, char **argv)
     double hours = 4.0;
     unsigned rate_msps = 16;
     const char *firmware_path = NULL;
+    int verbose = 0;
 
     static struct option opts[] = {
         {"rate",     required_argument, 0, 'r'},
         {"firmware", required_argument, 0, 'f'},
+        {"verbose",  no_argument,       0, 'v'},
         {"help",     no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "r:f:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:f:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'r': rate_msps = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'f': firmware_path = optarg; break;
+        case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -252,7 +269,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "%s: starting %.3f hour run @ %u MSPS "
             "(full transfer = %zu samples)\n",
             PROG_NAME, hours, rate_msps, ctx.expected_nsamples);
-    printf("#time             stat   edges  marks  spur  miss\n");
+    printf("#time             stat   edges  marks  spur  miss%s\n",
+           verbose ? "   minxfer" : "");
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
@@ -271,6 +289,7 @@ int main(int argc, char **argv)
 
         /* Arm before the edge so a fast marker is never missed. */
         atomic_store(&ctx.marker_arrived, 0);
+        atomic_store(&ctx.min_nsamples, UINT32_MAX);
         atomic_store(&ctx.expecting_marker, 1);
         if (ctrl_write_u32(h2, (uint8_t)GPIOFX3, base_gpio | PPS_MARKER_BIT) < 0)
             ctrl_fault = 1;
@@ -299,9 +318,15 @@ int main(int argc, char **argv)
             missed++;
             stat = "MISS";
         }
-        printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64 "\n",
+        printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
                (uint64_t)atomic_load(&ctx.spurious), missed);
+        if (verbose) {
+            uint32_t mn = atomic_load(&ctx.min_nsamples);
+            if (mn == UINT32_MAX) printf("   %8s", "-");      /* no transfer */
+            else                  printf("   %8" PRIu32, mn);
+        }
+        printf("\n");
         fflush(stdout);
     }
 

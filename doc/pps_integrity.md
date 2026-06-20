@@ -22,7 +22,7 @@ reader.
 ## Tool
 
 ```
-pps_integrity [hours] [--rate MSPS] [--firmware FILE]   # default: 4 hours, 16 MSPS
+pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-v]   # default: 4 hours, 16 MSPS
 ```
 
 Standalone binary in rx888-tools, statically linked against
