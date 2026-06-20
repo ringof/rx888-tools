@@ -136,14 +136,15 @@
  * BASE_WIN is the median window for the continuity rate estimate. */
 #define BASE_WIN        32
 
-/* Firmware DMA buffer size, in bytes (SDDC_FX3 GPIF->DMA config). glDMACount
- * counts buffers of THIS size, whereas the host aggregates several of them into
- * one librx888 bulk transfer (buf_bytes). To compare produced vs delivered we
- * must work in bytes: produced_bytes = glDMACount * FW_DMA_BUF_BYTES. This is a
- * firmware constant the host can't read, so it is asserted here and guarded at
- * runtime (if produced_bytes is wildly off delivered_bytes the assumption is
- * wrong and the check is marked indeterminate rather than failing). Confirm
- * against the firmware DMA config if GETSTATS semantics ever change. */
+/* Firmware DMA buffer size, in bytes. CONFIRMED 16 KB against the SDDC_FX3
+ * GPIF->DMA config (firmware maintainer, 2026). glDMACount counts buffers of
+ * THIS size, whereas the host aggregates several of them into one librx888 bulk
+ * transfer (buf_bytes; e.g. 1 MB = 64 of these). To compare produced vs
+ * delivered we must work in bytes: produced_bytes = glDMACount * FW_DMA_BUF_BYTES.
+ * The host can't read this at runtime, so it is still guarded below (if
+ * produced_bytes is wildly off delivered_bytes the assumption is stale and the
+ * check is marked indeterminate rather than failing). Revisit if the firmware
+ * DMA config ever changes. */
 #define FW_DMA_BUF_BYTES 16384
 
 /* Vendor control-transfer timeout on the second handle (ms). */

@@ -185,8 +185,8 @@ lose samples?" That is checked by independent detectors:
 1. **Bytes produced vs delivered — the authoritative, clock-independent
    check.** The firmware's `glDMACount` (GETSTATS byte 0) counts the DMA
    buffers the GPIF *produced*. **These are the firmware's small DMA
-   buffers (`FW_DMA_BUF_BYTES`, 16 KB on SDDC_FX3), not the host's 1 MB
-   USB transfers** — the host aggregates ~64 DMA buffers per transfer, so
+   buffers (`FW_DMA_BUF_BYTES` = 16 KB, confirmed against the SDDC_FX3
+   GPIF→DMA config), not the host's 1 MB USB transfers** — the host aggregates ~64 DMA buffers per transfer, so
    `glDMACount` runs ~64× `ok_xfers`. The comparison must therefore be in
    **bytes**, not buffer counts:
    ```
