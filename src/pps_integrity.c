@@ -151,10 +151,11 @@ static void fmt_wallclock(char *out, size_t n)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [hours] [--rate MSPS]\n"
-        "  hours          Run duration in hours (default 4; fractional ok)\n"
-        "  --rate MSPS    Sample rate in MSPS (default 16)\n"
-        "  -h, --help     Show this help\n",
+        "Usage: %s [hours] [--rate MSPS] [--firmware FILE]\n"
+        "  hours              Run duration in hours (default 4; fractional ok)\n"
+        "  --rate MSPS        Sample rate in MSPS (default 16)\n"
+        "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
+        "  -h, --help         Show this help\n",
         argv0);
 }
 
@@ -164,16 +165,19 @@ int main(int argc, char **argv)
 {
     double hours = 4.0;
     unsigned rate_msps = 16;
+    const char *firmware_path = NULL;
 
     static struct option opts[] = {
-        {"rate", required_argument, 0, 'r'},
-        {"help", no_argument,       0, 'h'},
+        {"rate",     required_argument, 0, 'r'},
+        {"firmware", required_argument, 0, 'f'},
+        {"help",     no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "r:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:f:h", opts, NULL)) != -1) {
         switch (c) {
         case 'r': rate_msps = (unsigned)strtoul(optarg, NULL, 10); break;
+        case 'f': firmware_path = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -202,7 +206,8 @@ int main(int argc, char **argv)
 
     rx888_config_t cfg;
     rx888_config_init_default(&cfg);
-    cfg.samplerate = rate_msps * 1000000u;
+    cfg.samplerate    = rate_msps * 1000000u;
+    cfg.firmware_path = firmware_path;  /* NULL: device must already be loaded */
 
     rx888_t *r = NULL;
     int rc = rx888_open(&r, &cfg);
