@@ -438,11 +438,29 @@ targets.
 - **GETSTATS wire format** — copied decoder; keep in sync with
   `src/fx3_cmd/fx3_stats.h` (the firmware layout authority).
 
+## Control: `stream_soak`
+
+`stream_soak` is the no-marker control. It runs the *same* data-integrity
+instrumentation — effective rate from delivered-samples/elapsed-time,
+produced-vs-delivered byte loss, `bad_xfers`, per-second PIB, streaming
+faults, device-reset detection — but injects **no** PPS marker. Two uses:
+
+- It isolates the marker mechanism: anything `stream_soak` reports
+  (e.g. **short transfers** — which should be zero with no marker
+  applied, so each is a pure FX3-partial-commit anomaly, or sample loss)
+  is inherent to the streaming path, not caused by the PPS injection.
+- It is the natural baseline for the throughput-ceiling work above and
+  shares the `-q`/`-p` knobs, so `tests/pps_knob_sweep.sh`-style sweeps
+  can be repeated on the bare stream.
+
+A clean control run at a rate where `pps_integrity` also passes confirms
+the marker mechanism adds no loss of its own.
+
 ## Tests
 
-- **Non-HW smoke** (`tests/pps_integrity_smoke.sh`): `--help`, bad
-  args, and the no-device path return cleanly. Wire into the `check`
-  target alongside the existing smoke tests.
+- **Non-HW smoke** (`tests/pps_integrity_smoke.sh`,
+  `tests/stream_soak_smoke.sh`): `--help`, bad args, and the no-device
+  path return cleanly. Both are wired into the `check` target.
 - **HW** (`hw-check`): short runs at each rate confirm `ok` every
   second, zero spurious, zero missed; SIGINT yields a clean partial
   summary.

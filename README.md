@@ -59,6 +59,7 @@ make rx888_dsp
 make iqrecord
 make fx3_cmd         # standalone; links libusb directly (not librx888)
 make pps_integrity   # PPS marker fidelity test; static-links librx888.a
+make stream_soak     # no-marker stream-integrity control
 ```
 
 ---
@@ -89,8 +90,9 @@ sudo make uninstall
 ```
 
 This installs `librx888.so`, `librx888.a`, `librx888.pc`, `librx888.h`,
-the five binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`,
-`pps_integrity`), the firmware blob, and the udev rule. After installing:
+the six binaries (`rx888_stream`, `rx888_dsp`, `iqrecord`, `fx3_cmd`,
+`pps_integrity`, `stream_soak`), the firmware blob, and the udev rule.
+After installing:
 
 ```bash
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -175,6 +177,7 @@ Test scripts live under `tests/`. See `doc/rx888_stream_testplan.md`.
 | `iqrecord`     | SigMF file recorder | cf32 IQ on stdin | `.sigmf-data` + `.sigmf-meta` files |
 | `fx3_cmd`      | Vendor-command diagnostics CLI | RX888 device | `PASS`/`FAIL` + details |
 | `pps_integrity` | PPS in-band marker fidelity test | RX888 device | per-second status + `PASS`/`FAIL` |
+| `stream_soak`  | No-marker stream-integrity control (rate, loss, PIB) | RX888 device | per-second status + `PASS`/`FAIL` |
 
 Per-program docs in `doc/`:
 

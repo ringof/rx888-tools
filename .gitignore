@@ -5,6 +5,7 @@
 /iqrecord
 /fx3_cmd
 /pps_integrity
+/stream_soak
 
 # Library + pkg-config build outputs
 librx888.so
