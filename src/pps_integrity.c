@@ -210,7 +210,8 @@ static void usage(const char *argv0)
     fprintf(stderr,
         "Usage: %s [hours] [--rate MSPS] [--firmware FILE] [-v]\n"
         "  hours              Run duration in hours (default 4; fractional ok)\n"
-        "  --rate MSPS        Sample rate in MSPS (default 16)\n"
+        "  --rate MSPS        Sample rate in MSPS (default 16; fractional ok,\n"
+        "                     e.g. 129.6)\n"
         "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
         "  -v, --verbose      Add a per-second 'minxfer' column (smallest\n"
         "                     transfer that second, in samples; = the marker\n"
@@ -219,8 +220,8 @@ static void usage(const char *argv0)
         argv0);
 }
 
-/* Median of the recent-normal-marker ring (n <= BASE_WIN), for the MERGE
- * baseline. Small n, so an insertion sort on a copy is plenty. */
+/* Median of a small ring (n <= BASE_WIN), for the continuity rate estimate.
+ * Small n, so an insertion sort on a copy is plenty. */
 static uint32_t base_median(const uint32_t *ring, int n)
 {
     if (n <= 0) return 0;
@@ -239,7 +240,7 @@ static uint32_t base_median(const uint32_t *ring, int n)
 int main(int argc, char **argv)
 {
     double hours = 4.0;
-    unsigned rate_msps = 16;
+    double rate_msps = 16.0;
     const char *firmware_path = NULL;
     int verbose = 0;
 
@@ -253,7 +254,15 @@ int main(int argc, char **argv)
     int c;
     while ((c = getopt_long(argc, argv, "r:f:vh", opts, NULL)) != -1) {
         switch (c) {
-        case 'r': rate_msps = (unsigned)strtoul(optarg, NULL, 10); break;
+        case 'r': {
+            char *end = NULL;
+            rate_msps = strtod(optarg, &end);
+            if (end == optarg || *end != '\0' || rate_msps <= 0) {
+                fprintf(stderr, "%s: bad --rate '%s'\n", PROG_NAME, optarg);
+                return 2;
+            }
+            break;
+        }
         case 'f': firmware_path = optarg; break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
@@ -270,7 +279,10 @@ int main(int argc, char **argv)
         optind++;
     }
     if (optind < argc) { usage(argv[0]); return 2; }
-    if (rate_msps == 0) {
+
+    /* MSPS -> Hz (rounded to the nearest sample/s). */
+    unsigned samplerate = (unsigned)(rate_msps * 1e6 + 0.5);
+    if (samplerate == 0) {
         fprintf(stderr, "%s: --rate must be > 0\n", PROG_NAME);
         return 2;
     }
@@ -284,7 +296,7 @@ int main(int argc, char **argv)
 
     rx888_config_t cfg;
     rx888_config_init_default(&cfg);
-    cfg.samplerate    = rate_msps * 1000000u;
+    cfg.samplerate    = samplerate;
     cfg.firmware_path = firmware_path;  /* NULL: device must already be loaded */
 
     rx888_t *r = NULL;
@@ -327,9 +339,9 @@ int main(int argc, char **argv)
     struct fw_stats st_start = {0}, st_end = {0};
     read_fw_stats(h2, &st_start);
 
-    fprintf(stderr, "%s: starting %.3f hour run @ %u MSPS "
+    fprintf(stderr, "%s: starting %.3f hour run @ %g MSPS (%u Hz) "
             "(full transfer = %zu samples)\n",
-            PROG_NAME, hours, rate_msps, ctx.expected_nsamples);
+            PROG_NAME, hours, rate_msps, samplerate, ctx.expected_nsamples);
     printf("#time             stat   edges  marks  spur  miss%s\n",
            verbose ? "   minxfer" : "");
     fflush(stdout);
@@ -508,7 +520,7 @@ int main(int argc, char **argv)
     printf("\n=== PPS INTEGRITY RESULT ===\n");
     printf("Duration:        %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "\n",
            elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
-    printf("Sample rate:     %u MSPS\n", rate_msps);
+    printf("Sample rate:     %g MSPS (%u Hz)\n", rate_msps, samplerate);
     printf("Transfer size:   %zu samples (%zu bytes)\n",
            ctx.expected_nsamples, xfer_bytes);
     printf("Edges sent:      %" PRIu64 "\n", edges);

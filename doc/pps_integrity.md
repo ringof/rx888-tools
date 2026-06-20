@@ -25,6 +25,10 @@ reader.
 pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-v]   # default: 4 hours, 16 MSPS
 ```
 
+`--rate` accepts fractional MSPS (e.g. `--rate 129.6`) so the test can
+match production rates such as ka9q-radio's 129.6 Msps exactly; it is
+rounded to the nearest Hz and passed to `STARTADC`.
+
 Standalone binary in rx888-tools, statically linked against
 `librx888.a`. Streams at the requested rate while toggling the marker
 GPIO at 1 Hz, verifying every short transfer correlates with a GPIO
