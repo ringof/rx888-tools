@@ -362,9 +362,15 @@ int main(int argc, char **argv)
                              ? st_end.dma_count - st_start.dma_count : 0;
     uint64_t produced_bytes  = (uint64_t)bufs_produced * (uint64_t)FW_DMA_BUF_BYTES;
     uint64_t delivered_bytes = (delivered - samples_start) * sizeof(int16_t);
-    uint64_t inflight_bytes  = (uint64_t)lib.in_flight * (uint64_t)xfer_bytes;
+    /* Subtract the in-flight DELTA (end - start), not the end value: produced
+     * and delivered are both measured from the start snapshot, so the steady
+     * in-flight already cancels in their difference; only a change in pipeline
+     * occupancy between the two snapshots needs removing. (Subtracting the end
+     * value double-counted one queue depth, biasing undelivered by ~ -queue.) */
+    int64_t  inflight_delta  = ((int64_t)lib.in_flight - (int64_t)lib_start.in_flight)
+                             * (int64_t)xfer_bytes;
     int64_t  undeliv_bytes   = (int64_t)produced_bytes - (int64_t)delivered_bytes
-                             - (int64_t)inflight_bytes;
+                             - inflight_delta;
     int64_t  byte_slack      = 4 * (int64_t)xfer_bytes;
     int pd_valid = st_start.valid && st_end.valid && delivered_bytes > 0
                  && produced_bytes > delivered_bytes / 4
@@ -399,11 +405,11 @@ int main(int argc, char **argv)
                    "off, FW_DMA_BUF_BYTES unverified (check INDETERMINATE)\n",
                    (double)produced_bytes / 1e9, (double)delivered_bytes / 1e9);
         else
-            printf("DMA buffers:     produced %.2f GB, delivered %.2f GB, in-flight "
-                   "%.2f GB, undelivered %+.3f MB (slack %.2f MB)\n",
+            printf("DMA buffers:     produced %.2f GB, delivered %.2f GB, "
+                   "undelivered %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
                    (double)produced_bytes / 1e9, (double)delivered_bytes / 1e9,
-                   (double)inflight_bytes / 1e9,
-                   (double)undeliv_bytes / 1e6, (double)byte_slack / 1e6);
+                   (double)undeliv_bytes / 1e6,
+                   lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
     }
     printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
     printf("Short transfers: %" PRIu64 "  (anomalous — no marker applied)\n", shorts);

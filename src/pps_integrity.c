@@ -635,10 +635,13 @@ int main(int argc, char **argv)
      * difference stays at zero; only real loss makes produced exceed delivered.
      * This is the decisive, clock-independent separation of clock from loss.
      *
-     * The counters aren't sampled atomically and the host pipeline always has
-     * transfers in flight, so produced runs ahead of delivered by ~in_flight
-     * transfers; subtract that (in bytes) and allow a few transfers of slack for
-     * the startup ramp and read skew before calling it loss.
+     * The counters aren't sampled atomically and the host pipeline holds
+     * transfers in flight. produced and delivered are both measured from the
+     * start snapshot, so the steady in-flight cancels in their difference; only
+     * a CHANGE in pipeline occupancy between the snapshots needs removing, so we
+     * subtract the in_flight DELTA (end - start), then allow a few transfers of
+     * slack for read skew before calling it loss. (Subtracting the end value
+     * alone double-counted one queue depth, biasing undelivered by ~ -queue.)
      *
      * GUARD: FW_DMA_BUF_BYTES is an asserted firmware constant. If it is wrong
      * for the running firmware, produced_bytes would be off delivered_bytes by a
@@ -649,10 +652,11 @@ int main(int argc, char **argv)
                              ? st_end.dma_count - st_start.dma_count : 0; /* mod 2^32 */
     uint64_t produced_bytes  = (uint64_t)bufs_produced * (uint64_t)FW_DMA_BUF_BYTES;
     uint64_t delivered_bytes = (delivered - samples_start) * sizeof(int16_t);
-    uint64_t inflight_bytes  = (uint64_t)lib.in_flight * (uint64_t)xfer_bytes;
+    int64_t  inflight_delta  = ((int64_t)lib.in_flight - (int64_t)lib_start.in_flight)
+                             * (int64_t)xfer_bytes;
     int64_t  undeliv_bytes   = (int64_t)produced_bytes - (int64_t)delivered_bytes
-                             - (int64_t)inflight_bytes;
-    int64_t  byte_slack      = 4 * (int64_t)xfer_bytes;   /* ramp + read skew */
+                             - inflight_delta;
+    int64_t  byte_slack      = 4 * (int64_t)xfer_bytes;   /* read skew */
     /* Sanity: produced and delivered must be the same order of magnitude for the
      * FW_DMA_BUF_BYTES assumption to hold. */
     int pd_valid = st_start.valid && st_end.valid && delivered_bytes > 0
@@ -731,10 +735,10 @@ int main(int argc, char **argv)
                (double)delivered_bytes / 1e9);
     else
         printf("DMA buffers:     produced %.2f GB (%" PRIu32 " x %d B), delivered "
-               "%.2f GB, in-flight %.2f GB, undelivered %+.3f MB (slack %.2f MB)\n",
+               "%.2f GB, undelivered %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
                (double)produced_bytes / 1e9, bufs_produced, FW_DMA_BUF_BYTES,
-               (double)delivered_bytes / 1e9, (double)inflight_bytes / 1e9,
-               (double)undeliv_bytes / 1e6, (double)byte_slack / 1e6);
+               (double)delivered_bytes / 1e9, (double)undeliv_bytes / 1e6,
+               lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
     printf("Sample loss:     %" PRIu64 " continuity dip(s), ~%" PRIu64 " samples "
