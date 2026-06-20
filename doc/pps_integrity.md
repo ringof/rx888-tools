@@ -22,12 +22,15 @@ reader.
 ## Tool
 
 ```
-pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-v]   # default: 4 hours, 16 MSPS
+pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-q N] [-p N] [-v]   # default: 4 hours, 16 MSPS
 ```
 
 `--rate` accepts fractional MSPS (e.g. `--rate 129.6`) so the test can
 match production rates such as ka9q-radio's 129.6 Msps exactly; it is
-rounded to the nearest Hz and passed to `STARTADC`.
+rounded to the nearest Hz and passed to `STARTADC`. `-q`/`--queuedepth`
+and `-p`/`--reqsize` tune librx888's in-flight buffering and transfer
+size — at rates near the USB drain ceiling, more buffering can ride out
+drain stalls (see "Throughput ceiling" below).
 
 Standalone binary in rx888-tools, statically linked against
 `librx888.a`. Streams at the requested rate while toggling the marker
@@ -264,6 +267,27 @@ beyond the in-flight slack — plus spurious shorts, device resets, early
 library stop, or marker-handle control faults. Blind-spot and displaced
 misses do not (marker timing only); an uncorroborated continuity dip does
 not.
+
+### Throughput ceiling (empirical) and why the clock check matters
+
+Measured on real hardware: **64 MSPS (128 MB/s) is lossless** over 3 h
+(`produced == delivered`), but **129 MSPS (258 MB/s) drops ~30 ppm**
+sustained — ~82 MB over 3 h — with **`PIB = 0` and `bad_xfers = 0`**. The
+GPIF producer never stalls (no PIB) and every USB transfer that ships is
+intact (no `bad_xfers`); the loss is on the **DMA→USB consumer side** (the
+FX3 can't drain DMA buffers to USB fast enough, so buffers are overwritten
+before shipping). Only `glDMACount` (produced) vs delivered bytes sees it.
+
+Critically, the sample-rate **budget alone would have missed it**: with a
++28 ppm fast ADC clock and ~30 ppm loss, the budget read **−1.2 ppm** —
+apparently fine. The clock-independent produced-vs-delivered check is what
+exposed the loss; the report prints the *implied* clock (`budget + loss
+added back`) so the masking is visible. This is the case the whole
+loss-accounting design exists for.
+
+If a rate near the ceiling must be used, `-q`/`-p` increase in-flight
+buffering, which can absorb transient drain stalls; whether it actually
+moves the ceiling is hardware-dependent and worth measuring per host.
 
 ### Main thread — 1 Hz toggle loop
 

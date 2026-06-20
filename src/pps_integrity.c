@@ -289,11 +289,14 @@ static void fmt_wallclock(char *out, size_t n)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [hours] [--rate MSPS] [--firmware FILE] [-v]\n"
+        "Usage: %s [hours] [--rate MSPS] [--firmware FILE] [-q N] [-p N] [-v]\n"
         "  hours              Run duration in hours (default 4; fractional ok)\n"
         "  --rate MSPS        Sample rate in MSPS (default 16; fractional ok,\n"
         "                     e.g. 129.6)\n"
         "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
+        "  -q, --queuedepth N   Concurrent in-flight USB transfers (default 32);\n"
+        "                     more buffering can ride out drain stalls at high rates\n"
+        "  -p, --reqsize N    USB transfer size in packets (default 1024)\n"
         "  -v, --verbose      Add a per-second 'minxfer' column (smallest\n"
         "                     transfer that second, in samples; = the marker\n"
         "                     size on an ok second)\n"
@@ -324,16 +327,19 @@ int main(int argc, char **argv)
     double rate_msps = 16.0;
     const char *firmware_path = NULL;
     int verbose = 0;
+    unsigned queuedepth = 0, reqsize = 0;   /* 0 = librx888 default */
 
     static struct option opts[] = {
-        {"rate",     required_argument, 0, 'r'},
-        {"firmware", required_argument, 0, 'f'},
-        {"verbose",  no_argument,       0, 'v'},
-        {"help",     no_argument,       0, 'h'},
+        {"rate",       required_argument, 0, 'r'},
+        {"firmware",   required_argument, 0, 'f'},
+        {"queuedepth", required_argument, 0, 'q'},
+        {"reqsize",    required_argument, 0, 'p'},
+        {"verbose",    no_argument,       0, 'v'},
+        {"help",       no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "r:f:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:f:q:p:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'r': {
             char *end = NULL;
@@ -345,6 +351,8 @@ int main(int argc, char **argv)
             break;
         }
         case 'f': firmware_path = optarg; break;
+        case 'q': queuedepth = (unsigned)strtoul(optarg, NULL, 10); break;
+        case 'p': reqsize     = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
@@ -379,6 +387,8 @@ int main(int argc, char **argv)
     rx888_config_init_default(&cfg);
     cfg.samplerate    = samplerate;
     cfg.firmware_path = firmware_path;  /* NULL: device must already be loaded */
+    if (queuedepth) cfg.queue_depth = queuedepth;  /* more in-flight buffering */
+    if (reqsize)    cfg.req_packets = reqsize;     /* larger/smaller USB transfers */
 
     rx888_t *r = NULL;
     int rc = rx888_open(&r, &cfg);
@@ -736,23 +746,34 @@ int main(int argc, char **argv)
            LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
            max_deficit, (double)max_deficit / (double)ctx.expected_nsamples,
            (double)byte_slack / 1e6);
+    /* Loss as a fraction of produced data, for severity at a glance. */
+    double loss_ppm = produced_bytes > 0
+                    ? (double)lost_bytes / (double)produced_bytes * 1e6 : 0.0;
     if (bufs_lost)
-        printf("  FAIL: %.3f MB produced but never delivered — firmware/USB "
-               "dropped data (clock-independent).\n", (double)lost_bytes / 1e6);
+        printf("  FAIL: %.3f MB produced but never delivered = %.1f ppm "
+               "(%.4f%%) — firmware/USB dropped data (clock-independent).\n",
+               (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
     if (lib.bad_xfers > 0)
         printf("  FAIL: %llu errored/cancelled USB transfers — transport-level "
                "sample loss.\n", lib.bad_xfers);
-    /* Clock vs loss: with produced==delivered and no errors, the sample-rate
-     * offset is provably the ADC-vs-host clock, not loss. */
+    /* Clock vs loss. With produced==delivered and no errors the rate offset is
+     * provably the ADC-vs-host clock. When there IS loss the budget ppm is
+     * (clock - loss) combined; we still recover the implied clock by adding the
+     * measured loss back (budget_ppm + loss_ppm), so the masking is visible. */
     if (st_start.valid && st_end.valid) {
         if (lossless && pd_valid)
             printf("ADC clock:       %+.3f ppm (lossless: produced==delivered, "
                    "no USB errors; assumes disciplined host)\n",
                    rate_n >= BASE_WIN ? learned_ppm : budget_ppm);
-        else
+        else {
             printf("Sample budget:   delivered %" PRIu64 " vs expected %" PRIu64
-                   " (rate x elapsed), %+.3f ppm (clock+loss combined)\n",
+                   " (rate x elapsed), %+.3f ppm (clock - loss combined)\n",
                    delivered, expected_total, budget_ppm);
+            if (pd_valid)
+                printf("Implied clock:   %+.3f ppm (budget %+.3f + loss %.1f ppm "
+                       "added back) — the fast clock was masking the loss\n",
+                       budget_ppm + loss_ppm, budget_ppm, loss_ppm);
+        }
     }
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u total in %" PRIu64 " second(s); "
