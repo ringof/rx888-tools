@@ -197,12 +197,32 @@ lose samples?" Those are checked directly:
   one — equal ⇒ recovered (data intact), short ⇒ lost.
 - **librx888 `bad_xfers`** — errored/cancelled USB transfers, i.e.
   transport-level loss, surfaced in the summary.
-- **Firmware PIB errors** — overflow events. PIB > 0 *with* an
-  inter-marker deficit means the overflow lost host-visible samples;
-  PIB > 0 with no deficit recovered without loss (NOTE).
+- **Firmware PIB errors, polled per second.** GETSTATS is read every
+  second on the EP0 handle, so overflow events are localised to the
+  second they occur and correlated with that interval's continuity
+  result: PIB *with* a deficit lost host-visible samples; PIB with none
+  recovered without loss. The same poll catches a mid-run device reset
+  (boot-count change) immediately.
+- **Absolute sample budget.** `expected = samplerate × elapsed` vs the
+  samples actually delivered, reported as a `±ppm` offset. This catches
+  *sustained* loss that the self-referential per-interval rate would
+  otherwise absorb. **Caveat:** the offset is clock-vs-host drift **and**
+  any uniform loss *combined* — the host cannot separate them. A few-ppm
+  value is clock-dominated (no meaningful loss); a large negative one is
+  loss. Separating them for certain needs a *firmware-side* "samples
+  produced" / DMA-buffer counter (a side-channel count via GETSTATS, not
+  anything embedded in the sample stream); the tool already reads GETSTATS
+  and is ready to consume such a field.
+- **Learned-vs-nominal rate** and **loss floor / largest observed
+  deficit** are reported so the summary states its own sensitivity: the
+  detection floor is `LOSS_TOL` (drops smaller than this in one interval
+  are invisible), and the largest deficit actually seen shows the
+  headroom to it.
 
-Any confirmed loss (`bad_xfers > 0` or an inter-marker deficit) fails the
-run.
+Confirmed loss (`bad_xfers > 0` or an inter-marker deficit) fails the run.
+A gross-budget shortfall beyond localised loss + a 100 ppm clock band is a
+WARN, not a fail — it cannot be attributed to loss vs. clock from the host
+side alone.
 
 ### Main thread — 1 Hz toggle loop
 
@@ -243,9 +263,12 @@ Markers seen:    14401
 Spurious shorts: 0
 Missed markers:  0  (blind-spot: 0, recovered: 0, lost: 0)
 Samples in:      230400000000 (230.40 Gsa)
+Sample budget:   expected 230400000000 (rate x elapsed), delivered 230400000037, diff +37 (+0.161 ppm; clock+loss combined)
+Learned rate:    32000005 Sa/s vs nominal 32000000 (+0.156 ppm)
+Loss floor:      65536 samples (0.12 buffer); largest interval deficit 31204 (0.06 buffer)
 USB transfers:   ok=219726 bad=0
 Sample loss:     0 interval(s), ~0 samples (inter-marker deficit)
-PIB errors:      0
+PIB errors:      0 total in 0 second(s); 0 coincided with a deficit
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS

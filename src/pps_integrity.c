@@ -357,6 +357,10 @@ int main(int argc, char **argv)
     uint32_t rate_ring[BASE_WIN];                 /* single-second inter-marker counts */
     int rate_n = 0, rate_pos = 0;
     uint64_t loss_events = 0, lost_samples_est = 0;
+    uint64_t max_deficit = 0;                     /* largest inter-marker deficit seen */
+    uint32_t pib_prev = st_start.valid ? st_start.pib_errors : 0;
+    uint64_t pib_seconds = 0, pib_with_deficit = 0;  /* per-second PIB localisation */
+    int mid_reset = 0;
     int internal_stop = 0, ctrl_fault = 0;
 
     struct timespec t0;
@@ -397,6 +401,7 @@ int main(int argc, char **argv)
         uint32_t mn = atomic_load(&ctx.min_nsamples);
         const char *stat = "ok";
         char note[128]; note[0] = '\0';
+        int interval_lost = 0;            /* this window's interval showed a deficit */
         if (arrived) {
             marks++;
             if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
@@ -407,7 +412,6 @@ int main(int argc, char **argv)
              * stream (USB/firmware overflow) — the direct "did we lose data?"
              * check, and the ground truth for resolving deferred misses. */
             uint64_t cur_ms = atomic_load(&ctx.samples_at_marker);
-            int interval_lost = 0;
             if (have_prev_marker) {
                 uint64_t interval = cur_ms - prev_marker_samples;
                 uint64_t span = edges - prev_marker_edge;     /* seconds */
@@ -421,8 +425,9 @@ int main(int argc, char **argv)
                 if (rate_n >= 8) {
                     uint64_t rate = base_median(rate_ring, rate_n);
                     uint64_t expected = rate * span;
+                    uint64_t deficit = expected > interval ? expected - interval : 0;
+                    if (deficit > max_deficit) max_deficit = deficit;  /* floor headroom */
                     if (interval + LOSS_TOL < expected) {
-                        uint64_t deficit = expected - interval;
                         loss_events++;
                         lost_samples_est += deficit;
                         interval_lost = 1;
@@ -473,6 +478,28 @@ int main(int argc, char **argv)
             if (blind) { blind_spot++; stat = "BLIND"; }
             else       { pending_misses++; stat = "MISS"; }  /* resolved next edge */
         }
+
+        /* Per-second firmware poll on the EP0 handle: localise PIB overflow
+         * events to the second they happen and correlate with the continuity
+         * deficit (so we can say whether an overflow cost host-visible
+         * samples), and catch a mid-run device reset immediately. */
+        struct fw_stats cur;
+        if (read_fw_stats(h2, &cur) == 0) {
+            if (cur.pib_errors > pib_prev) {
+                uint32_t d = cur.pib_errors - pib_prev;
+                pib_seconds++;
+                if (interval_lost) pib_with_deficit++;
+                snprintf(note + strlen(note), sizeof note - strlen(note),
+                         "  PIB+%u%s", d, interval_lost ? " (deficit)" : "");
+                pib_prev = cur.pib_errors;
+            }
+            if (st_start.valid && cur.boot_count != st_start.boot_count && !mid_reset) {
+                mid_reset = 1;
+                snprintf(note + strlen(note), sizeof note - strlen(note),
+                         "  DEVICE RESET");
+            }
+        }
+
         printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
                (uint64_t)atomic_load(&ctx.spurious), missed);
@@ -506,6 +533,29 @@ int main(int argc, char **argv)
     uint32_t pib_delta = (st_start.valid && st_end.valid)
                        ? st_end.pib_errors - st_start.pib_errors : 0;
 
+    /* Absolute sample budget: what the clock should have produced vs what we
+     * received. The ppm offset is clock-vs-host AND any uniform loss combined
+     * — the two are indistinguishable from the host alone (that separation
+     * needs a firmware "samples produced" counter). A few-ppm value is
+     * clock-dominated; a large negative one is loss. */
+    double elapsed_d = (double)(t1.tv_sec - t0.tv_sec)
+                     + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double expected_d = (double)samplerate * elapsed_d;
+    uint64_t expected_total = (uint64_t)(expected_d + 0.5);
+    double budget_ppm = expected_d > 0
+                      ? ((double)delivered - expected_d) / expected_d * 1e6 : 0.0;
+    uint64_t gross_deficit = expected_total > delivered
+                           ? expected_total - delivered : 0;
+    /* Gross shortfall beyond what we localised, past a generous clock band:
+     * candidate sustained / sub-threshold loss the per-interval check can't see. */
+    uint64_t clk_allow = (uint64_t)(expected_d * 100e-6);   /* 100 ppm */
+    uint64_t unaccounted = gross_deficit > lost_samples_est + clk_allow
+                         ? gross_deficit - lost_samples_est - clk_allow : 0;
+    uint64_t learned_rate = base_median(rate_ring, rate_n);  /* samples/s median */
+    double learned_ppm = samplerate > 0
+                       ? ((double)learned_rate - (double)samplerate)
+                         / (double)samplerate * 1e6 : 0.0;
+
     /* Sample loss is the hard question and the verdict's basis: errored USB
      * transfers (transport loss) or an inter-marker deficit (firmware/USB
      * overflow) both mean the stream is missing data. */
@@ -513,7 +563,8 @@ int main(int argc, char **argv)
 
     /* Verdict: blind-spot misses are inherent and recovered misses are lossless
      * delimiter displacements, so neither fails the run; lost markers, spurious
-     * shorts, and any confirmed sample loss do. */
+     * shorts, and any confirmed sample loss do. The gross-budget shortfall is a
+     * WARN only — it cannot be separated from clock offset without a reference. */
     int pass = (spur == 0) && (lost == 0) && !sample_loss &&
                !internal_stop && !ctrl_fault && !boot_changed;
 
@@ -545,6 +596,17 @@ int main(int argc, char **argv)
                "(data loss).\n");
     printf("Samples in:      %" PRIu64 " (%.2f Gsa)\n",
            delivered, (double)delivered / 1e9);
+    printf("Sample budget:   expected %" PRIu64 " (rate x elapsed), delivered "
+           "%" PRIu64 ", diff %+" PRId64 " (%+.3f ppm; clock+loss combined)\n",
+           expected_total, delivered,
+           (int64_t)delivered - (int64_t)expected_total, budget_ppm);
+    if (rate_n >= 8)
+        printf("Learned rate:    %" PRIu64 " Sa/s vs nominal %u (%+.3f ppm)\n",
+               learned_rate, samplerate, learned_ppm);
+    printf("Loss floor:      %d samples (%.2f buffer); largest interval deficit "
+           "%" PRIu64 " (%.2f buffer)\n",
+           LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
+           max_deficit, (double)max_deficit / (double)ctx.expected_nsamples);
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
     printf("Sample loss:     %" PRIu64 " interval(s), ~%" PRIu64 " samples "
@@ -555,17 +617,21 @@ int main(int argc, char **argv)
     if (loss_events > 0)
         printf("  FAIL: inter-marker sample deficit — the stream dropped data "
                "(firmware/USB overflow).\n");
+    if (unaccounted > 0)
+        printf("  WARN: %" PRIu64 " samples short beyond localised loss + 100 ppm "
+               "clock — possible sustained/sub-floor loss (or a slow clock; "
+               "needs a rate reference to tell apart).\n", unaccounted);
     if (st_start.valid && st_end.valid) {
-        printf("PIB errors:      %u%s\n", pib_delta,
-               pib_delta > 0 && loss_events == 0
-                 ? "  (NOTE: overflow flagged but no inter-marker deficit — "
-                   "recovered without host-visible loss)"
-                 : (pib_delta > 0 ? "  (overflow — see sample loss above)"
-                                  : ""));
+        printf("PIB errors:      %u total in %" PRIu64 " second(s); "
+               "%" PRIu64 " coincided with a deficit%s\n",
+               pib_delta, pib_seconds, pib_with_deficit,
+               pib_delta > 0 && pib_with_deficit == 0
+                 ? "  (NOTE: overflow flagged but no host-visible loss)" : "");
         printf("Stream faults:   %u\n",
                st_end.streaming_faults - st_start.streaming_faults);
         printf("Boot count:      %s\n",
-               boot_changed ? "CHANGED — device reset during run!" : "unchanged");
+               (boot_changed || mid_reset) ? "CHANGED — device reset during run!"
+                                           : "unchanged");
     } else {
         printf("FW stats:        unavailable\n");
     }
