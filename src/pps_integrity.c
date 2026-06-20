@@ -274,6 +274,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
+    uint64_t true_drops = 0, near_full_miss = 0;  /* miss breakdown by minxfer */
     int internal_stop = 0, ctrl_fault = 0;
 
     struct timespec t0;
@@ -311,18 +312,26 @@ int main(int argc, char **argv)
         /* Window closed: stop accepting this edge's marker as "on time". */
         atomic_store(&ctx.expecting_marker, 0);
         int arrived = atomic_load(&ctx.marker_arrived);
+        uint32_t mn = atomic_load(&ctx.min_nsamples);
         const char *stat = "ok";
         if (arrived) {
             marks++;
         } else {
             missed++;
             stat = "MISS";
+            /* Categorise the miss from the smallest transfer that window.
+             * A short below the detect threshold would have set marker_arrived,
+             * so a miss means min >= expected-SHORT_MARGIN: either a full
+             * buffer (true drop — no marker emitted) or a near-full short that
+             * slipped past the margin (threshold artifact). The latter should
+             * not happen; counting it proves the threshold isn't hiding drops. */
+            if (mn >= ctx.expected_nsamples) true_drops++;
+            else                             near_full_miss++;
         }
         printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
                (uint64_t)atomic_load(&ctx.spurious), missed);
         if (verbose) {
-            uint32_t mn = atomic_load(&ctx.min_nsamples);
             if (mn == UINT32_MAX) printf("   %8s", "-");      /* no transfer */
             else                  printf("   %8" PRIu32, mn);
         }
@@ -355,7 +364,13 @@ int main(int argc, char **argv)
     printf("Edges sent:      %" PRIu64 "\n", edges);
     printf("Markers seen:    %" PRIu64 "\n", marks);
     printf("Spurious shorts: %" PRIu64 "\n", spur);
-    printf("Missed markers:  %" PRIu64 "\n", missed);
+    printf("Missed markers:  %" PRIu64 "  (true drops: %" PRIu64
+           ", near-full: %" PRIu64 ")\n", missed, true_drops, near_full_miss);
+    if (edges > 0) {
+        double rate = 100.0 * (double)missed / (double)edges;
+        printf("Drop rate:       %.3f%% of edges (~%.1f/hour)\n",
+               rate, rate / 100.0 * 3600.0);
+    }
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u (NOTE, informational)\n",
                st_end.pib_errors - st_start.pib_errors);
