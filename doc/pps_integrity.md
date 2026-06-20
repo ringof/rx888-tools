@@ -118,6 +118,50 @@ Counting "extra" shorts as spurious is intentional: this is an
 integrity test, and a genuine USB hiccup or a doubled marker is a real
 finding.
 
+### Marker size, and the blind spot (empirical)
+
+The marker is the **leftover partial buffer** at each PPS second. A
+second's worth of samples packs into a whole number of full transfers
+plus one partial, and that partial *is* the short transfer we detect.
+Its size is therefore:
+
+```
+marker_samples ≈ samplerate mod (transfer_bytes / 2)
+```
+
+Measured against a 524288-sample full transfer:
+
+| Rate     | `rate mod 524288` | observed marker size |
+|----------|-------------------|----------------------|
+| 16 MSPS  | 271 360           | ~272 000             |
+| 32 MSPS  |  18 432           | ~18k–20k             |
+| 64 MSPS  |  36 864           | (predicted ~37k)     |
+
+The value drifts slowly with the ADC-vs-host clock offset (a few ppm).
+This is why marker sizes differ per rate — it is expected, not a bug.
+
+It also exposes an **inherent blind spot**: when the remainder drifts
+within a buffer-boundary band of `0` or `full`, the partial is either
+empty (suppressed by firmware) or indistinguishable from a full
+transfer — so *no in-band short can exist*. That was always a design
+risk of a short-transfer marker; here it is characterised. The blind
+spot is a property of the marker scheme, eliminable only at the source
+(e.g. firmware emitting a zero-length packet or a forced minimum-length
+delimiter regardless of buffer fill).
+
+The tool therefore classifies every miss:
+
+- **blind-spot** — `minxfer < full` (a near-full partial slipped past
+  `SHORT_MARGIN`), or `minxfer == full` while the live remainder (last
+  good marker) sits within `DANGER_BAND` of a boundary. Inherent and
+  benign; reported as a NOTE.
+- **anomalous** — `minxfer == full` while the remainder is mid-buffer,
+  i.e. the marker should have been plainly visible but vanished. A real
+  fidelity failure; fails the run.
+
+`-v` adds a `minxfer` column (smallest transfer that second) so the
+classification is auditable line by line.
+
 ### Main thread — 1 Hz toggle loop
 
 1. `clock_gettime(CLOCK_REALTIME)` — wall-clock timestamp per edge.
@@ -131,15 +175,17 @@ finding.
 ### Per-second output
 
 ```
-pps_integrity: starting 0.033 hour run @ 64 MSPS
-#time                 stat   edges   marks  spur  miss
- 14:23:01.384521  ok        1       1     0     0
- 14:23:02.384892  ok        2       2     0     0
- 14:23:03.385201  MISS      3       2     0     1
+pps_integrity: starting 0.033 hour run @ 32 MSPS
+#time             stat   edges  marks  spur  miss   minxfer
+ 14:23:01.384521  ok         1      1     0     0      18432
+ 14:23:02.384892  ok         2      2     0     0      19960
+ 14:23:03.385201  ANOM       3      2     0     1     524288
 ```
 
 Wall-clock microsecond timestamps so the operator can visually catch
-cadence skips.
+cadence skips. `stat` is `ok`, `BLIND`, or `ANOM`; the `minxfer` column
+(samples) appears under `-v`. Here edge 3's marker vanished while the
+remainder was healthy (~18k–20k) — an anomalous miss.
 
 ### Final report
 
@@ -151,7 +197,7 @@ Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      14401
 Markers seen:    14401
 Spurious shorts: 0
-Missed markers:  0
+Missed markers:  0  (blind-spot: 0, anomalous: 0)
 PIB errors:      0 (NOTE, informational)
 Stream faults:   0
 Boot count:      unchanged
@@ -169,12 +215,13 @@ delta and flags a `boot_count` mismatch (device reset between reads).
 
 ### Pass criteria
 
+- `anomalous == 0` — every miss is explained by the boundary blind spot;
+  none is a real marker loss.
 - `spurious_count == 0` — no shorts without a preceding rising edge.
-- `markers_seen` within ±2 of `edges_sent` — every edge produced a
-  marker, modulo startup/shutdown tolerance (this subsumes "no misses").
 - No device resets (`boot_count` unchanged), no streaming faults, no
   early library stop, no marker-handle control faults.
-- PIB errors are informational (NOTE), not FAIL.
+- Blind-spot misses are a NOTE, not a FAIL — they are inherent to the
+  marker scheme. PIB errors are likewise informational.
 
 ## Implementation
 

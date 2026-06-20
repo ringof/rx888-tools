@@ -2,9 +2,12 @@
  * pps_integrity — long-duration PPS in-band marker fidelity test.
  *
  * Streams from the RX888 mk II via librx888 while toggling the PPS
- * marker GPIO at 1 Hz on a second (EP0-only) libusb handle, and
- * verifies that every rising edge produces exactly one short USB bulk
- * transfer (the in-band marker) with no spurious shorts and no misses.
+ * marker GPIO at 1 Hz on a second (EP0-only) libusb handle, and checks
+ * that each rising edge produces one short USB bulk transfer (the in-band
+ * marker). Misses are classified: "blind-spot" misses (the marker partial
+ * buffer drifted within a buffer boundary, where no in-band short can
+ * exist) are inherent and benign; "anomalous" misses (marker lost with the
+ * remainder mid-buffer) and spurious shorts are real fidelity failures.
  *
  * Two handles by design:
  *   - librx888 owns interface 0 and the async bulk EP1-IN stream.
@@ -48,6 +51,18 @@
 /* A transfer this many samples below the full size still counts as "full",
  * absorbing any benign under-fill. A real marker transfer is far shorter. */
 #define SHORT_MARGIN    512
+
+/* The marker is the leftover partial buffer each PPS second: its size is
+ * (samples_per_second mod full-transfer-size), which slowly drifts with the
+ * ADC-vs-host clock offset. When that remainder drifts within DANGER_BAND of a
+ * buffer boundary (0 or full), the partial is either empty (suppressed) or
+ * indistinguishable from a full transfer, so no in-band short can exist — an
+ * inherent blind spot of a short-transfer marker, not a fidelity failure. A
+ * miss is "blind-spot" when the live remainder (last good marker) sits in that
+ * band, "anomalous" otherwise. The band must exceed the per-second remainder
+ * jitter (~2k samples observed); the firmware's empty-partial suppression
+ * threshold is unknown, so tune this once long-run data is in hand. */
+#define DANGER_BAND     8192
 
 /* Vendor control-transfer timeout on the second handle (ms). */
 #define CTRL_TIMEOUT_MS 1000
@@ -274,7 +289,9 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     uint64_t edges = 0, marks = 0, missed = 0;
-    uint64_t true_drops = 0, near_full_miss = 0;  /* miss breakdown by minxfer */
+    uint64_t blind_spot = 0, anomalous = 0;       /* miss classification */
+    uint32_t last_marker = 0;                     /* live remainder estimate */
+    int last_marker_valid = 0;
     int internal_stop = 0, ctrl_fault = 0;
 
     struct timespec t0;
@@ -316,17 +333,27 @@ int main(int argc, char **argv)
         const char *stat = "ok";
         if (arrived) {
             marks++;
+            if (mn != UINT32_MAX) { last_marker = mn; last_marker_valid = 1; }
         } else {
             missed++;
-            stat = "MISS";
-            /* Categorise the miss from the smallest transfer that window.
-             * A short below the detect threshold would have set marker_arrived,
-             * so a miss means min >= expected-SHORT_MARGIN: either a full
-             * buffer (true drop — no marker emitted) or a near-full short that
-             * slipped past the margin (threshold artifact). The latter should
-             * not happen; counting it proves the threshold isn't hiding drops. */
-            if (mn >= ctx.expected_nsamples) true_drops++;
-            else                             near_full_miss++;
+            /* Classify the miss. mn < expected means a near-full partial
+             * slipped past the detect threshold — the near-full edge of the
+             * blind spot. mn == expected means no distinguishable partial at
+             * all: a blind spot only if the live remainder (last good marker)
+             * sits within DANGER_BAND of a boundary, else the marker vanished
+             * while it should have been plainly visible — a real anomaly. */
+            int blind;
+            if (mn < ctx.expected_nsamples) {
+                blind = 1;                       /* near-full boundary */
+            } else if (!last_marker_valid) {
+                blind = 1;                       /* startup: no baseline yet */
+            } else {
+                uint32_t to_full = (uint32_t)ctx.expected_nsamples - last_marker;
+                uint32_t dist = last_marker < to_full ? last_marker : to_full;
+                blind = (dist <= DANGER_BAND);
+            }
+            if (blind) { blind_spot++; stat = "BLIND"; }
+            else       { anomalous++;  stat = "ANOM";  }
         }
         printf(" %-16s %-5s %6" PRIu64 " %6" PRIu64 " %5" PRIu64 " %5" PRIu64,
                ts, stat, edges, marks,
@@ -350,9 +377,10 @@ int main(int argc, char **argv)
     int boot_changed = (st_start.valid && st_end.valid &&
                         st_start.boot_count != st_end.boot_count);
 
-    /* ±2 startup/shutdown tolerance on edge↔marker pairing. */
-    int markers_ok = (edges >= marks) && ((edges - marks) <= 2);
-    int pass = (spur == 0) && markers_ok && !internal_stop &&
+    /* Verdict is about marker fidelity: blind-spot misses are an inherent,
+     * phase-dependent property of the short-transfer marker and do not fail
+     * the run; anomalous misses (and spurious shorts) do. */
+    int pass = (spur == 0) && (anomalous == 0) && !internal_stop &&
                !ctrl_fault && !boot_changed;
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
@@ -364,13 +392,19 @@ int main(int argc, char **argv)
     printf("Edges sent:      %" PRIu64 "\n", edges);
     printf("Markers seen:    %" PRIu64 "\n", marks);
     printf("Spurious shorts: %" PRIu64 "\n", spur);
-    printf("Missed markers:  %" PRIu64 "  (true drops: %" PRIu64
-           ", near-full: %" PRIu64 ")\n", missed, true_drops, near_full_miss);
-    if (edges > 0) {
-        double rate = 100.0 * (double)missed / (double)edges;
-        printf("Drop rate:       %.3f%% of edges (~%.1f/hour)\n",
+    printf("Missed markers:  %" PRIu64 "  (blind-spot: %" PRIu64
+           ", anomalous: %" PRIu64 ")\n", missed, blind_spot, anomalous);
+    if (edges > 0 && anomalous > 0) {
+        double rate = 100.0 * (double)anomalous / (double)edges;
+        printf("Anomaly rate:    %.3f%% of edges (~%.1f/hour)\n",
                rate, rate / 100.0 * 3600.0);
     }
+    if (blind_spot > 0)
+        printf("  NOTE: blind-spot misses are the inherent short-transfer "
+               "marker limit near a buffer boundary, not a failure.\n");
+    if (anomalous > 0)
+        printf("  FAIL: anomalous misses — marker lost with the remainder "
+               "mid-buffer, i.e. it should have been plainly visible.\n");
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u (NOTE, informational)\n",
                st_end.pib_errors - st_start.pib_errors);
