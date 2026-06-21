@@ -498,6 +498,14 @@ the marker mechanism adds no loss of its own.
 - **HW** (`hw-check`): short runs at each rate confirm `ok` every
   second, zero spurious, zero missed; SIGINT yields a clean partial
   summary.
+- **Log analysis** (`tests/pps_log_stats.py <log> [<log2> ...]`):
+  correlates the dip / MISS / spurious events in a `-v` log — the
+  marker-position **boundary-enrichment** of dip seconds (the
+  commit-vs-buffer-boundary race signature), the post-MISS ~2× merge
+  ratio, dip/spur co-occurrence, and temporal clustering. Pass several
+  logs (`_baseline`, `_lowR`, `_sync`) for a comparison table; a working
+  fix should drop dips/hour **and** collapse the boundary-enrichment
+  toward 1×.
 
 ## Verification
 
