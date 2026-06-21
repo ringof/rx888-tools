@@ -319,40 +319,55 @@ story does not account for all of them. The leading reading is still
 **fixable input conditions rather than the in-band concept**, but it
 rests on the suspects below, none yet tested:
 
-- **Edge quality.** The PPS reaches the FX3 through a 100 kΩ series
-  resistor → a ~4 µs RC edge, which dwells in the input threshold for
-  *hundreds* of clocks at 129.6 MSPS — a textbook way to induce
-  metastability. Untested with a fast/buffered (<1 clock) edge.
-- **Clock-domain crossing.** An asynchronous PPS into the GPIF state
-  machine needs a real (2-flop) synchronizer; "the GPIF is clocked" only
-  means it *samples* the input, and a single sample of an async signal can
-  go metastable. A slow edge makes this far worse. Whether the FX3 GPIF
-  synchronizes CTL inputs before they drive the commit is open.
+The firmware source (reading the actual GPIF config and vendored SDK)
+turns the input-condition suspects from speculation into a **confirmed
+signal path** — though not yet a confirmed *cause*. The `PPS_CTL_ENABLE=1`
+marker commit is performed **entirely in GPIF hardware** (states
+`TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`), on an `AUTO_MANY_TO_ONE` channel with
+cross-route correct by construction (see the KBA note below — the software
+commit-ordering class is eliminated). What the config shows about the CTL
+path:
 
-The firmware source rules out one *class* of cause (see the KBA note
-below): in the `PPS_CTL_ENABLE=1` build that is actually running, the
-marker commit is performed **entirely inside the GPIF state machine in
-hardware** (states `TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`) — there is **no CPU
-`CommitBuffer()` or `SetWrapUp()` in the path**, and the streaming channel
-is `AUTO_MANY_TO_ONE` with cross-route correct by construction (each
-per-thread commit state only fires while that thread is active). That
-eliminates the software commit-ordering explanation and places the loss
-*inside the GPIF state machine*. The leading hypothesis from there is the
-slow CTL[2] edge driving the control comparator metastable: a ~4 µs edge
-can sit in the input threshold for hundreds of clocks, and a metastable
-latch could stall the state machine long enough to lose ~15 DMA buffers
-(~250 KB, ~1 ms) per event — far more than the few-µs cost of a clean
-descriptor swap. This is **inference, not a captured event**: we have not
-observed a metastable stall directly, nor confirmed whether the GPIF
-synchronizes CTL inputs, nor that the resistor is causal. It remains
-possible the AUTO channel simply cannot absorb an async commit interruption
-mid-descriptor regardless of edge quality, in which case a faster edge
-changes nothing.
+- **Edge quality (confirmed slow).** The PPS reaches the FX3 through a
+  100 kΩ series resistor → a ~4 µs RC edge. CTL[2] is sampled on the
+  **external ADC clock (129.6 MHz)**, not the faster PIB fabric clock, so
+  that edge spans **~500 consecutive sample clocks in the input threshold**
+  — 500 edges each able to violate setup/hold. Untested with a
+  fast/buffered (<1 clock) edge.
+- **No synchronizer, and edge-triggered (confirmed).** The control
+  comparator is in **TOGGLE mode** (`GPIF_CONFIG` bit 12) — it fires for
+  one clock whenever the *sampled* CTL[2] value differs from the previous
+  sample — and it samples CTL[2] **directly**: no intermediate sampling
+  state, no 2-flop synchronizer. A metastable sample propagates straight
+  into the `PPS_COMMIT` transition. The PPS vs original GPIF waveforms
+  differ in exactly two bits — `CTRL_COMP_ENABLE` (bit 0) and
+  `CTRL_COMP_TOGGLE` (bit 12) — so the marker is *only* "turn the toggle
+  comparator on," riding the raw async edge.
+- **DLL: correctly off, not a lever.** `pibClock.isDllEnable = CyFalse`;
+  the GPIF is in **sync mode** (`GPIF_CONFIG` bit 8 = 1) clocked by the
+  external ADC clock. The DLL exists for *async*-mode input timing, which
+  this interface does not use, so disabling it is correct — ruling out the
+  one firmware-config lever I had flagged (KBA210733).
+- **SDK 1.3.4** (`SDK/fw_lib/1_3_4/`).
+
+So the metastability *mechanism path* is real and firmware-confirmed: a
+~4 µs async edge, sampled directly with no synchronizer by a toggle
+comparator on a 129.6 MHz clock, driving a state transition — the textbook
+setup for a metastable sample to push the state machine into an undefined
+state and stall it long enough to lose ~15 DMA buffers (~250 KB, ~1 ms).
+**What is still not proven** is that this path is what produces the 397
+catastrophic events: we have not captured a metastable stall, and **43.6 %
+of loss events are not boundary-adjacent**, which a pure edge-collision
+story does not yet explain. The causal test is the edge fix.
 
 So this is **not** a verdict either way — neither that in-band marking is
-unworkable nor that it is fixable. The investigation sequence is:
+unworkable nor that it is fixable. With the path confirmed, the experiment
+order is now clear and **edge-first**:
 (1) **done — 129.6 MSPS baseline = 42.3 ppm** (n = 1, slow-edge resistor);
-(2) fast/buffered edge; (3) GPIF input-synchronization. (2) and (3) are
+(2) **fast/buffered edge (lower R)** — directly attacks the ~500-cycle
+threshold dwell, the cheapest change and the one most likely to move the
+result; (3) **a synchronizer state in the GPIF waveform** — belt-and-
+suspenders for any residual metastability once the edge is clean. Both are
 **tests that can fail.** Watch the loss and the boundary-enrichment
 together: if a clean edge collapses the per-event loss and pulls
 `pps_log_stats.py`'s `bnd-enr` toward 1×, the metastability reading holds
