@@ -621,6 +621,72 @@ make librx888.a pps_integrity
 ./pps_integrity 4 --rate 64
 ```
 
+## Takeaways even if this doesn't work
+
+The in-band marker may not survive the edge experiment. The harness and the
+understanding behind it survive regardless: we now have trustworthy host-side
+data-quality, dropped-sample, and timing-error instrumentation
+(`pps_integrity`, `stream_soak`, `pps_log_stats.py`, the produced-vs-delivered
+and clock-vs-loss accounting). The natural next step is firmware features that
+turn what these tools currently **infer** into something the device **reports
+exactly** — none of which depend on in-band PPS panning out. Feasibility is a
+firmware call (FX3 SDK 1.3.4, `AUTO_MANY_TO_ONE` channel, GPIF counter
+hardware); these are ranked candidates with the open questions noted.
+
+**Dropped-sample detection (make it exact, not inferred)**
+
+1. **Drop/overflow event counter in GETSTATS** *(cheapest big win)*. The
+   firmware knows the exact moment a producer socket has no free buffer (host
+   fell behind) — that is when a sample is lost. Count it and expose it (the
+   KBA's own ++commit/−−CONS recipe). *Buys:* turns our `glDMACount`-vs-
+   delivered inference into a device-reported drop count and retires the
+   `INDETERMINATE if off by >4×` guard. Just more GETSTATS fields.
+2. **Sample-granular "produced" counter (BYTE_COUNT) in GETSTATS.** Today we
+   count 16 KB DMA buffers, so loss resolution is `LOSS_TOL = 65536` samples;
+   a byte-granular produced count drops that to ~1 sample. *Buys:*
+   produced-vs-delivered becomes sample-exact.
+3. **In-band per-buffer sequence / cumulative sample-count header**
+   *(most powerful, most invasive)*. A monotonic counter word per buffer
+   catches any drop instantly and exactly. *Caveat:* perturbs the zero-copy
+   AUTO path and the host must strip it — heavyweight, only if 1–2 fall short.
+
+**Timing error / clock offset (make it directly measurable)**
+
+4. **Free-running device sample counter readable via EP0.** Host reads it and
+   stamps its own clock → a `(host_time, device_sample_index)` pair on demand;
+   sampled over a run it measures clock drift/offset **directly**. *Buys:*
+   removes the clock-vs-loss ambiguity this doc wrestles with.
+5. **GPIF counter-capture-on-CTL-edge — the "right" PPS latch.** Instead of
+   forcing a *commit* on the PPS edge (what stalls the stream), have the GPIF
+   snapshot the sample counter into a register on the edge; the CPU exposes it
+   via EP0. **Sample-exact timing, zero stream perturbation**, reusing the same
+   CTL[2] wiring. A genuine *alternative* to the in-band marker, worth pursuing
+   in parallel regardless of how the edge experiment goes.
+
+**Monitoring / health (cheap GETSTATS additions)**
+
+6. **In-flight depth + high-water mark** — early warning before the host
+   actually drops.
+7. **USB3 link-recovery (LTSSM recovery) count** — marginal cables/links
+   retrain silently; a leading indicator that correlates with transport stalls.
+8. **DMA topology self-report (buffer size + count + sockets)** — removes the
+   hardcoded `FW_DMA_BUF_BYTES = 16384` and channel-depth assumptions.
+
+**Validation (ground truth for the tools themselves)**
+
+9. **Test-pattern / counter-ramp mode.** A known deterministic stream verifies
+   the transport bit-exactly and separates analog/ADC from transport faults.
+   *Buys:* validates the loss math against ground truth. *Caveat:* at 259 MB/s
+   the CPU cannot synthesize a ramp — this likely belongs to the **ADC's**
+   built-in test mode, with firmware enabling it and flagging it in GETSTATS.
+
+If only two get built, **#1 (drop counter)** and **#2 (sample-granular
+produced count)** are the highest value-per-effort: small GETSTATS additions
+that make the already-shipped host tools authoritative rather than inferential.
+**#5 (GPIF counter-capture latch)** is the standout because it chases the same
+prize as the in-band marker — sample-exact device timing — without perturbing
+the stream at all.
+
 ## Work breakdown
 
 1. Add `rx888_get_transfer_bytes()` to `include/librx888.h` +
