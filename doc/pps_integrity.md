@@ -292,17 +292,32 @@ pristine. The clock-independent produced-vs-delivered check exposed it (and
 prints the *implied* clock, `budget + loss added back`). This is the case
 the whole loss-accounting design exists for.
 
-**OPEN: the loss magnitude says this is a fixable rig artifact, not an
-intrinsic cost of marking.** A correct forced buffer commit costs ~0
-samples (it ships a partial early, then continues). But the loss is
-**~1 ms of stream per event (~397 events / 3 h)** with the device
-otherwise *pristine* — `PIB = 0`, `bad_xfers = 0`, `faults = 0` — i.e.
-buffers `glDMACount` counts as produced but that never become a USB
-transfer: the commit is dropping them *in the handoff*, not overflowing.
-A second tell: the marker size swings the **entire** range (≈2.5k–521k
-samples), so the commit fires at wildly inconsistent points — exactly what
-a metastable trigger produces. This points at **fixable input conditions,
-not the in-band concept**:
+**OPEN: the loss is consistent with a fixable rig artifact — but that is
+a hypothesis, not a measured result.** A correct forced buffer commit
+should cost ~0 samples (it ships a partial early, then continues). What we
+measure instead is loss that is **rare but, when it happens, large**:
+
+- Of 10,800 markers (1 Hz × 3 h), only **397 (3.68 %)** caused a *detected*
+  loss event, and those 397 carry essentially all 118 MB (median ~98k
+  samples each, ~1 ms). So the headline 42.3 ppm is **not** a per-marker
+  cost; it is a rare catastrophic mode. The other 96.3 % did not trip the
+  continuity detector — but that detector is jittery (it is demoted to a
+  diagnostic for exactly that reason), so "clean" means "below a noisy
+  floor," **not** verified zero. The true per-marker floor is unknown from
+  this data.
+- The device is *pristine* throughout — `PIB = 0`, `bad_xfers = 0`,
+  `faults = 0` — i.e. buffers `glDMACount` counts as produced but that
+  never become a USB transfer: the loss is in the handoff, not an overflow.
+
+Loss events are **26.9× enriched at buffer boundaries** (`pps_log_stats.py`),
+which points at a commit-vs-buffer-completion collision. Two cautions on
+how far that carries: the marker *size* distribution across all clean
+seconds is ~uniform (≈2.5k–521k samples) — that is **expected** from the
+incommensurate PPS-vs-fill phase, **not** itself evidence of anything; and
+**43.6 % of loss events are not boundary-adjacent**, so the boundary-race
+story does not account for all of them. The leading reading is still
+**fixable input conditions rather than the in-band concept**, but it
+rests on the suspects below, none yet tested:
 
 - **Edge quality.** The PPS reaches the FX3 through a 100 kΩ series
   resistor → a ~4 µs RC edge, which dwells in the input threshold for
@@ -314,32 +329,40 @@ not the in-band concept**:
   go metastable. A slow edge makes this far worse. Whether the FX3 GPIF
   synchronizes CTL inputs before they drive the commit is open.
 
-The firmware source narrows this further (see the KBA note below): in the
-`PPS_CTL_ENABLE=1` build that is actually running, the marker commit is
-performed **entirely inside the GPIF state machine in hardware** (states
-`TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`) — there is **no CPU `CommitBuffer()` or
-`SetWrapUp()` in the path**, and the streaming channel is
-`AUTO_MANY_TO_ONE` with cross-route correct by construction (each
-per-thread commit state only fires while that thread is active). So the
-loss is *internal to the GPIF state machine*, not a software commit-order
-bug — which puts the slow CTL[2] edge squarely in the frame: a ~4 µs edge
-can hold the control comparator in its threshold for hundreds of clocks,
-letting the state machine latch an indeterminate value and stall. A stall
-is the only thing that explains the *size* of the loss — ~250 KB/event is
-~15 DMA buffers (~1 ms), far more than the few-µs cost of a clean
-descriptor swap.
+The firmware source rules out one *class* of cause (see the KBA note
+below): in the `PPS_CTL_ENABLE=1` build that is actually running, the
+marker commit is performed **entirely inside the GPIF state machine in
+hardware** (states `TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`) — there is **no CPU
+`CommitBuffer()` or `SetWrapUp()` in the path**, and the streaming channel
+is `AUTO_MANY_TO_ONE` with cross-route correct by construction (each
+per-thread commit state only fires while that thread is active). That
+eliminates the software commit-ordering explanation and places the loss
+*inside the GPIF state machine*. The leading hypothesis from there is the
+slow CTL[2] edge driving the control comparator metastable: a ~4 µs edge
+can sit in the input threshold for hundreds of clocks, and a metastable
+latch could stall the state machine long enough to lose ~15 DMA buffers
+(~250 KB, ~1 ms) per event — far more than the few-µs cost of a clean
+descriptor swap. This is **inference, not a captured event**: we have not
+observed a metastable stall directly, nor confirmed whether the GPIF
+synchronizes CTL inputs, nor that the resistor is causal. It remains
+possible the AUTO channel simply cannot absorb an async commit interruption
+mid-descriptor regardless of edge quality, in which case a faster edge
+changes nothing.
 
-So this is **not** a verdict that in-band marking is unworkable. The
-investigation sequence is: (1) **done — 129.6 MSPS baseline = 42.3 ppm**
-on the current rig (slow-edge resistor); (2) fast/buffered edge; (3) GPIF
-input-synchronization. Watch both the loss **and** whether the marker-size
-swing tightens toward a consistent value — if the resistor/synchronizer
-collapse the loss toward the expected ~0–2 samples, in-band marking is
-viable, and it is the *finest* time source available (the short transfer's
-length encodes the edge's sample index sample-exactly, with no firmware
-machinery), so it is worth recovering. Until then, the out-of-band MCU
-latch (buffer-level, plus an optional byte-offset for sample-exactness)
-remains the safe fallback.
+So this is **not** a verdict either way — neither that in-band marking is
+unworkable nor that it is fixable. The investigation sequence is:
+(1) **done — 129.6 MSPS baseline = 42.3 ppm** (n = 1, slow-edge resistor);
+(2) fast/buffered edge; (3) GPIF input-synchronization. (2) and (3) are
+**tests that can fail.** Watch the loss and the boundary-enrichment
+together: if a clean edge collapses the per-event loss and pulls
+`pps_log_stats.py`'s `bnd-enr` toward 1×, the metastability reading holds
+and in-band marking becomes viable — and it would then be the *finest*
+time source available (the short transfer's length encodes the edge's
+sample index sample-exactly, with no firmware machinery), worth recovering.
+If the loss persists, or the non-boundary 43.6 % survives, the cause is
+something else and the out-of-band MCU latch (buffer-level, plus an
+optional byte-offset) stays the fallback. Until (2)/(3) run, that fallback
+is the only proven option.
 
 `-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
 out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
@@ -374,16 +397,17 @@ RX888 runs `PPS_CTL_ENABLE=1`, in which the marker commit is performed
   the `PPS_CTL_ENABLE=0` build and **never runs here**.)
 
 So the KBA was worth chasing and is now closed as a cause for this build.
-What it leaves behind is sharper, not weaker: with the entire software
-commit-ordering class eliminated, the loss is **internal to the GPIF state
-machine**, and the prime suspect is the slow CTL[2] edge driving the
-control comparator metastable (see "Clock-domain crossing" above). The
-loss *magnitude* is the clincher — ~250 KB/event (~15 DMA buffers, ~1 ms)
-is far too large for a clean descriptor swap (µs) and is the signature of
-the state machine stalling on an indeterminate latch, not a one-buffer
-ordering slip. The fast-edge experiment is now the decisive test: a clean
-(<1 clock) edge into a synchronized CTL input should collapse the
-per-event loss toward the intrinsic ~1–2 samples.
+What it eliminates is the *software commit-ordering* class; what remains is
+a loss **internal to the GPIF state machine**, with the slow CTL[2] edge
+the leading (not the only) suspect. The loss *magnitude* — ~250 KB/event
+(~15 DMA buffers, ~1 ms), too large for a clean descriptor swap (µs) — is
+**consistent with** a state-machine stall on an indeterminate latch, but
+that is an interpretation, not a measurement; we have not captured a stall.
+The fast-edge run is the next test and a real test: it may collapse the
+per-event loss toward ~1–2 samples (metastability confirmed), or leave it
+unchanged (cause is elsewhere — e.g. the AUTO channel not tolerating an
+async mid-descriptor commit at all). Either outcome is informative; only
+the first one makes in-band marking viable.
 
 ### Main thread — 1 Hz toggle loop
 
