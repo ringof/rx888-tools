@@ -330,6 +330,72 @@ remains the safe fallback.
 out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
 But the real questions are edge quality and input synchronization, above.
 
+#### A firmware-side lead: Infineon KBA231382 (commit-buffer failures)
+
+Infineon's KBA *"Handling Commit Buffer Failures Occurred during Video
+Transfers using FX3"* (KBA231382, AN75779/UVC reference) describes two
+ways `CyU3PDmaMultiChannelCommitBuffer()` returns
+`CY_U3P_ERROR_INVALID_SEQUENCE` (error 71) on a channel fed by the two
+ping-pong producer sockets `PIB_SOCKET_0`/`PIB_SOCKET_1`. Only one of the
+two scenarios is a candidate for what we measured — reading the actual
+article (not just the title) is what narrows it down:
+
+- **Scenario 1 — commit ordering (relevant).** `GetBuffer()` hands buffers
+  back in strict socket alternation (socket 0, then socket 1, …), matching
+  the GPIF fill order, and `CommitBuffer()` *must* commit in that same
+  alternation. Commit a socket-0 buffer when the next due buffer is from
+  socket 1 and the API fails with `INVALID_SEQUENCE` — the buffer's data
+  does not ship. A 1 Hz marker that forces a *partial* commit at an
+  arbitrary phase is exactly a way to commit out of the socket order the
+  GPIF state machine expects. This is the same race the
+  `pps_log_stats.py` boundary-enrichment (26.9×) is pointing at, now with
+  a named failure code.
+- **Scenario 2 — host too slow (does NOT fit).** All 8 buffers fill and
+  commit because the host stops draining; SDK ≤ 1.3.4 then re-hands an
+  already-committed buffer and the commit fails. This is backpressure, and
+  our control rules it out: `stream_soak` at the *same* 129.6 MSPS with no
+  marker loses nothing, so the host is keeping up. The marker, not a drain
+  stall, is the perturbation.
+
+Three caveats keep this a **lead, not a conclusion** (pending firmware
+source):
+
+1. The KBA is a *manual many-to-one* channel. If the RX888 streaming path
+   is a plain AUTO one-to-one channel, Scenario 1 does not apply *as
+   written* — **but the marker mechanism itself reintroduces a
+   firmware-driven partial commit into an otherwise-automatic stream**,
+   which is precisely the manual-commit hazard the KBA is about. The
+   sanctioned partial flush on an AUTO channel is
+   `CyU3PDmaChannelSetWrapUp()`, not a hand-rolled `CommitBuffer()`.
+2. We never observed error 71: the pristine baseline reads `faults = 0`.
+   So *if* this is the mechanism, the RX888 firmware's commit path is
+   **swallowing the return code** — the buffer is dropped silently and no
+   counter we read via GETSTATS moves. That is consistent with "produced
+   by `glDMACount`, never delivered as a USB transfer."
+3. The KBA is explicit that even its SDK fix **does not prevent the data
+   loss** — it only makes the failure clean. Genuine zero-loss flow
+   control needs buffering ahead of the FX3 (their answer: an FPGA). For
+   us the equivalent is making the marker commit *not collide* in the
+   first place (edge quality / synchronizer / socket-aware commit), not
+   catching the error after the fact.
+
+So the KBA corroborates the boundary-race reading and supplies the likely
+failure code, but it sits alongside — not above — the hardware leads
+(slow edge, CDC). Questions for whoever holds the RX888 FX3 firmware:
+
+1. Is the streaming DMA channel **AUTO or MANUAL**, and one-to-one or
+   many-to-one (i.e. are both `PIB_SOCKET_0/1` producers in play)?
+2. How is the PPS marker's partial commit performed —
+   `CyU3PDmaChannelSetWrapUp()` (the sanctioned partial flush) or a manual
+   `CommitBuffer()`?
+3. If many-to-one/manual, does the forced marker commit respect the strict
+   socket-0→socket-1 alternation the GPIF fill order requires? An
+   out-of-order forced commit is Scenario 1 exactly.
+4. Is the commit return code checked, and is `INVALID_SEQUENCE` counted
+   anywhere GETSTATS can surface? (`faults = 0` says today it is not — the
+   silent-drop hypothesis.) What FX3 SDK version is the firmware built
+   against (≤ 1.3.4 carries the Scenario-2 GetBuffer relook bug)?
+
 ### Main thread — 1 Hz toggle loop
 
 1. `clock_gettime(CLOCK_REALTIME)` — wall-clock timestamp per edge.
