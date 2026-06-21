@@ -270,36 +270,39 @@ not.
 
 ### Marker injection, not throughput, perturbs the stream (and the loss is anomalously large — root cause OPEN)
 
-Measured on real hardware, 3 h each:
+Measured on real hardware, 3 h each (sleep inhibited; in-flight-corrected):
 
-| run | rate | throughput | short xfers | loss |
-|-----|------|-----------|-------------|------|
-| `stream_soak` (no marker) | 64 MSPS | 128 MB/s | 0 | 0 |
-| `stream_soak` (no marker) | 129.6 MSPS | 259 MB/s | 0 | 0 |
-| `pps_integrity` (1 Hz marker) | 129 MSPS | 258 MB/s | 333 | ~82 MB |
+| run | rate | short xfers | loss | device |
+|-----|------|-------------|------|--------|
+| `stream_soak` (no marker) | 64 MSPS | 0 | 0 | clean |
+| `stream_soak` (no marker) | 129.6 MSPS | 0 | 0 | clean |
+| `pps_integrity` (1 Hz marker) | 129.6 MSPS | 403 | **118 MB = 42.3 ppm** | clean (PIB=0, bad=0, faults=0) |
 
 Two firm conclusions and one open question:
 
-**Firm: it is not a throughput ceiling.** The bare stream sustains 259 MB/s
-losslessly with zero short transfers (`produced == delivered`, `PIB = 0`,
-`bad_xfers = 0`). The direction is conclusive — the *lossy* run was at the
-*lower* throughput (129) *with* the marker, while the *higher* bare rate
-(129.6) was clean; a drain limit would fail the higher rate first. The
-loss is associated with the PPS marker mechanism, not the data rate.
+**Firm: it is not a throughput ceiling, it's the marker.** Same rate (129.6),
+same duration, healthy device both ways: the bare stream loses nothing, the
+marker run loses 42.3 ppm. The streaming path sustains 259 MB/s fine. (The
+bare stream is even clean at the *higher*-stress comparison — a drain limit
+would fail it first.)
 
-**Firm: the budget alone would have missed it.** With a +28 ppm fast ADC
-clock and ~30 ppm loss, the sample-rate budget read **−1.2 ppm** —
-apparently fine. The clock-independent produced-vs-delivered check exposed
-it (and prints the *implied* clock, `budget + loss added back`). This is
-the case the whole loss-accounting design exists for.
+**Firm: the budget alone would have missed it.** With a +41.8 ppm fast ADC
+clock and 42.3 ppm loss, the sample-rate budget read **−0.5 ppm** —
+pristine. The clock-independent produced-vs-delivered check exposed it (and
+prints the *implied* clock, `budget + loss added back`). This is the case
+the whole loss-accounting design exists for.
 
 **OPEN: the loss magnitude says this is a fixable rig artifact, not an
 intrinsic cost of marking.** A correct forced buffer commit costs ~0
-samples (it ships a partial early, then continues). But the measured loss
-is **~140–250 KB per event ≈ 0.5–1 ms of stream lost each time** — ~500×
-longer than a clean commit should take. That is a stall/glitch, not "a
-sample or two," and points at **fixable input conditions, not the in-band
-concept**:
+samples (it ships a partial early, then continues). But the loss is
+**~1 ms of stream per event (~397 events / 3 h)** with the device
+otherwise *pristine* — `PIB = 0`, `bad_xfers = 0`, `faults = 0` — i.e.
+buffers `glDMACount` counts as produced but that never become a USB
+transfer: the commit is dropping them *in the handoff*, not overflowing.
+A second tell: the marker size swings the **entire** range (≈2.5k–521k
+samples), so the commit fires at wildly inconsistent points — exactly what
+a metastable trigger produces. This points at **fixable input conditions,
+not the in-band concept**:
 
 - **Edge quality.** The PPS reaches the FX3 through a 100 kΩ series
   resistor → a ~4 µs RC edge, which dwells in the input threshold for
@@ -312,14 +315,16 @@ concept**:
   synchronizes CTL inputs before they drive the commit is open.
 
 So this is **not** a verdict that in-band marking is unworkable. The
-investigation sequence is: (1) matched 129 MSPS baseline on the current
-rig; (2) fast/buffered edge; (3) GPIF input-synchronization. If (2)+(3)
-bring the per-marker cost to the expected ~0–2 samples, in-band marking is
-viable — and it is the *finest* time source available (the short
-transfer's length encodes the edge's sample index sample-exactly, with no
-firmware machinery), so it is worth recovering. Until then, the
-out-of-band MCU latch (buffer-level, plus an optional byte-offset for
-sample-exactness) remains the safe fallback.
+investigation sequence is: (1) **done — 129.6 MSPS baseline = 42.3 ppm**
+on the current rig (slow-edge resistor); (2) fast/buffered edge; (3) GPIF
+input-synchronization. Watch both the loss **and** whether the marker-size
+swing tightens toward a consistent value — if the resistor/synchronizer
+collapse the loss toward the expected ~0–2 samples, in-band marking is
+viable, and it is the *finest* time source available (the short transfer's
+length encodes the edge's sample index sample-exactly, with no firmware
+machinery), so it is worth recovering. Until then, the out-of-band MCU
+latch (buffer-level, plus an optional byte-offset for sample-exactness)
+remains the safe fallback.
 
 `-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
 out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
