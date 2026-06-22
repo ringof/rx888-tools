@@ -444,14 +444,18 @@ int main(int argc, char **argv)
         if (st_start.drain_valid && st_end.drain_valid) {
             uint32_t backlog0 = fw_backlog(&st_start);
             uint32_t backlog1 = fw_backlog(&st_end);
-            if (backlog1 >= BACKLOG_SANE_MAX)
-                printf("DMA drain:       backlog implausible (%.1f MB) — consumer "
-                       "xferCount not tracking\n", (double)backlog1 / 1e6);
+            int64_t  orphan   = (int64_t)backlog1 - (int64_t)backlog0;
+            if (backlog0 >= BACKLOG_SANE_MAX || backlog1 >= BACKLOG_SANE_MAX ||
+                orphan >= (int64_t)BACKLOG_SANE_MAX || orphan <= -(int64_t)BACKLOG_SANE_MAX)
+                printf("DMA drain:       producer/consumer counters incoherent "
+                       "(backlog %.1f -> %.1f MB) — producer xferCount not the "
+                       "full-stream byte count (one socket of the many-to-one?)\n",
+                       (double)backlog0 / 1e6, (double)backlog1 / 1e6);
             else
                 printf("DMA drain:       backlog (produced-consumed) %.3f -> "
                        "%.3f MB, orphaned %+.3f MB (expect ~0 with no marker)\n",
                        (double)backlog0 / 1e6, (double)backlog1 / 1e6,
-                       ((double)backlog1 - (double)backlog0) / 1e6);
+                       (double)orphan / 1e6);
         } else {
             printf("DMA drain:       not reported by this firmware (GETSTATS "
                    "< 48 B) — flash the socket-xferCount build\n");

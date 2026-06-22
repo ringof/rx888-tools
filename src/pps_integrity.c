@@ -813,12 +813,21 @@ int main(int argc, char **argv)
         uint32_t backlog0    = fw_backlog(&st_start);
         uint32_t backlog1    = fw_backlog(&st_end);
         int32_t  cons_skew   = (int32_t)(st_end.drain_cons - st_end.drain_raw);
-        if (backlog1 >= BACKLOG_SANE_MAX) {
-            printf("DMA drain:       backlog implausible (%.1f MB) — consumer "
-                   "xferCount not tracking; cross-check unavailable\n",
-                   (double)backlog1 / 1e6);
+        int64_t  orphan_bytes = (int64_t)backlog1 - (int64_t)backlog0;
+        /* A real backlog is a few MB at most (4-buffer channel); it must be
+         * small at BOTH ends and the orphan growth bounded. GB-scale or
+         * negative-GB values mean producer and consumer counters are not a
+         * coherent pair (e.g. producer = a single socket of the many-to-one,
+         * so it advances at a different rate than the full consumer). */
+        if (backlog0 >= BACKLOG_SANE_MAX || backlog1 >= BACKLOG_SANE_MAX ||
+            orphan_bytes >= (int64_t)BACKLOG_SANE_MAX ||
+            orphan_bytes <= -(int64_t)BACKLOG_SANE_MAX) {
+            printf("DMA drain:       producer/consumer counters incoherent "
+                   "(backlog %.1f -> %.1f MB; API-vs-rawreg skew %d B) — producer "
+                   "xferCount is not the full-stream byte count (one socket of "
+                   "the many-to-one?); cross-check unavailable\n",
+                   (double)backlog0 / 1e6, (double)backlog1 / 1e6, cons_skew);
         } else {
-            int64_t orphan_bytes = (int64_t)backlog1 - (int64_t)backlog0;
             double  orphan_mb    = (double)orphan_bytes / 1e6;
             printf("DMA drain:       backlog (produced-consumed) %.3f -> %.3f MB, "
                    "orphaned %+.3f MB in the DMA->USB drain "
