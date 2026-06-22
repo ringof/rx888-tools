@@ -298,11 +298,40 @@ not.
 
 Measured on real hardware, 3 h each (sleep inhibited; in-flight-corrected):
 
-| run | rate | short xfers | loss | device |
+| run | rate | spurious shorts | loss | device |
 |-----|------|-------------|------|--------|
 | `stream_soak` (no marker) | 64 MSPS | 0 | 0 | clean |
 | `stream_soak` (no marker) | 129.6 MSPS | 0 | 0 | clean |
-| `pps_integrity` (1 Hz marker) | 129.6 MSPS | 403 | **118 MB = 42.3 ppm** | clean (PIB=0, bad=0, faults=0) |
+| `pps_integrity` (1 Hz, 100 kΩ slow edge) | 129.6 MSPS | 403 | **118 MB = 42.3 ppm** | clean (PIB=0, bad=0, faults=0) |
+| `pps_integrity` (1 Hz, 1 kΩ fast edge) | 129.6 MSPS | **0** | **115 MB = 41.2 ppm** | clean |
+
+**Edge experiment (1 kΩ) result — the edge is not the loss.** Swapping the
+100 kΩ series resistor for 1 kΩ (a ~100× faster edge) **eliminated the
+spurious shorts (403 → 0) and halved displaced markers (61 → 32)** — marker
+*fidelity* improved, confirming the slow edge had been chattering across the
+input threshold and tripping the TOGGLE comparator spuriously. But the
+**loss did not move (42.3 → 41.2 ppm, within n=1 noise), and the
+boundary-enrichment signature is intact (26.9× → 25.8×) with an *identical*
+dip magnitude (median 98,347 → 98,220 samples ≈ 12 DMA buffers).** Two
+independent 3 h runs, same enrichment, same characteristic loss size: this
+is a **stable, reproducible structural commit-vs-buffer-boundary collision**,
+not edge metastability. Edge quality governs fidelity; the buffer boundary
+governs loss — decoupled, confirmed both directions.
+
+This also **down-weights the synchronizer as a *loss* fix.** A synchronizer
+makes the commit fire on a deterministic clock but does not move *where* it
+lands relative to the buffer boundary (that is set by the async PPS arrival
+time); a marker in the danger band still collides. And the clean edge
+already crushed metastable events without touching the boundary loss, so the
+boundary loss is not metastability-driven. The lever that remains is
+**boundary-aware commit logic in the GPIF state machine** — defer or
+suppress the forced partial commit when it would land within the danger band
+(recording the deferred offset so the marker timing stays recoverable). The
+quantized ~12-buffer loss points squarely at the open firmware question:
+does a consumer-socket wrap-up landing near a boundary orphan already-counted
+buffers in the DMA→USB drain? Strategically this strengthens **#5**
+(capture the edge's sample index *without* forcing a commit), which sidesteps
+the boundary collision entirely.
 
 Two firm conclusions and one open question:
 
@@ -378,36 +407,41 @@ path:
 
 So the metastability *mechanism path* is real and firmware-confirmed: a
 ~4 µs async edge, sampled directly with no synchronizer by a toggle
-comparator on a 129.6 MHz clock, driving a state transition — the textbook
-setup for a metastable sample to push the state machine into an undefined
-state and stall it long enough to lose ~15 DMA buffers (~250 KB, ~1 ms).
-**What is still not proven** is that this path is what produces the 397
-catastrophic events: we have not captured a metastable stall, and **43.6 %
-of loss events are not boundary-adjacent**, which a pure edge-collision
-story does not yet explain. The causal test is the edge fix.
+comparator on a 129.6 MHz clock, driving a state transition. That path is
+real — and the 1 kΩ edge experiment showed it **drives marker fidelity
+(spurious chatter), not the data loss**: cleaning the edge took spurious
+shorts 403 → 0 but left the loss and its boundary-enrichment unchanged (see
+the edge-experiment note under the table). So the loss is **not** a
+metastable stall on this edge; it is a structural collision when the forced
+commit lands near a buffer boundary, regardless of edge quality. The 43.6 %
+of loss events that are not boundary-adjacent remain a separate open thread.
 
 So this is **not** a verdict either way — neither that in-band marking is
-unworkable nor that it is fixable. With the path confirmed, the experiment
-order is now clear and **edge-first**:
+unworkable nor that it is fixable. The experiment sequence and where it
+landed:
 (1) **done — 129.6 MSPS baseline = 42.3 ppm** (n = 1, slow-edge resistor);
-(2) **fast/buffered edge (lower R)** — directly attacks the ~500-cycle
-threshold dwell, the cheapest change and the one most likely to move the
-result; (3) **a synchronizer state in the GPIF waveform** — belt-and-
-suspenders for any residual metastability once the edge is clean. Both are
-**tests that can fail.** Watch the loss and the boundary-enrichment
-together: if a clean edge collapses the per-event loss and pulls
-`pps_log_stats.py`'s `bnd-enr` toward 1×, the metastability reading holds
-and in-band marking becomes viable — and it would then be the *finest*
-time source available (the short transfer's length encodes the edge's
-sample index sample-exactly, with no firmware machinery), worth recovering.
-If the loss persists, or the non-boundary 43.6 % survives, the cause is
-something else and the out-of-band MCU latch (buffer-level, plus an
-optional byte-offset) stays the fallback. Until (2)/(3) run, that fallback
-is the only proven option.
+(2) **done — 1 kΩ fast edge = 41.2 ppm, loss unchanged.** The clean edge
+fixed *fidelity* (spurious 403 → 0, displaced halved) but left the loss and
+its 26.9× → 25.8× boundary-enrichment intact — so the loss is a **structural
+commit-vs-boundary collision, not edge metastability** (see the edge-
+experiment note under the table above);
+(3) **a synchronizer state** — still untried, but now **down-weighted as a
+loss fix**: it makes the commit deterministic but cannot move where it lands
+relative to the buffer boundary, and the clean edge already showed the
+boundary loss is not metastability-driven. The lever the data now points at
+is **boundary-aware commit logic** (defer/suppress the partial commit in the
+danger band) plus the open firmware question of whether a near-boundary
+consumer wrap-up orphans buffers in the DMA→USB drain.
+The fallback is unchanged: the out-of-band MCU latch (buffer-level, plus an
+optional byte-offset) — or, better, **#5** (capture the edge's sample index
+without forcing a commit), which sidesteps the boundary collision entirely.
+Until a boundary-aware firmware change is tried, that fallback is the only
+proven option.
 
 `-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
 out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
-But the real questions are edge quality and input synchronization, above.
+But the real question, post-edge-experiment, is **boundary-aware commit
+logic** in the GPIF state machine, above.
 
 #### Investigated and ruled out: Infineon KBA231382 (commit-buffer failures)
 
