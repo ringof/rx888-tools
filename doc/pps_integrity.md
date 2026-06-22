@@ -240,18 +240,23 @@ loss correlates 26.9× with the *device-internal* buffer-fill phase
 (`minxfer`), which the host neither sees nor controls, so it cannot be a
 host-delivery artifact.
 
-The firmware now exposes the **consumer** side too: `glDMAConsCount`
-(`CY_U3P_DMA_CB_CONS_EVENT`, GETSTATS `[36..39]`) counts buffers drained
-*out* to USB. The tools read it (requesting the 40-byte response; absent on
-older firmware → reported as unavailable) and surface **produced −
-consumed** — the firmware's own in-flight + orphaned count — both per
-second (an `orphan+N (drain)` note on the second a step lands, correlating
-it with the dip) and as a summary **cross-check**: with USB-wire loss ruled
-out, `consumed ≈ delivered`, so `produced − consumed` (firmware) should
-equal `produced − delivered` (host). Agreement pins the loss to the
-in-chip producer→consumer hop (orphaned in the drain); a `consumed >
-delivered` gap would instead indict the USB wire. In `stream_soak` the same
-delta should sit at the steady in-flight depth — the "no orphaning"
+The firmware also exposes the **consumer** side. (`CY_U3P_DMA_CB_CONS_EVENT`
+never fires on an AUTO channel — proven on hardware, the callback counter
+stayed pinned at 0 — so the firmware reads the **socket `xferCount`
+registers** directly instead.) GETSTATS now carries, in bytes:
+producer `xferCount` `[36..39]`, consumer `xferCount` (SDK API) `[40..43]`,
+and consumer `xferCount` (raw register) `[44..47]`, in a 48-byte response.
+These are 32-bit byte counters that **wrap ~every 16 s** at 129.6 MSPS, so
+only the *instantaneous* **backlog = producer − consumer** is meaningful
+(both wrap together, and the backlog — in-flight + orphaned — never nears
+2³²). The tools read it (absent on older firmware → reported unavailable)
+and surface the backlog both per second (an `orphan+NKB (drain)` note on
+the second a step lands, correlating it with the dip) and as a summary
+**cross-check**: the backlog's *growth* over the run is the orphaned bytes,
+and with USB-wire loss ruled out it should equal the host's
+`produced − delivered`. Agreement pins the loss to the in-chip
+producer→consumer hop (orphaned in the drain). In `stream_soak` the backlog
+should stay flat at the steady in-flight depth — the "no orphaning"
 baseline the marker's steps stand out against.
 
 One accounting nuance follows from the PROD_EVENT semantics: it fires per

@@ -168,13 +168,24 @@
  * shorter response; the USB block delivers only what it has, so the cons
  * field is simply absent (cons_valid stays 0) and everything else still
  * decodes. */
-#define GETSTATS_LEN      40
+#define GETSTATS_LEN      48
 #define GETSTATS_MIN_LEN  26
-#define GETSTATS_CONS_OFF 36   /* glDMAConsCount: DMA buffers drained to USB */
-#define GETSTATS_CONS_END 40   /* need at least this many bytes for the field */
-/* produced-consumed normally wobbles by the in-flight depth (channel holds 4
- * buffers); a per-second step beyond this is an orphaned buffer, not wobble. */
-#define ORPHAN_STEP_BUFS  6
+/* Drain instrumentation. CONS_EVENT never fires on an AUTO channel, so the
+ * firmware reads the socket xferCount registers instead. All three are 32-bit
+ * BYTE counters that WRAP ~every 16 s at 129.6 MSPS, so only the INSTANTANEOUS
+ * producer-minus-consumer difference is meaningful — both wrap together, and
+ * the backlog (in-flight + orphaned) never approaches 2^32. apiCons (SDK API)
+ * and rawCons (direct register) are two reads of the consumer count. */
+#define GETSTATS_DRAIN_PROD 36   /* producer socket xferCount, bytes */
+#define GETSTATS_DRAIN_CONS 40   /* consumer socket xferCount, bytes (API) */
+#define GETSTATS_DRAIN_RAW  44   /* consumer socket xferCount, bytes (raw reg) */
+#define GETSTATS_DRAIN_END  48   /* need this many bytes for all three */
+/* The backlog wobbles by the in-flight depth (4 x 16 KB); a step well past
+ * that is an orphaned buffer. ~6 buffers separates the two. */
+#define ORPHAN_STEP_BYTES (6 * FW_DMA_BUF_BYTES)
+/* Sanity cap: the backlog tops out at tens of MB; anything past this means the
+ * consumer counter is not tracking, so suppress the (meaningless) orphan note. */
+#define BACKLOG_SANE_MAX  (1u << 28)   /* 256 MB */
 
 struct pps_ctx {
     _Atomic int      expecting_marker;  /* armed before each rising edge */
@@ -197,23 +208,32 @@ struct pps_ctx {
  * equally; only real loss makes produced exceed delivered). NOTE: glDMACount
  * resets on STOPFX3, so the end snapshot must be read before rx888_stop().
  *
- * dma_cons_count is glDMAConsCount: DMA buffers the consumer socket *drained*
- * to USB (incremented on CY_U3P_DMA_CB_CONS_EVENT). produced - consumed is the
- * firmware's own view of buffers still inside the DMA channel — normally just
- * the steady in-flight (<= channel depth, 4), but it STEPS UP and never
- * recovers when a buffer is orphaned in the DMA->USB drain. This is the
- * firmware-side counterpart to the host produced-vs-delivered check, and
- * pins the loss to the producer->consumer (in-chip) hop vs the consumer->host
- * (USB) hop. cons_valid is 0 against firmware too old to report the field. */
+ * drain_prod/drain_cons are the producer/consumer socket xferCounts in BYTES
+ * (the firmware reads the registers directly; CONS_EVENT never fires on an
+ * AUTO channel). They wrap ~every 16 s, so the meaningful quantity is the
+ * instantaneous backlog = drain_prod - drain_cons (wrap-safe; both wrap
+ * together) = bytes still inside the DMA channel: normally the steady
+ * in-flight, but it STEPS UP and never recovers when a buffer is orphaned in
+ * the DMA->USB drain. drain_raw is a second read of the consumer count (direct
+ * register) for cross-check. drain_valid is 0 against firmware too old. */
 struct fw_stats {
     uint32_t dma_count;        /* glDMACount: DMA buffers produced (GPIF->DMA) */
-    uint32_t dma_cons_count;   /* glDMAConsCount: DMA buffers drained to USB */
-    int      cons_valid;       /* 1 if the firmware returned the [36..39] field */
+    uint32_t drain_prod;       /* producer socket xferCount, bytes (wraps ~16s) */
+    uint32_t drain_cons;       /* consumer socket xferCount, bytes (API)  */
+    uint32_t drain_raw;        /* consumer socket xferCount, bytes (raw reg) */
+    int      drain_valid;      /* 1 if the firmware returned [36..47] */
     uint32_t pib_errors;
     uint32_t streaming_faults;
     uint32_t boot_count;
     int      valid;
 };
+
+/* Backlog = bytes produced into the channel but not yet drained to USB.
+ * Wrap-safe because drain_prod and drain_cons wrap together at 2^32 and the
+ * true backlog is far below 2^32. */
+static inline uint32_t fw_backlog(const struct fw_stats *s) {
+    return s->drain_prod - s->drain_cons;
+}
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -278,9 +298,11 @@ static int read_fw_stats(libusb_device_handle *h, struct fw_stats *s)
     memcpy(&s->pib_errors,       &buf[5],  4);
     memcpy(&s->streaming_faults, &buf[15], 4);
     memcpy(&s->boot_count,       &buf[20], 4);
-    if (r >= GETSTATS_CONS_END) {
-        memcpy(&s->dma_cons_count, &buf[GETSTATS_CONS_OFF], 4);
-        s->cons_valid = 1;
+    if (r >= GETSTATS_DRAIN_END) {
+        memcpy(&s->drain_prod, &buf[GETSTATS_DRAIN_PROD], 4);
+        memcpy(&s->drain_cons, &buf[GETSTATS_DRAIN_CONS], 4);
+        memcpy(&s->drain_raw,  &buf[GETSTATS_DRAIN_RAW],  4);
+        s->drain_valid = 1;
     }
     s->valid = 1;
     return 0;
@@ -486,11 +508,11 @@ int main(int argc, char **argv)
     uint64_t max_deficit = 0;                     /* largest inter-marker deficit seen */
     uint32_t pib_prev = st_start.valid ? st_start.pib_errors : 0;
     uint64_t pib_seconds = 0, pib_with_deficit = 0;  /* per-second PIB localisation */
-    /* Track produced-consumed (firmware in-flight + orphaned). High-water so a
-     * sustained step (a buffer orphaned in the drain) shows on the second it
-     * happens — directly correlating the orphan with the marker/dip. */
-    uint32_t orphan_hw = (st_start.valid && st_start.cons_valid)
-                       ? st_start.dma_count - st_start.dma_cons_count : 0;
+    /* Track the drain backlog high-water (bytes) so a sustained step — a buffer
+     * orphaned in the drain — shows on the second it happens, correlating the
+     * orphan with the marker/dip. */
+    uint32_t orphan_hw = (st_start.valid && st_start.drain_valid)
+                       ? fw_backlog(&st_start) : 0;
     int mid_reset = 0;
     int internal_stop = 0, ctrl_fault = 0;
 
@@ -616,20 +638,19 @@ int main(int argc, char **argv)
                 snprintf(note + strlen(note), sizeof note - strlen(note),
                          "  DEVICE RESET");
             }
-            /* Orphan tracker: produced-consumed wobbles by the in-flight depth
-             * (<= 4 buffers) normally; a step well past that is a buffer
-             * orphaned in the DMA->USB drain. Only meaningful once the consumer
-             * counter is actually advancing — a firmware that never fires
-             * CONS_EVENT leaves it pinned at 0, which would otherwise "step" by
-             * the whole production rate every second. */
-            if (cur.cons_valid && st_start.cons_valid &&
-                cur.dma_cons_count > st_start.dma_cons_count) {
-                uint32_t orphan = cur.dma_count - cur.dma_cons_count;
-                if (orphan > orphan_hw + ORPHAN_STEP_BUFS) {
-                    snprintf(note + strlen(note), sizeof note - strlen(note),
-                             "  orphan+%u (drain)", orphan - orphan_hw);
+            /* Orphan tracker: the drain backlog wobbles by the in-flight depth
+             * normally; a step well past that is a buffer orphaned in the
+             * DMA->USB drain. The sanity cap suppresses the note if the
+             * consumer counter is not tracking (backlog would blow up). */
+            if (cur.drain_valid && st_start.drain_valid) {
+                uint32_t backlog = fw_backlog(&cur);
+                if (backlog < BACKLOG_SANE_MAX) {
+                    if (backlog > orphan_hw + ORPHAN_STEP_BYTES)
+                        snprintf(note + strlen(note), sizeof note - strlen(note),
+                                 "  orphan+%uKB (drain)",
+                                 (backlog - orphan_hw) / 1024);
+                    if (backlog > orphan_hw) orphan_hw = backlog;
                 }
-                if (orphan > orphan_hw) orphan_hw = orphan;
             }
         }
 
@@ -784,43 +805,36 @@ int main(int argc, char **argv)
                (double)produced_bytes / 1e9, bufs_produced, FW_DMA_BUF_BYTES,
                (double)delivered_bytes / 1e9, (double)undeliv_bytes / 1e6,
                lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
-    /* Firmware drain cross-check (glDMAConsCount). produced-consumed is the
-     * firmware's own count of buffers still in the channel; with USB-wire loss
-     * ruled out, consumed should match host-delivered, so produced-consumed
-     * should equal host undelivered — and that pins the loss to the in-chip
-     * producer->consumer hop (orphaned in the DMA->USB drain) rather than the
-     * USB wire. The steady in-flight (<= channel depth) is the only honest
-     * slack. */
-    if (st_start.valid && st_end.valid && st_start.cons_valid && st_end.cons_valid
-        && (st_end.dma_cons_count - st_start.dma_cons_count) == 0 && bufs_produced > 64) {
-        /* Counter present in GETSTATS but pinned at 0 while production runs:
-         * CONS_EVENT is not firing (expected on an AUTO channel — read the
-         * consumer socket's transfer-count register instead). Say so plainly
-         * rather than reporting the whole stream as "orphaned". */
-        printf("DMA drain:       glDMAConsCount did not advance (0 consumer "
-               "events over %" PRIu32 " produced buffers) — firmware CONS_EVENT "
-               "not firing; drain cross-check unavailable\n", bufs_produced);
-    } else if (st_start.valid && st_end.valid && st_start.cons_valid && st_end.cons_valid) {
-        uint32_t bufs_consumed = st_end.dma_cons_count - st_start.dma_cons_count; /* mod 2^32 */
-        int64_t  orphan_bufs   = (int64_t)bufs_produced - (int64_t)bufs_consumed;
-        double   orphan_mb     = (double)orphan_bufs * FW_DMA_BUF_BYTES / 1e6;
-        int64_t  delivered_bufs = (int64_t)(delivered_bytes / FW_DMA_BUF_BYTES);
-        int64_t  wire_bufs      = (int64_t)bufs_consumed - delivered_bufs; /* consumer->host */
-        printf("DMA drain:       consumed %" PRIu32 " buffers, produced-consumed "
-               "= %+lld buf = %+.3f MB orphaned in DMA->USB drain "
-               "(in-flight <= channel depth)\n",
-               bufs_consumed, (long long)orphan_bufs, orphan_mb);
-        /* Agreement: firmware orphan vs host undelivered, within in-flight slack. */
-        double diff_mb = orphan_mb - (double)undeliv_bytes / 1e6;
-        if (pd_valid)
-            printf("  cross-check:   firmware orphan %+.3f MB vs host undelivered "
-                   "%+.3f MB (Δ %+.3f MB); USB-wire consumer-host gap %+lld buf — %s\n",
-                   orphan_mb, (double)undeliv_bytes / 1e6, diff_mb,
-                   (long long)wire_bufs,
-                   (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
-                                    && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
-                     ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
-                     : "MISMATCH: see consumer-host gap");
+    /* Firmware drain cross-check (socket xferCount registers). The backlog
+     * (produced-consumed, bytes) grows by exactly the orphaned amount over the
+     * run; with USB-wire loss ruled out it should equal the host's undelivered
+     * bytes — pinning the loss to the in-chip producer->consumer hop. */
+    if (st_start.valid && st_end.valid && st_start.drain_valid && st_end.drain_valid) {
+        uint32_t backlog0    = fw_backlog(&st_start);
+        uint32_t backlog1    = fw_backlog(&st_end);
+        int32_t  cons_skew   = (int32_t)(st_end.drain_cons - st_end.drain_raw);
+        if (backlog1 >= BACKLOG_SANE_MAX) {
+            printf("DMA drain:       backlog implausible (%.1f MB) — consumer "
+                   "xferCount not tracking; cross-check unavailable\n",
+                   (double)backlog1 / 1e6);
+        } else {
+            int64_t orphan_bytes = (int64_t)backlog1 - (int64_t)backlog0;
+            double  orphan_mb    = (double)orphan_bytes / 1e6;
+            printf("DMA drain:       backlog (produced-consumed) %.3f -> %.3f MB, "
+                   "orphaned %+.3f MB in the DMA->USB drain "
+                   "(byte-exact; API-vs-rawreg skew %d B)\n",
+                   (double)backlog0 / 1e6, (double)backlog1 / 1e6, orphan_mb,
+                   cons_skew);
+            double diff_mb = orphan_mb - (double)undeliv_bytes / 1e6;
+            if (pd_valid)
+                printf("  cross-check:   firmware orphan %+.3f MB vs host "
+                       "undelivered %+.3f MB (Δ %+.3f MB) — %s\n",
+                       orphan_mb, (double)undeliv_bytes / 1e6, diff_mb,
+                       (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
+                                        && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
+                         ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
+                         : "see delta (orphan vs undelivered)");
+        }
     }
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
