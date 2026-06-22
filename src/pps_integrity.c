@@ -618,9 +618,12 @@ int main(int argc, char **argv)
             }
             /* Orphan tracker: produced-consumed wobbles by the in-flight depth
              * (<= 4 buffers) normally; a step well past that is a buffer
-             * orphaned in the DMA->USB drain. Report the jump above the prior
-             * high-water so it lands on the dip's line. */
-            if (cur.cons_valid && st_start.cons_valid) {
+             * orphaned in the DMA->USB drain. Only meaningful once the consumer
+             * counter is actually advancing — a firmware that never fires
+             * CONS_EVENT leaves it pinned at 0, which would otherwise "step" by
+             * the whole production rate every second. */
+            if (cur.cons_valid && st_start.cons_valid &&
+                cur.dma_cons_count > st_start.dma_cons_count) {
                 uint32_t orphan = cur.dma_count - cur.dma_cons_count;
                 if (orphan > orphan_hw + ORPHAN_STEP_BUFS) {
                     snprintf(note + strlen(note), sizeof note - strlen(note),
@@ -788,7 +791,16 @@ int main(int argc, char **argv)
      * producer->consumer hop (orphaned in the DMA->USB drain) rather than the
      * USB wire. The steady in-flight (<= channel depth) is the only honest
      * slack. */
-    if (st_start.valid && st_end.valid && st_start.cons_valid && st_end.cons_valid) {
+    if (st_start.valid && st_end.valid && st_start.cons_valid && st_end.cons_valid
+        && (st_end.dma_cons_count - st_start.dma_cons_count) == 0 && bufs_produced > 64) {
+        /* Counter present in GETSTATS but pinned at 0 while production runs:
+         * CONS_EVENT is not firing (expected on an AUTO channel — read the
+         * consumer socket's transfer-count register instead). Say so plainly
+         * rather than reporting the whole stream as "orphaned". */
+        printf("DMA drain:       glDMAConsCount did not advance (0 consumer "
+               "events over %" PRIu32 " produced buffers) — firmware CONS_EVENT "
+               "not firing; drain cross-check unavailable\n", bufs_produced);
+    } else if (st_start.valid && st_end.valid && st_start.cons_valid && st_end.cons_valid) {
         uint32_t bufs_consumed = st_end.dma_cons_count - st_start.dma_cons_count; /* mod 2^32 */
         int64_t  orphan_bufs   = (int64_t)bufs_produced - (int64_t)bufs_consumed;
         double   orphan_mb     = (double)orphan_bufs * FW_DMA_BUF_BYTES / 1e6;

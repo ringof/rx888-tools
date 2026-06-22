@@ -428,12 +428,17 @@ int main(int argc, char **argv)
          * stay at the steady in-flight depth — the "no orphaning" baseline. */
         if (st_start.cons_valid && st_end.cons_valid) {
             uint32_t bufs_consumed = st_end.dma_cons_count - st_start.dma_cons_count;
-            int64_t  orphan_bufs   = (int64_t)bufs_produced - (int64_t)bufs_consumed;
-            printf("DMA drain:       consumed %" PRIu32 " buffers, "
-                   "produced-consumed = %+lld buf = %+.3f MB "
-                   "(expect ~in-flight depth with no marker)\n",
-                   bufs_consumed, (long long)orphan_bufs,
-                   (double)orphan_bufs * FW_DMA_BUF_BYTES / 1e6);
+            if (bufs_consumed == 0 && bufs_produced > 64)
+                printf("DMA drain:       glDMAConsCount did not advance (0 "
+                       "consumer events over %" PRIu32 " produced buffers) — "
+                       "firmware CONS_EVENT not firing\n", bufs_produced);
+            else
+                printf("DMA drain:       consumed %" PRIu32 " buffers, "
+                       "produced-consumed = %+lld buf = %+.3f MB "
+                       "(expect ~in-flight depth with no marker)\n",
+                       bufs_consumed, (long long)(bufs_produced - bufs_consumed),
+                       (double)((int64_t)bufs_produced - (int64_t)bufs_consumed)
+                         * FW_DMA_BUF_BYTES / 1e6);
         }
     }
     printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
