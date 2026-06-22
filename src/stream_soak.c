@@ -63,9 +63,13 @@
  * sync with src/pps_integrity.c. */
 #define FW_DMA_BUF_BYTES 16384
 
-/* GETSTATS payload (canonical layout: src/fx3_cmd/fx3_stats.h — keep in sync). */
-#define GETSTATS_LEN     30
-#define GETSTATS_MIN_LEN 26
+/* GETSTATS payload (canonical layout: src/fx3_cmd/fx3_stats.h — keep in sync).
+ * Request the full 40-byte response to pick up glDMAConsCount at [36..39];
+ * older firmware returns a shorter response and the field is simply absent. */
+#define GETSTATS_LEN      40
+#define GETSTATS_MIN_LEN  26
+#define GETSTATS_CONS_OFF 36   /* glDMAConsCount: DMA buffers drained to USB */
+#define GETSTATS_CONS_END 40
 
 struct soak_ctx {
     _Atomic uint64_t samples_total;   /* cumulative samples delivered */
@@ -74,9 +78,15 @@ struct soak_ctx {
     size_t           expected_nsamples;
 };
 
-/* Subset of GETSTATS (see FW_DMA_BUF_BYTES note re: dma_count = glDMACount). */
+/* Subset of GETSTATS (see FW_DMA_BUF_BYTES note re: dma_count = glDMACount).
+ * dma_cons_count = glDMAConsCount (buffers drained to USB); produced-consumed
+ * is the firmware in-flight + orphaned count. In this no-marker control it
+ * should stay at the steady in-flight depth — a baseline for what "no
+ * orphaning" looks like, against which pps_integrity's steps stand out. */
 struct fw_stats {
     uint32_t dma_count;        /* glDMACount: DMA buffers produced */
+    uint32_t dma_cons_count;   /* glDMAConsCount: DMA buffers drained to USB */
+    int      cons_valid;
     uint32_t pib_errors;
     uint32_t streaming_faults;
     uint32_t boot_count;
@@ -120,6 +130,10 @@ static int read_fw_stats(libusb_device_handle *h, struct fw_stats *s)
     memcpy(&s->pib_errors,       &buf[5],  4);
     memcpy(&s->streaming_faults, &buf[15], 4);
     memcpy(&s->boot_count,       &buf[20], 4);
+    if (r >= GETSTATS_CONS_END) {
+        memcpy(&s->dma_cons_count, &buf[GETSTATS_CONS_OFF], 4);
+        s->cons_valid = 1;
+    }
     s->valid = 1;
     return 0;
 }
@@ -410,6 +424,17 @@ int main(int argc, char **argv)
                    (double)produced_bytes / 1e9, (double)delivered_bytes / 1e9,
                    (double)undeliv_bytes / 1e6,
                    lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
+        /* Firmware drain (glDMAConsCount): in the no-marker control this should
+         * stay at the steady in-flight depth — the "no orphaning" baseline. */
+        if (st_start.cons_valid && st_end.cons_valid) {
+            uint32_t bufs_consumed = st_end.dma_cons_count - st_start.dma_cons_count;
+            int64_t  orphan_bufs   = (int64_t)bufs_produced - (int64_t)bufs_consumed;
+            printf("DMA drain:       consumed %" PRIu32 " buffers, "
+                   "produced-consumed = %+lld buf = %+.3f MB "
+                   "(expect ~in-flight depth with no marker)\n",
+                   bufs_consumed, (long long)orphan_bufs,
+                   (double)orphan_bufs * FW_DMA_BUF_BYTES / 1e6);
+        }
     }
     printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
     printf("Short transfers: %" PRIu64 "  (anomalous — no marker applied)\n", shorts);

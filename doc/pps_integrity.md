@@ -240,6 +240,20 @@ loss correlates 26.9× with the *device-internal* buffer-fill phase
 (`minxfer`), which the host neither sees nor controls, so it cannot be a
 host-delivery artifact.
 
+The firmware now exposes the **consumer** side too: `glDMAConsCount`
+(`CY_U3P_DMA_CB_CONS_EVENT`, GETSTATS `[36..39]`) counts buffers drained
+*out* to USB. The tools read it (requesting the 40-byte response; absent on
+older firmware → reported as unavailable) and surface **produced −
+consumed** — the firmware's own in-flight + orphaned count — both per
+second (an `orphan+N (drain)` note on the second a step lands, correlating
+it with the dip) and as a summary **cross-check**: with USB-wire loss ruled
+out, `consumed ≈ delivered`, so `produced − consumed` (firmware) should
+equal `produced − delivered` (host). Agreement pins the loss to the
+in-chip producer→consumer hop (orphaned in the drain); a `consumed >
+delivered` gap would instead indict the USB wire. In `stream_soak` the same
+delta should sit at the steady in-flight depth — the "no orphaning"
+baseline the marker's steps stand out against.
+
 One accounting nuance follows from the PROD_EVENT semantics: it fires per
 buffer *regardless of fill*, so `produced_bytes = glDMACount × 16 KB`
 could in principle over-count the *partial* buffers the marker forces.
