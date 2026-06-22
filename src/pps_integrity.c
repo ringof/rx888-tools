@@ -835,6 +835,10 @@ int main(int argc, char **argv)
                          ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
                          : "see delta (orphan vs undelivered)");
         }
+    } else if (st_start.valid && st_end.valid) {
+        printf("DMA drain:       not reported by this firmware (GETSTATS < 48 B) "
+               "— flash the socket-xferCount build to enable the orphan "
+               "cross-check\n");
     }
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);

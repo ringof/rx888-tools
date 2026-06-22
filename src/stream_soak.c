@@ -452,6 +452,9 @@ int main(int argc, char **argv)
                        "%.3f MB, orphaned %+.3f MB (expect ~0 with no marker)\n",
                        (double)backlog0 / 1e6, (double)backlog1 / 1e6,
                        ((double)backlog1 - (double)backlog0) / 1e6);
+        } else {
+            printf("DMA drain:       not reported by this firmware (GETSTATS "
+                   "< 48 B) — flash the socket-xferCount build\n");
         }
     }
     printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
