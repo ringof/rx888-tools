@@ -318,20 +318,14 @@ is a **stable, reproducible structural commit-vs-buffer-boundary collision**,
 not edge metastability. Edge quality governs fidelity; the buffer boundary
 governs loss — decoupled, confirmed both directions.
 
-This also **down-weights the synchronizer as a *loss* fix.** A synchronizer
-makes the commit fire on a deterministic clock but does not move *where* it
-lands relative to the buffer boundary (that is set by the async PPS arrival
-time); a marker in the danger band still collides. And the clean edge
-already crushed metastable events without touching the boundary loss, so the
-boundary loss is not metastability-driven. The lever that remains is
-**boundary-aware commit logic in the GPIF state machine** — defer or
-suppress the forced partial commit when it would land within the danger band
-(recording the deferred offset so the marker timing stays recoverable). The
-quantized ~12-buffer loss points squarely at the open firmware question:
-does a consumer-socket wrap-up landing near a boundary orphan already-counted
-buffers in the DMA→USB drain? Strategically this strengthens **#5**
-(capture the edge's sample index *without* forcing a commit), which sidesteps
-the boundary collision entirely.
+This also **kills the synchronizer as a *loss* fix.** The clean edge crushed
+metastable events without touching the boundary loss, so the loss is not
+metastability-driven; and the firmware source later showed the marker is a
+forced **thread switch**, not a commit, so there is no commit to synchronize.
+The loss is a **drain-side descriptor desync** when that thread switch races
+the DMA adapter near a buffer boundary — see the "Path forward" block below
+for the firmware-confirmed mechanism, the decisive `CONS_EVENT` telemetry,
+and the A0/A/B fixes.
 
 Two firm conclusions and one open question:
 
@@ -425,23 +419,60 @@ fixed *fidelity* (spurious 403 → 0, displaced halved) but left the loss and
 its 26.9× → 25.8× boundary-enrichment intact — so the loss is a **structural
 commit-vs-boundary collision, not edge metastability** (see the edge-
 experiment note under the table above);
-(3) **a synchronizer state** — still untried, but now **down-weighted as a
-loss fix**: it makes the commit deterministic but cannot move where it lands
-relative to the buffer boundary, and the clean edge already showed the
-boundary loss is not metastability-driven. The lever the data now points at
-is **boundary-aware commit logic** (defer/suppress the partial commit in the
-danger band) plus the open firmware question of whether a near-boundary
-consumer wrap-up orphans buffers in the DMA→USB drain.
-The fallback is unchanged: the out-of-band MCU latch (buffer-level, plus an
-optional byte-offset) — or, better, **#5** (capture the edge's sample index
-without forcing a commit), which sidesteps the boundary collision entirely.
-Until a boundary-aware firmware change is tried, that fallback is the only
-proven option.
+(3) **a synchronizer state — dropped.** The firmware source has since
+confirmed the mechanism, and it is neither edge metastability (the clean
+edge ruled that out) nor a software commit: **the marker is not even a
+*commit*.** `BETA_THR_WRAPUP` is set in **no** waveform state;
+`TH0_PPS_COMMIT` is byte-identical to the normal `DATA_CNT_HIT` transition
+except it fires **unconditionally**. So the marker is a forced
+*thread-switch* that abandons a partially-filled buffer, and the short
+transfer is an **implicit side effect** — the DMA adapter auto-wrapping the
+abandoned socket, not a commanded wrap-up. A CTL[2] synchronizer cannot
+help a thread-switch-vs-adapter race, so it is off the table.
+
+**Firmware-confirmed mechanism.** The channel holds only **4 × 16 KB
+buffers** (`AUTO_MANY_TO_ONE`, 2 PIB producers → 1 UIB consumer); the
+host's "64 buffers per 1 MB transfer" is URB-side *assembly*, not device
+buffering. So the ~12-buffer loss cannot be 12 stranded buffers (that is
+3× the entire pool) — it is a **drain-side descriptor desync**: the
+consumer pointer skips ~12 buffers' worth while the producer keeps filling
+and counting, which is exactly why nothing overflows (`PIB = 0`) and the
+loss is silent. The whole consumer/drain side is confirmed
+**uninstrumented** (`CY_U3P_DMA_CB_CONS_EVENT` is commented out), so the
+loss is invisible to firmware *because nothing watches it*, not because
+nothing happens.
+
+**Path forward — instrument first, then three options.** The decisive next
+step is firmware telemetry, not another host run: enable
+`CY_U3P_DMA_CB_CONS_EVENT`, expose `glDMAConsCount`, and watch
+`glDMACount − glDMAConsCount` at the marker events. A ~12 jump that never
+recovers confirms the orphan directly, on the drain side where the loss
+is. With that in place:
+
+- **A0 — explicit `THR_WRAPUP` (one bit, try first).** Set
+  `BETA_THR_WRAPUP` in `PPS_COMMIT` so the partial buffer is wrapped by the
+  *sanctioned* primitive instead of the implicit adapter side-effect — a
+  deliberate, clock-ordered handshake rather than a race. **Caveat:**
+  `THR_WRAPUP` also *shuts the thread down*, so the thread must re-arm
+  cleanly or it trades the boundary drop for a per-marker re-arm gap (this
+  is plausibly why the original used the thread-switch hack). Nearly free to
+  try, and the `CONS` counter says immediately whether it worked.
+- **A — boundary-aware switch.** Use `ADDR_COUNT` as a danger-zone detector
+  to inhibit the CTL[2] transition near a boundary, deferring and recording
+  the offset (~4–6 GPIF states). The fallback if A0's explicit wrap still
+  collides.
+- **B — capture, don't commit (the clean sidestep).** A GPIO19
+  `POS_EDGE` ISR latches `glDMACount`, exposed via GETSTATS — zero stream
+  perturbation, buffer-level (~63 µs) resolution, stock waveform. Trades
+  sample-exact in-band timing for guaranteed no perturbation.
+
+The out-of-band MCU latch (B, or buffer-level + byte-offset) stays the only
+**proven** option until A0/A is shown to work.
 
 `-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
 out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
-But the real question, post-edge-experiment, is **boundary-aware commit
-logic** in the GPIF state machine, above.
+But the real next move, post-edge-experiment, is the **`CONS_EVENT`
+telemetry then path A0**, above.
 
 #### Investigated and ruled out: Infineon KBA231382 (commit-buffer failures)
 
@@ -472,17 +503,14 @@ RX888 runs `PPS_CTL_ENABLE=1`, in which the marker commit is performed
   the `PPS_CTL_ENABLE=0` build and **never runs here**.)
 
 So the KBA was worth chasing and is now closed as a cause for this build.
-What it eliminates is the *software commit-ordering* class; what remains is
-a loss **internal to the GPIF state machine**, with the slow CTL[2] edge
-the leading (not the only) suspect. The loss *magnitude* — ~250 KB/event
-(~15 DMA buffers, ~1 ms), too large for a clean descriptor swap (µs) — is
-**consistent with** a state-machine stall on an indeterminate latch, but
-that is an interpretation, not a measurement; we have not captured a stall.
-The fast-edge run is the next test and a real test: it may collapse the
-per-event loss toward ~1–2 samples (metastability confirmed), or leave it
-unchanged (cause is elsewhere — e.g. the AUTO channel not tolerating an
-async mid-descriptor commit at all). Either outcome is informative; only
-the first one makes in-band marking viable.
+What it eliminates is the *software commit-ordering* class. The fast-edge
+run then closed the metastability question too (loss unchanged), and the
+firmware source closed the mechanism: the marker is a forced **thread
+switch** (no `THR_WRAPUP` in the waveform), and the loss is a **drain-side
+descriptor desync** of ~12 buffers when that switch races the DMA adapter
+near a boundary — silent because the consumer side is uninstrumented. See
+the experiment-outcome and "Path forward" block above for the confirmed
+mechanism and the A0/A/B options.
 
 ### Main thread — 1 Hz toggle loop
 
