@@ -225,6 +225,32 @@ correlated with that interval's continuity result: PIB *with* a deficit
 lost host-visible samples; PIB with none did not. The same poll catches
 a mid-run device reset (boot-count change) immediately.
 
+**Where the loss is — inside the FX3, on the DMA→USB drain (firmware-confirmed).**
+`glDMACount` increments in the firmware DMA callback on
+`CY_U3P_DMA_CB_PROD_EVENT` — i.e. when the **producer** socket commits a
+filled buffer *into* the DMA channel, **before** USB consumption. So
+`produced > delivered` means buffers that **entered the channel but never
+came out the USB consumer socket**: the gap is *inside the chip*, on the
+DMA-channel→USB drain, not across the USB wire. This localises the loss
+precisely — the producer fill is fine (every lost buffer was filled and
+counted); it is the **drain** that loses them. It also **rules out host
+backpressure**: a host too slow to drain would (a) show in the no-marker
+`stream_soak` control at the same data rate — it does not — and (b) the
+loss correlates 26.9× with the *device-internal* buffer-fill phase
+(`minxfer`), which the host neither sees nor controls, so it cannot be a
+host-delivery artifact.
+
+One accounting nuance follows from the PROD_EVENT semantics: it fires per
+buffer *regardless of fill*, so `produced_bytes = glDMACount × 16 KB`
+could in principle over-count the *partial* buffers the marker forces.
+This cross-checks out as a small secondary term, not the headline: the
+**continuity detector is delivered-side** (gaps in *received* samples) and
+therefore immune to producer-count rounding, yet independently attributes
+~87 MB (397 events × ~110k samples) to real loss in the *same* events the
+byte check flags. Two detectors — one producer-side, one consumer-side —
+agree the bulk loss is real and ~order-118 MB. A byte-granular produced
+counter (see "Takeaways", #2) would close the ~87→118 MB residual cleanly.
+
 ### Separating clock offset from loss
 
 `delivered / (samplerate × elapsed)`, as ppm, is the ADC-vs-host **clock
