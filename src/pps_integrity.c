@@ -835,14 +835,21 @@ int main(int argc, char **argv)
                    (double)backlog0 / 1e6, (double)backlog1 / 1e6, orphan_mb,
                    cons_skew);
             double diff_mb = orphan_mb - (double)undeliv_bytes / 1e6;
-            if (pd_valid)
+            if (pd_valid) {
+                /* Three outcomes: nothing lost this window (both ~0); real loss
+                 * that the firmware orphan accounts for (AGREE); or a gap that
+                 * needs explaining. */
+                const char *verdict =
+                    (!bufs_lost && orphan_mb < 1.0 && orphan_mb > -1.0)
+                      ? "both clear — no loss this window"
+                    : (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
+                                       && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
+                      ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
+                      : "see delta (orphan vs undelivered)";
                 printf("  cross-check:   firmware orphan %+.3f MB vs host "
                        "undelivered %+.3f MB (Δ %+.3f MB) — %s\n",
-                       orphan_mb, (double)undeliv_bytes / 1e6, diff_mb,
-                       (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
-                                        && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
-                         ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
-                         : "see delta (orphan vs undelivered)");
+                       orphan_mb, (double)undeliv_bytes / 1e6, diff_mb, verdict);
+            }
         }
     } else if (st_start.valid && st_end.valid) {
         printf("DMA drain:       not reported by this firmware (GETSTATS < 48 B) "
