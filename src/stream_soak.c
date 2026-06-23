@@ -186,6 +186,7 @@ static void usage(const char *argv0)
         "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
         "  -q, --queuedepth N   Concurrent in-flight USB transfers (default 32)\n"
         "  -p, --reqsize N    USB transfer size in packets (default 1024)\n"
+        "  -l, --statslog FILE  Write a CSV row per GETSTATS poll (raw counters)\n"
         "  -v, --verbose      Add a per-second 'minxfer' column (samples)\n"
         "  -h, --help         Show this help\n"
         "\n"
@@ -202,6 +203,7 @@ int main(int argc, char **argv)
     double hours = 4.0;
     double rate_msps = 16.0;
     const char *firmware_path = NULL;
+    const char *statslog_path = NULL;
     int verbose = 0;
     unsigned queuedepth = 0, reqsize = 0;
 
@@ -210,12 +212,13 @@ int main(int argc, char **argv)
         {"firmware",   required_argument, 0, 'f'},
         {"queuedepth", required_argument, 0, 'q'},
         {"reqsize",    required_argument, 0, 'p'},
+        {"statslog",   required_argument, 0, 'l'},
         {"verbose",    no_argument,       0, 'v'},
         {"help",       no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "r:f:q:p:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:f:q:p:l:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'r': {
             char *end = NULL;
@@ -229,6 +232,7 @@ int main(int argc, char **argv)
         case 'f': firmware_path = optarg; break;
         case 'q': queuedepth = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'p': reqsize     = (unsigned)strtoul(optarg, NULL, 10); break;
+        case 'l': statslog_path = optarg; break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
@@ -303,6 +307,29 @@ int main(int argc, char **argv)
     fprintf(stderr, "%s: starting %.3f hour run @ %g MSPS (%u Hz), no marker "
             "(full transfer = %zu samples)\n",
             PROG_NAME, hours, rate_msps, samplerate, ctx.expected_nsamples);
+    /* Raw telemetry log (--statslog): same CSV schema as pps_integrity (marker
+     * columns are 0/"soak" here) so one analyser reads both. */
+    FILE *statslog = NULL;
+    if (statslog_path) {
+        statslog = fopen(statslog_path, "w");
+        if (!statslog) {
+            fprintf(stderr, "%s: cannot open statslog '%s': %s\n",
+                    PROG_NAME, statslog_path, strerror(errno));
+            rx888_close(r);
+            return 1;
+        }
+        fprintf(statslog, "time,sec,edges,marks,spur,missed,stat,minxfer,"
+                "samples_total,ok_xfers,bad_xfers,in_flight,dma_count,"
+                "drain_valid,drain_prod,drain_cons,drain_raw,backlog,pib,faults,boot\n");
+        fprintf(statslog, "%s,0,0,0,0,0,start,0,%" PRIu64 ",%llu,%llu,%u,%u,%d,"
+                "%u,%u,%u,%u,%u,%u,%u\n",
+                "00:00:00.000000", samples_start, lib_start.ok_xfers,
+                lib_start.bad_xfers, lib_start.in_flight, st_start.dma_count,
+                st_start.drain_valid, st_start.drain_prod, st_start.drain_cons,
+                st_start.drain_raw, fw_backlog(&st_start),
+                st_start.pib_errors, st_start.streaming_faults, st_start.boot_count);
+    }
+
     printf("#time             sec    Msa/s   total_Gsa  short   pib%s\n",
            verbose ? "   minxfer" : "");
     fflush(stdout);
@@ -365,12 +392,37 @@ int main(int argc, char **argv)
         if (note[0]) printf("%s", note);
         printf("\n");
         fflush(stdout);
+
+        if (statslog) {
+            rx888_stats_t lib_now;
+            rx888_get_stats(r, &lib_now);
+            fprintf(statslog, "%s,%" PRIu64 ",0,0,%" PRIu64 ",0,soak,%u,%" PRIu64
+                    ",%llu,%llu,%u,%u,%d,%u,%u,%u,%u,%u,%u,%u\n",
+                    ts, sec, (uint64_t)atomic_load(&ctx.short_xfers),
+                    (mn == UINT32_MAX ? 0u : mn), now_samples,
+                    lib_now.ok_xfers, lib_now.bad_xfers, lib_now.in_flight,
+                    cur.dma_count, cur.drain_valid, cur.drain_prod, cur.drain_cons,
+                    cur.drain_raw, fw_backlog(&cur), cur.pib_errors,
+                    cur.streaming_faults, cur.boot_count);
+        }
     }
 
     /* End counters BEFORE rx888_stop() (STOPFX3 resets glDMACount). */
     read_fw_stats(h2, &st_end);
     rx888_stats_t lib;
     rx888_get_stats(r, &lib);
+    if (statslog) {
+        char tend[32]; fmt_wallclock(tend, sizeof tend);
+        fprintf(statslog, "%s,0,0,0,0,0,end,0,%" PRIu64 ",%llu,%llu,%u,%u,%d,"
+                "%u,%u,%u,%u,%u,%u,%u\n",
+                tend, (uint64_t)atomic_load(&ctx.samples_total), lib.ok_xfers,
+                lib.bad_xfers, lib.in_flight, st_end.dma_count, st_end.drain_valid,
+                st_end.drain_prod, st_end.drain_cons, st_end.drain_raw,
+                fw_backlog(&st_end), st_end.pib_errors, st_end.streaming_faults,
+                st_end.boot_count);
+        fclose(statslog);
+        statslog = NULL;
+    }
     rx888_stop(r);
 
     struct timespec t1;

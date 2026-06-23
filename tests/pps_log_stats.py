@@ -17,7 +17,10 @@
 #
 # Stdlib only; needs a -v log (the minxfer column). Not a hardware test.
 
-import re, sys, math, statistics as st, collections
+import re, sys, math, statistics as st, collections, csv
+
+FW_DMA_BUF = 16384            # firmware DMA buffer size (bytes)
+ORPHAN_STEP = 6 * FW_DMA_BUF  # backlog step that counts as an orphan event
 
 TIME_RE = re.compile(r'^\d\d:\d\d:\d\d')
 DIP_RE  = re.compile(r'dip ~(\d+)')
@@ -155,11 +158,125 @@ def compare(ms):
     print("\nA working edge/synchronizer fix should drop dips/hr AND collapse")
     print("bnd-enr toward ~1.0 (loss no longer concentrated at buffer boundaries).")
 
+# ----------------------------- raw CSV (--statslog) -----------------------------
+# pps_integrity/stream_soak -l writes a CSV row per GETSTATS poll. Analysing the
+# raw counters settles the questions the summary can only infer: is the producer
+# socket counter independent of the consumer (or mirroring it), does the backlog
+# step at loss events, and is the glDMACount 'loss' a smooth per-marker artifact
+# or bursty real loss.
+
+def is_csv(path):
+    try:
+        with open(path, errors='replace') as f:
+            return f.readline().startswith('time,sec,edges')
+    except OSError:
+        return False
+
+def parse_csv(path):
+    rows = []
+    with open(path, newline='', errors='replace') as f:
+        for r in csv.DictReader(f):
+            row = {}
+            for k, v in r.items():
+                if k is None or v is None or v == '':
+                    continue
+                if k in ('time', 'stat'):
+                    row[k] = v
+                else:
+                    try:
+                        row[k] = int(v)
+                    except ValueError:
+                        row[k] = v
+            rows.append(row)
+    return rows
+
+def analyze_csv(path):
+    rows = parse_csv(path)
+    print(f"\n===== {path} (raw CSV telemetry) =====")
+    data = [r for r in rows if r.get('stat') not in ('start', 'end')]
+    if not data:
+        print("  no per-second rows"); return
+    n = len(data)
+    print(f"  rows={len(rows)} ({n} per-second + start/end)  "
+          f"dur~{data[-1].get('sec', n)}s")
+
+    # --- drain counters: independence + orphan steps ---
+    dv = [r for r in data if r.get('drain_valid') == 1 and 'backlog' in r]
+    if not dv:
+        print("  drain_valid=0 on all rows -> firmware has no socket xferCount "
+              "(GETSTATS < 48 B); reflash the socket-xferCount build")
+    else:
+        same = sum(1 for r in dv if r['drain_prod'] == r['drain_cons'])
+        backl = [r['backlog'] for r in dv]
+        nz = sum(1 for b in backl if b != 0)
+        s = sorted(backl); peak = s[-1]
+        print(f"\n  drain rows: {len(dv)}/{n}")
+        print(f"  drain_prod==drain_cons: {same}/{len(dv)} rows   "
+              f"backlog nonzero: {nz}/{len(dv)} rows")
+        print(f"  backlog bytes: min={s[0]} med={s[len(s)//2]} "
+              f"max={peak} ({peak/FW_DMA_BUF:.1f} buffers)")
+        if peak == 0:
+            print("  >>> backlog is 0 on EVERY row -> apiProd MIRRORS apiCons "
+                  "(vacuous; the producer counter is not independent)")
+        else:
+            print(f"  >>> backlog wobbles nonzero (peak {peak/FW_DMA_BUF:.1f} buf) "
+                  "-> producer counter looks INDEPENDENT of consumer")
+        # orphan steps (sustained jumps above the running high-water)
+        steps, hw = [], backl[0]
+        for r in dv:
+            b = r['backlog']
+            if b > hw + ORPHAN_STEP:
+                steps.append((r, b - hw))
+            if b > hw:
+                hw = b
+        print(f"  orphan steps (> {ORPHAN_STEP//FW_DMA_BUF} buffers): {len(steps)}")
+        for r, sz in steps[:12]:
+            print(f"    sec {r.get('sec'):>5}  backlog+{sz//1024}KB "
+                  f"({sz/FW_DMA_BUF:.1f} buf)  minxfer={r.get('minxfer')}")
+
+    # --- glDMACount vs delivered: smooth artifact vs bursty real loss ---
+    g = [(r['sec'], r['dma_count'] * FW_DMA_BUF - r['samples_total'] * 2)
+         for r in data if 'dma_count' in r and 'samples_total' in r]
+    if len(g) > 2:
+        gap0, gap1 = g[0][1], g[-1][1]
+        growth = gap1 - gap0
+        incs = [g[i][1] - g[i-1][1] for i in range(1, len(g))]
+        m = st.mean(incs); sd = st.pstdev(incs) if len(incs) > 1 else 0.0
+        print(f"\n  glDMACount*16384 - delivered: {gap0/1e6:+.3f} -> {gap1/1e6:+.3f} MB "
+              f"(growth {growth/1e6:+.3f} MB)")
+        if growth < FW_DMA_BUF:
+            print("  >>> no net growth -> no glDMACount-vs-delivered loss signal "
+                  "this window")
+        else:
+            # how concentrated is the growth? seconds holding 90% of it.
+            pos = sorted((x for x in incs if x > 0), reverse=True)
+            tot = sum(pos) or 1
+            c, k = 0, 0
+            for x in pos:
+                c += x; k += 1
+                if c >= 0.9 * tot:
+                    break
+            print(f"  per-second gap increment: mean={m/1024:.1f}KB sd={sd/1024:.1f}KB; "
+                  f"90% of growth in {k}/{len(incs)} seconds")
+            smooth = sd < 0.6 * abs(m) + FW_DMA_BUF and k > 0.5 * len(incs)
+            print("  >>> " + ("SMOOTH/per-second -> consistent with the per-marker "
+                              "partial-buffer over-count (artifact, not dropped data)"
+                              if smooth else
+                              "BURSTY/concentrated -> consistent with real loss "
+                              "events (a few seconds carry the deficit)"))
+    print("\n  (cross-check: real loss => backlog steps AND bursty gap on the SAME "
+          "seconds; artifact => backlog flat/~0 while gap grows smoothly.)")
+
 def main(argv):
     if len(argv) < 2:
-        print(__doc__ or "usage: pps_log_stats.py <log> [<log2> ...]")
+        print(__doc__ or "usage: pps_log_stats.py <log|csv> [...]")
         return 2
-    metrics = [analyze(p) for p in argv[1:]]
+    metrics = []
+    for p in argv[1:]:
+        if is_csv(p):
+            analyze_csv(p)
+        else:
+            metrics.append(analyze(p))
     compare(metrics)
     return 0
 
