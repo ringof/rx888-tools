@@ -874,7 +874,19 @@ int main(int argc, char **argv)
                        "independent producer-socket sum AND shows nonzero steady "
                        "in-flight before trusting either reading.\n",
                        FW_DMA_BUF_BYTES, (double)undeliv_bytes / 1e6);
+            /* Peak in-flight (max producer-consumer backlog over the run): a
+             * genuine independent producer wobbles nonzero as buffers fill and
+             * drain; a peak of 0 all run is the mirroring red flag. */
+            printf("  drain inflight:peak backlog over run = %" PRIu32 " B "
+                   "(0 all run => apiProd mirrors apiCons)\n", orphan_hw);
         }
+        /* Raw counters for scrutiny: if apiProd == apiCons byte-for-byte at the
+         * end, the producer is mirroring the consumer (backlog vacuously 0); a
+         * small nonzero apiProd-apiCons is genuine in-flight. */
+        printf("  drain raw:     start P=%" PRIu32 " C=%" PRIu32 " | end P=%" PRIu32
+               " C=%" PRIu32 " Craw=%" PRIu32 " (P==C => mirrored/suspect)\n",
+               st_start.drain_prod, st_start.drain_cons,
+               st_end.drain_prod, st_end.drain_cons, st_end.drain_raw);
     } else if (st_start.valid && st_end.valid) {
         printf("DMA drain:       not reported by this firmware (GETSTATS < 48 B) "
                "— flash the socket-xferCount build to enable the orphan "
