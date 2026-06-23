@@ -148,3 +148,6 @@ only untested path is the device driver, which mirrors the known-good
    `tone_quality.py base.iq`.
 2. Long soak with the PPS marker running, then correlate corruption events with
    the marker splices via `--markers`.
+
+Once the tone-quality baseline is a PASS, the same coherent tone becomes the
+*timing* ruler for the extracted PPS — see `doc/pps_timing.md`.

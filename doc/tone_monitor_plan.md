@@ -217,5 +217,7 @@ The phasor is scaled by `2/decim`, so `|I+jQ|` is the tone amplitude in LSB and
 3. Doc: fold method + formats into `doc/pps_integrity.md` (or a new
    `doc/tone_quality.md`); update PR #32 (still DRAFT).
 4. Rig: bare-stream tone baseline (confirm clean), then run alongside
-   `pps_integrity --markers` for the splice correlation.
+   `pps_integrity --markers` for the splice correlation. Once tone-quality is a
+   PASS, the coherent tone also becomes the timing ruler for the extracted PPS —
+   see `doc/pps_timing.md` (Tier 1 OS-level vs Tier 2 tone-referenced).
 ```
