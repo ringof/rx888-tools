@@ -647,8 +647,8 @@ int main(int argc, char **argv)
                 if (backlog < BACKLOG_SANE_MAX) {
                     if (backlog > orphan_hw + ORPHAN_STEP_BYTES)
                         snprintf(note + strlen(note), sizeof note - strlen(note),
-                                 "  orphan+%uKB (drain)",
-                                 (backlog - orphan_hw) / 1024);
+                                 "  orphan+%uKB (drain; backlog %.2fMB)",
+                                 (backlog - orphan_hw) / 1024, (double)backlog / 1e6);
                     if (backlog > orphan_hw) orphan_hw = backlog;
                 }
             }
