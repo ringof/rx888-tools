@@ -6,6 +6,7 @@
 /fx3_cmd
 /pps_integrity
 /stream_soak
+/tone_monitor
 
 # Library + pkg-config build outputs
 librx888.so

@@ -1,6 +1,20 @@
 # Plan: coherent-tone corruption monitor (`tone_monitor` + offline analyzer)
 
-Status: PLAN — not yet built. Branch `claude/cool-gauss-ptkl28`.
+Status: STEP 1 BUILT + DSP-VALIDATED (no hardware yet). Branch
+`claude/pps-development`. `src/tone_monitor.c` exists with `--statslog`,
+`--iqlog`, and a `--source FILE` replay mode; the inline Goertzel demod is
+validated against synthesized clean/drop/garble waveforms by
+`tests/tone_monitor_replay.sh` (in `make check`): clean -> flat phase, drop ->
+75.00 deg grid slip, garble -> amplitude dip with no phase step. The offline
+tracking-demod analyzer (step 2) is not built yet.
+
+## `--source`: hardware-free validation of the real DSP
+
+`--source FILE` (or `-` for stdin) drives the SAME `sample_cb`/Goertzel/iqlog
+path from raw int16 samples instead of the device, emitting the same `--iqlog`
+and `--statslog`. A "second" in file mode is `fs` input samples. This lets a
+synthesized waveform exercise the production DSP with no rig — used by
+`tests/tone_monitor_replay.sh` and handy for replaying captured streams.
 
 ## Goal
 
@@ -166,12 +180,27 @@ Synthesize a coherent int16 tone at 5/24, and a decimated-baseband `.iq` from it
   tolerance — the whole point of this redesign).
 Reuse the synthetic generators already used to validate `tone_quality.py`.
 
+## iqlog binary format (v1)
+
+48-byte little-endian header, then interleaved `float32 (I,Q)` records at
+`fs/decim`:
+
+```
+char[8] magic "RX888IQ\0" ; u32 version=1 ; u32 decim ; u32 period_n ;
+u32 period_cyc ; f64 fs_hz ; f64 ftone_hz ; f64 start_unix
+```
+
+The phasor is scaled by `2/decim`, so `|I+jQ|` is the tone amplitude in LSB and
+`atan2(Q,I)` its phase. A grid slip is a persistent `360*cyc/period_n` deg step
+(75 deg at the rig); a garble is an amplitude/phase transient.
+
 ## Sequencing
 
-1. `src/tone_monitor.c` — Goertzel inline + CSV (`--statslog`) + binary
-   (`--iqlog`); Makefile + `make check`.
+1. DONE — `src/tone_monitor.c`: Goertzel inline + `--statslog` CSV + `--iqlog`
+   binary + `--source` replay; Makefile + smoke + replay tests in `make check`.
 2. Offline analyzer path for the `.iq` binary + CSV with the tracking
-   demod/discriminator; validate on synthetic data.
+   demod/discriminator (phase-locked, slip vs garble vs benign wander); validate
+   on synthetic data (extend `tests/tone_quality.py`).
 3. Doc: fold method + formats into `doc/pps_integrity.md` (or a new
    `doc/tone_quality.md`); update PR #32 (still DRAFT).
 4. Rig: bare-stream tone baseline (confirm clean), then run alongside

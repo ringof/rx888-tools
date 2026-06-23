@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity stream_soak
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity stream_soak tone_monitor
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -121,6 +121,13 @@ stream_soak: $(SRCDIR)/stream_soak.c $(LIBRX_A) $(LIBRX_HDR)
 	    $(SRCDIR)/stream_soak.c \
 	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -o $@
 
+# tone_monitor: coherent-tone data-QUALITY monitor. Same static link + libusb;
+# needs -lm for the inline Goertzel phasor (hypot/atan2/cos/sin).
+tone_monitor: $(SRCDIR)/tone_monitor.c $(LIBRX_A) $(LIBRX_HDR)
+	$(CC) $(CFLAGS_STREAM) $(LIBUSB_CFLAGS) -I$(INCDIR) \
+	    $(SRCDIR)/tone_monitor.c \
+	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -lm -o $@
+
 rx888_dsp: $(SRCDIR)/rx888_dsp.c
 	$(CC) $(CFLAGS_DSP) -I$(INCDIR) $< -o $@ -lm -lpthread
 
@@ -152,7 +159,7 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak
+check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak tone_monitor
 	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
 	if [ "$$present" = "1" ]; then \
 	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
@@ -163,7 +170,9 @@ check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
 	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd; \
 	$(TESTS_DIR)/pps_integrity_smoke.sh ./pps_integrity; \
-	$(TESTS_DIR)/stream_soak_smoke.sh ./stream_soak
+	$(TESTS_DIR)/stream_soak_smoke.sh ./stream_soak; \
+	$(TESTS_DIR)/tone_monitor_smoke.sh ./tone_monitor; \
+	$(TESTS_DIR)/tone_monitor_replay.sh ./tone_monitor
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.
