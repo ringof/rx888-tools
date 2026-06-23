@@ -770,6 +770,15 @@ int main(int argc, char **argv)
     int pass = (spur == 0) && !sample_loss &&
                !internal_stop && !ctrl_fault && !boot_changed && !mid_reset;
 
+    /* Byte-exact drain verdict (set in the DMA-drain block below). When the
+     * producer/consumer socket counters are coherent and show ~0 backlog
+     * growth, the producer ACTUALLY delivered every byte to the consumer — so
+     * a large glDMACount-vs-delivered gap is the partial-buffer over-count
+     * (glDMACount counts each partial marker buffer as a full 16 KB), NOT lost
+     * data, and the "implied clock" add-back would be spurious. */
+    int    drain_coherent = 0;
+    int    drain_clean    = 0;   /* coherent AND backlog growth ~0 */
+
     printf("\n=== PPS INTEGRITY RESULT ===\n");
     printf("Duration:        %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "\n",
            elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
@@ -829,6 +838,8 @@ int main(int argc, char **argv)
                    (double)backlog0 / 1e6, (double)backlog1 / 1e6, cons_skew);
         } else {
             double  orphan_mb    = (double)orphan_bytes / 1e6;
+            drain_coherent = 1;
+            drain_clean    = (orphan_mb < 1.0 && orphan_mb > -1.0);
             printf("DMA drain:       backlog (produced-consumed) %.3f -> %.3f MB, "
                    "orphaned %+.3f MB in the DMA->USB drain "
                    "(byte-exact; API-vs-rawreg skew %d B)\n",
@@ -842,6 +853,8 @@ int main(int argc, char **argv)
                 const char *verdict =
                     (!bufs_lost && orphan_mb < 1.0 && orphan_mb > -1.0)
                       ? "both clear — no loss this window"
+                    : (bufs_lost && drain_clean)
+                      ? "CONFLICT: glDMACount says loss, byte-exact says clean (unresolved)"
                     : (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
                                        && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
                       ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
@@ -850,6 +863,17 @@ int main(int argc, char **argv)
                        "undelivered %+.3f MB (Δ %+.3f MB) — %s\n",
                        orphan_mb, (double)undeliv_bytes / 1e6, diff_mb, verdict);
             }
+            /* The unresolved reconciliation: two measures disagree, and BOTH are
+             * in question — glDMACount over-counts partial marker buffers, AND an
+             * exactly-0 backlog is implausible (expect nonzero in-flight). */
+            if (drain_clean && bufs_lost)
+                printf("  NOTE:          UNRESOLVED — glDMACount x %d B over-counts "
+                       "partial marker buffers (could make the +%.1f MB an "
+                       "artifact, not loss); but a backlog of *exactly* 0 is itself "
+                       "suspect (expect nonzero in-flight). Confirm apiProd is an "
+                       "independent producer-socket sum AND shows nonzero steady "
+                       "in-flight before trusting either reading.\n",
+                       FW_DMA_BUF_BYTES, (double)undeliv_bytes / 1e6);
         }
     } else if (st_start.valid && st_end.valid) {
         printf("DMA drain:       not reported by this firmware (GETSTATS < 48 B) "
@@ -870,7 +894,12 @@ int main(int argc, char **argv)
     /* Loss as a fraction of produced data, for severity at a glance. */
     double loss_ppm = produced_bytes > 0
                     ? (double)lost_bytes / (double)produced_bytes * 1e6 : 0.0;
-    if (bufs_lost)
+    if (bufs_lost && drain_coherent && drain_clean)
+        printf("  CONTESTED: %.3f MB glDMACount over delivered = %.1f ppm "
+               "(%.4f%%) — but byte-exact drain backlog ~0 disputes it; treat as "
+               "unresolved, not confirmed loss (see NOTE).\n",
+               (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
+    else if (bufs_lost)
         printf("  FAIL: %.3f MB produced but never delivered = %.1f ppm "
                "(%.4f%%) — firmware/USB dropped data (clock-independent).\n",
                (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
@@ -890,10 +919,20 @@ int main(int argc, char **argv)
             printf("Sample budget:   delivered %" PRIu64 " vs expected %" PRIu64
                    " (rate x elapsed), %+.3f ppm (clock - loss combined)\n",
                    delivered, expected_total, budget_ppm);
-            if (pd_valid)
+            if (pd_valid) {
+                /* Do NOT assert "the fast clock masked the loss" — that is only
+                 * true if the glDMACount loss is real. The byte-exact drain
+                 * disagreeing (or being absent) makes the add-back unproven. */
+                const char *caveat =
+                    (drain_coherent && drain_clean)
+                      ? " — UNPROVEN: byte-exact drain backlog ~0 disagrees (CONFLICT)"
+                    : drain_coherent
+                      ? " — drain confirms the loss"
+                    : " — IF the loss is real (no byte-exact drain counter to confirm)";
                 printf("Implied clock:   %+.3f ppm (budget %+.3f + loss %.1f ppm "
-                       "added back) — the fast clock was masking the loss\n",
-                       budget_ppm + loss_ppm, budget_ppm, loss_ppm);
+                       "added back)%s\n",
+                       budget_ppm + loss_ppm, budget_ppm, loss_ppm, caveat);
+            }
         }
     }
     if (st_start.valid && st_end.valid) {
