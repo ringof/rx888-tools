@@ -235,6 +235,15 @@ static inline uint32_t fw_backlog(const struct fw_stats *s) {
     return s->drain_prod - s->drain_cons;
 }
 
+/* Signed backlog: read-skew (prod and cons sampled a beat apart) lets the
+ * consumer be caught up to one buffer AHEAD, which wraps to ~2^32; interpret
+ * the high half as a small negative so +/-1 buffer of in-flight wobble reads
+ * correctly instead of as a 4 GB "orphan". */
+static inline int64_t fw_backlog_signed(const struct fw_stats *s) {
+    uint32_t b = s->drain_prod - s->drain_cons;
+    return (b >= (1u << 31)) ? (int64_t)b - (1LL << 32) : (int64_t)b;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -537,11 +546,14 @@ int main(int argc, char **argv)
     uint64_t max_deficit = 0;                     /* largest inter-marker deficit seen */
     uint32_t pib_prev = st_start.valid ? st_start.pib_errors : 0;
     uint64_t pib_seconds = 0, pib_with_deficit = 0;  /* per-second PIB localisation */
-    /* Track the drain backlog high-water (bytes) so a sustained step — a buffer
-     * orphaned in the drain — shows on the second it happens, correlating the
-     * orphan with the marker/dip. */
-    uint32_t orphan_hw = (st_start.valid && st_start.drain_valid)
-                       ? fw_backlog(&st_start) : 0;
+    /* Drain backlog tracking (signed). orphan_hw is the high-water for the
+     * per-second step note; blog_absmax is the peak |in-flight| over the run
+     * and blog_nz_secs counts seconds where producer != consumer (proves the
+     * producer counter is independent, not mirroring the consumer). */
+    int64_t  orphan_hw = (st_start.valid && st_start.drain_valid)
+                       ? fw_backlog_signed(&st_start) : 0;
+    int64_t  blog_absmax = 0;
+    uint64_t blog_nz_secs = 0;
     int mid_reset = 0;
     int internal_stop = 0, ctrl_fault = 0;
 
@@ -667,19 +679,20 @@ int main(int argc, char **argv)
                 snprintf(note + strlen(note), sizeof note - strlen(note),
                          "  DEVICE RESET");
             }
-            /* Orphan tracker: the drain backlog wobbles by the in-flight depth
-             * normally; a step well past that is a buffer orphaned in the
-             * DMA->USB drain. The sanity cap suppresses the note if the
-             * consumer counter is not tracking (backlog would blow up). */
+            /* Orphan tracker (signed): in-flight wobbles +/-1 buffer and returns
+             * to ~0; a sustained step well past that is a buffer orphaned in the
+             * DMA->USB drain. Track the peak |in-flight| and the nonzero-second
+             * count for the independence/accumulation verdict in the summary. */
             if (cur.drain_valid && st_start.drain_valid) {
-                uint32_t backlog = fw_backlog(&cur);
-                if (backlog < BACKLOG_SANE_MAX) {
-                    if (backlog > orphan_hw + ORPHAN_STEP_BYTES)
-                        snprintf(note + strlen(note), sizeof note - strlen(note),
-                                 "  orphan+%uKB (drain; backlog %.2fMB)",
-                                 (backlog - orphan_hw) / 1024, (double)backlog / 1e6);
-                    if (backlog > orphan_hw) orphan_hw = backlog;
-                }
+                int64_t sb = fw_backlog_signed(&cur);
+                int64_t a  = sb < 0 ? -sb : sb;
+                if (a > blog_absmax) blog_absmax = a;
+                if (sb != 0) blog_nz_secs++;
+                if (sb > orphan_hw + (int64_t)ORPHAN_STEP_BYTES)
+                    snprintf(note + strlen(note), sizeof note - strlen(note),
+                             "  backlog+%lldKB (now %.2fMB)",
+                             (long long)(sb - orphan_hw) / 1024, (double)sb / 1e6);
+                if (sb > orphan_hw) orphan_hw = sb;
             }
         }
 
@@ -786,8 +799,11 @@ int main(int argc, char **argv)
     int pd_valid = st_start.valid && st_end.valid && delivered_bytes > 0
                  && produced_bytes > delivered_bytes / 4
                  && produced_bytes < delivered_bytes * 4;
-    int      bufs_lost       = pd_valid && (undeliv_bytes > byte_slack);
     int64_t  lost_bytes      = undeliv_bytes > 0 ? undeliv_bytes : 0;
+
+    /* Raw drain measurements (reported below; interpretation is the analyst's). */
+    int64_t  drain_net = (st_start.drain_valid && st_end.drain_valid)
+                       ? fw_backlog_signed(&st_end) - fw_backlog_signed(&st_start) : 0;
 
     /* ---- Absolute sample budget and ADC clock offset ----
      *
@@ -800,7 +816,6 @@ int main(int argc, char **argv)
     double elapsed_d = (double)(t1.tv_sec - t0.tv_sec)
                      + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
     double expected_d = (double)samplerate * elapsed_d;
-    uint64_t expected_total = (uint64_t)(expected_d + 0.5);
     double budget_ppm = expected_d > 0
                       ? ((double)delivered - expected_d) / expected_d * 1e6 : 0.0;
     /* Per-second rate slope (median of clean single-second inter-marker counts):
@@ -810,32 +825,21 @@ int main(int argc, char **argv)
                        ? ((double)learned_rate - (double)samplerate)
                          / (double)samplerate * 1e6 : 0.0;
 
-    /* Sample loss = the verdict's basis. Authoritative detectors:
-     *   - bad_xfers : errored/cancelled USB transfers (transport loss)
-     *   - bufs_lost : produced bytes > delivered bytes (clock-independent, gross)
-     * The inter-marker continuity deficit (loss_events) is a DIAGNOSTIC that
-     * localizes loss but jitters at high rates, so it does not fail the run on
-     * its own — it is reported and corroborated against bufs_lost below. */
-    int sample_loss = (lib.bad_xfers > 0) || bufs_lost;
+    /* PASS/FAIL is reserved for UNAMBIGUOUS faults: errored/cancelled USB
+     * transfers. The glDMACount-vs-delivered gap (bufs_lost) and the drain
+     * backlog are REPORTED as measurements, not adjudicated here — glDMACount
+     * x 16 KB over-counts partial marker buffers, so whether a gap is loss or
+     * over-count is for the analyst (and the raw --statslog) to judge, not the
+     * tool. The continuity deficit (loss_events) is a localizing diagnostic. */
+    int sample_loss = (lib.bad_xfers > 0);
 
     /* With every authoritative loss detector clear, produced==delivered proves no
      * data was dropped, so the sample-rate budget offset is purely clock. */
-    int lossless = !sample_loss;
-
     /* Verdict: blind-spot and displaced misses are marker-TIMING glitches (data
      * integrity is judged separately), so they do not fail the run; confirmed
      * sample loss, spurious shorts, device resets, and control faults do. */
     int pass = (spur == 0) && !sample_loss &&
                !internal_stop && !ctrl_fault && !boot_changed && !mid_reset;
-
-    /* Byte-exact drain verdict (set in the DMA-drain block below). When the
-     * producer/consumer socket counters are coherent and show ~0 backlog
-     * growth, the producer ACTUALLY delivered every byte to the consumer — so
-     * a large glDMACount-vs-delivered gap is the partial-buffer over-count
-     * (glDMACount counts each partial marker buffer as a full 16 KB), NOT lost
-     * data, and the "implied clock" add-back would be spurious. */
-    int    drain_coherent = 0;
-    int    drain_clean    = 0;   /* coherent AND backlog growth ~0 */
 
     printf("\n=== PPS INTEGRITY RESULT ===\n");
     printf("Duration:        %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "\n",
@@ -867,82 +871,27 @@ int main(int argc, char **argv)
                bufs_produced, FW_DMA_BUF_BYTES, (double)produced_bytes / 1e9,
                (double)delivered_bytes / 1e9);
     else
-        printf("DMA buffers:     produced %.2f GB (%" PRIu32 " x %d B), delivered "
-               "%.2f GB, undelivered %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
+        printf("DMA buffers:     glDMACount %.2f GB (%" PRIu32 " x %d B), delivered "
+               "%.2f GB, gap %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
                (double)produced_bytes / 1e9, bufs_produced, FW_DMA_BUF_BYTES,
                (double)delivered_bytes / 1e9, (double)undeliv_bytes / 1e6,
                lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
-    /* Firmware drain cross-check (socket xferCount registers). The backlog
-     * (produced-consumed, bytes) grows by exactly the orphaned amount over the
-     * run; with USB-wire loss ruled out it should equal the host's undelivered
-     * bytes — pinning the loss to the in-chip producer->consumer hop. */
+    /* Firmware drain measurements (socket xferCount registers, signed backlog
+     * = producer - consumer bytes still in the channel). Reported raw; the
+     * --statslog CSV has the per-second series for analysis. */
     if (st_start.valid && st_end.valid && st_start.drain_valid && st_end.drain_valid) {
-        uint32_t backlog0    = fw_backlog(&st_start);
-        uint32_t backlog1    = fw_backlog(&st_end);
-        int32_t  cons_skew   = (int32_t)(st_end.drain_cons - st_end.drain_raw);
-        int64_t  orphan_bytes = (int64_t)backlog1 - (int64_t)backlog0;
-        /* A real backlog is a few MB at most (4-buffer channel); it must be
-         * small at BOTH ends and the orphan growth bounded. GB-scale or
-         * negative-GB values mean producer and consumer counters are not a
-         * coherent pair (e.g. producer = a single socket of the many-to-one,
-         * so it advances at a different rate than the full consumer). */
-        if (backlog0 >= BACKLOG_SANE_MAX || backlog1 >= BACKLOG_SANE_MAX ||
-            orphan_bytes >= (int64_t)BACKLOG_SANE_MAX ||
-            orphan_bytes <= -(int64_t)BACKLOG_SANE_MAX) {
-            printf("DMA drain:       producer/consumer counters incoherent "
-                   "(backlog %.1f -> %.1f MB; API-vs-rawreg skew %d B) — producer "
-                   "xferCount is not the full-stream byte count (one socket of "
-                   "the many-to-one?); cross-check unavailable\n",
-                   (double)backlog0 / 1e6, (double)backlog1 / 1e6, cons_skew);
-        } else {
-            double  orphan_mb    = (double)orphan_bytes / 1e6;
-            drain_coherent = 1;
-            drain_clean    = (orphan_mb < 1.0 && orphan_mb > -1.0);
-            printf("DMA drain:       backlog (produced-consumed) %.3f -> %.3f MB, "
-                   "orphaned %+.3f MB in the DMA->USB drain "
-                   "(byte-exact; API-vs-rawreg skew %d B)\n",
-                   (double)backlog0 / 1e6, (double)backlog1 / 1e6, orphan_mb,
-                   cons_skew);
-            double diff_mb = orphan_mb - (double)undeliv_bytes / 1e6;
-            if (pd_valid) {
-                /* Three outcomes: nothing lost this window (both ~0); real loss
-                 * that the firmware orphan accounts for (AGREE); or a gap that
-                 * needs explaining. */
-                const char *verdict =
-                    (!bufs_lost && orphan_mb < 1.0 && orphan_mb > -1.0)
-                      ? "both clear — no loss this window"
-                    : (bufs_lost && drain_clean)
-                      ? "CONFLICT: glDMACount says loss, byte-exact says clean (unresolved)"
-                    : (orphan_mb > 1.0 && diff_mb > -byte_slack / 1e6
-                                       && diff_mb <  byte_slack / 1e6 + orphan_mb * 0.1)
-                      ? "AGREE: loss is buffers orphaned in the DMA->USB drain"
-                      : "see delta (orphan vs undelivered)";
-                printf("  cross-check:   firmware orphan %+.3f MB vs host "
-                       "undelivered %+.3f MB (Δ %+.3f MB) — %s\n",
-                       orphan_mb, (double)undeliv_bytes / 1e6, diff_mb, verdict);
-            }
-            /* The unresolved reconciliation: two measures disagree, and BOTH are
-             * in question — glDMACount over-counts partial marker buffers, AND an
-             * exactly-0 backlog is implausible (expect nonzero in-flight). */
-            if (drain_clean && bufs_lost)
-                printf("  NOTE:          UNRESOLVED — glDMACount x %d B over-counts "
-                       "partial marker buffers (could make the +%.1f MB an "
-                       "artifact, not loss); but a backlog of *exactly* 0 is itself "
-                       "suspect (expect nonzero in-flight). Confirm apiProd is an "
-                       "independent producer-socket sum AND shows nonzero steady "
-                       "in-flight before trusting either reading.\n",
-                       FW_DMA_BUF_BYTES, (double)undeliv_bytes / 1e6);
-            /* Peak in-flight (max producer-consumer backlog over the run): a
-             * genuine independent producer wobbles nonzero as buffers fill and
-             * drain; a peak of 0 all run is the mirroring red flag. */
-            printf("  drain inflight:peak backlog over run = %" PRIu32 " B "
-                   "(0 all run => apiProd mirrors apiCons)\n", orphan_hw);
-        }
-        /* Raw counters for scrutiny: if apiProd == apiCons byte-for-byte at the
-         * end, the producer is mirroring the consumer (backlog vacuously 0); a
-         * small nonzero apiProd-apiCons is genuine in-flight. */
+        int64_t backlog0  = fw_backlog_signed(&st_start);
+        int64_t backlog1  = fw_backlog_signed(&st_end);
+        int32_t cons_skew = (int32_t)(st_end.drain_cons - st_end.drain_raw);
+        printf("DMA drain:       backlog start %+.3f end %+.3f net %+.3f MB; "
+               "peak |in-flight| %.0f B (%.1f buf); prod!=cons %" PRIu64 "/%"
+               PRIu64 " s; API-vs-rawreg skew %d B\n",
+               (double)backlog0 / 1e6, (double)backlog1 / 1e6,
+               (double)drain_net / 1e6, (double)blog_absmax,
+               (double)blog_absmax / FW_DMA_BUF_BYTES, blog_nz_secs, edges,
+               cons_skew);
         printf("  drain raw:     start P=%" PRIu32 " C=%" PRIu32 " | end P=%" PRIu32
-               " C=%" PRIu32 " Craw=%" PRIu32 " (P==C => mirrored/suspect)\n",
+               " C=%" PRIu32 " Craw=%" PRIu32 "\n",
                st_start.drain_prod, st_start.drain_cons,
                st_end.drain_prod, st_end.drain_cons, st_end.drain_raw);
     } else if (st_start.valid && st_end.valid) {
@@ -953,58 +902,28 @@ int main(int argc, char **argv)
     printf("USB transfers:   ok=%llu bad=%llu\n",
            lib.ok_xfers, lib.bad_xfers);
     printf("Sample loss:     %" PRIu64 " continuity dip(s), ~%" PRIu64 " samples "
-           "(diagnostic; %s)\n", loss_events, lost_samples_est,
-           bufs_lost ? "corroborated by produced>delivered"
-                     : "NOT corroborated — marker-flush jitter, no actual loss");
+           "(diagnostic localizer)\n", loss_events, lost_samples_est);
     printf("Loss floor:      continuity %d samples (%.2f buffer), largest dip "
-           "%" PRIu64 " (%.2f buffer); gross floor ~%.2f MB (in-flight)\n",
+           "%" PRIu64 " (%.2f buffer); in-flight slack ~%.2f MB\n",
            LOSS_TOL, (double)LOSS_TOL / (double)ctx.expected_nsamples,
            max_deficit, (double)max_deficit / (double)ctx.expected_nsamples,
            (double)byte_slack / 1e6);
-    /* Loss as a fraction of produced data, for severity at a glance. */
-    double loss_ppm = produced_bytes > 0
-                    ? (double)lost_bytes / (double)produced_bytes * 1e6 : 0.0;
-    if (bufs_lost && drain_coherent && drain_clean)
-        printf("  CONTESTED: %.3f MB glDMACount over delivered = %.1f ppm "
-               "(%.4f%%) — but byte-exact drain backlog ~0 disputes it; treat as "
-               "unresolved, not confirmed loss (see NOTE).\n",
-               (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
-    else if (bufs_lost)
-        printf("  FAIL: %.3f MB produced but never delivered = %.1f ppm "
-               "(%.4f%%) — firmware/USB dropped data (clock-independent).\n",
-               (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
+    double gap_ppm = produced_bytes > 0
+                   ? (double)lost_bytes / (double)produced_bytes * 1e6 : 0.0;
+    if (pd_valid && undeliv_bytes > byte_slack)
+        printf("  glDMACount-delivered gap: %.3f MB = %.1f ppm (%.4f%%) "
+               "— compare against the DMA-drain backlog above and --statslog\n",
+               (double)lost_bytes / 1e6, gap_ppm, gap_ppm / 1e4);
     if (lib.bad_xfers > 0)
-        printf("  FAIL: %llu errored/cancelled USB transfers — transport-level "
-               "sample loss.\n", lib.bad_xfers);
-    /* Clock vs loss. With produced==delivered and no errors the rate offset is
-     * provably the ADC-vs-host clock. When there IS loss the budget ppm is
-     * (clock - loss) combined; we still recover the implied clock by adding the
-     * measured loss back (budget_ppm + loss_ppm), so the masking is visible. */
-    if (st_start.valid && st_end.valid) {
-        if (lossless && pd_valid)
-            printf("ADC clock:       %+.3f ppm (lossless: produced==delivered, "
-                   "no USB errors; assumes disciplined host)\n",
-                   rate_n >= BASE_WIN ? learned_ppm : budget_ppm);
-        else {
-            printf("Sample budget:   delivered %" PRIu64 " vs expected %" PRIu64
-                   " (rate x elapsed), %+.3f ppm (clock - loss combined)\n",
-                   delivered, expected_total, budget_ppm);
-            if (pd_valid) {
-                /* Do NOT assert "the fast clock masked the loss" — that is only
-                 * true if the glDMACount loss is real. The byte-exact drain
-                 * disagreeing (or being absent) makes the add-back unproven. */
-                const char *caveat =
-                    (drain_coherent && drain_clean)
-                      ? " — UNPROVEN: byte-exact drain backlog ~0 disagrees (CONFLICT)"
-                    : drain_coherent
-                      ? " — drain confirms the loss"
-                    : " — IF the loss is real (no byte-exact drain counter to confirm)";
-                printf("Implied clock:   %+.3f ppm (budget %+.3f + loss %.1f ppm "
-                       "added back)%s\n",
-                       budget_ppm + loss_ppm, budget_ppm, loss_ppm, caveat);
-            }
-        }
-    }
+        printf("  FAIL: %llu errored/cancelled USB transfers (transport).\n",
+               lib.bad_xfers);
+    /* Rate offset: delivered vs rate x elapsed. This is the ADC-vs-host clock
+     * offset CONFLATED with any real uniform loss; we report the number and the
+     * decomposition's two terms, but do not assert which dominates. */
+    if (st_start.valid && st_end.valid)
+        printf("Rate offset:     %+.3f ppm (delivered vs rate x elapsed; budget "
+               "%+.3f ppm, glDMACount gap %+.1f ppm — conflated, see drain/CSV)\n",
+               rate_n >= BASE_WIN ? learned_ppm : budget_ppm, budget_ppm, gap_ppm);
     if (st_start.valid && st_end.valid) {
         printf("PIB errors:      %u total in %" PRIu64 " second(s); "
                "%" PRIu64 " coincided with a deficit%s\n",

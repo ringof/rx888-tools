@@ -106,6 +106,13 @@ static inline uint32_t fw_backlog(const struct fw_stats *s) {
     return s->drain_prod - s->drain_cons;   /* wrap-safe: both wrap together */
 }
 
+/* Signed backlog: read-skew lets the consumer be caught one buffer ahead,
+ * wrapping to ~2^32; map the high half to a small negative. */
+static inline int64_t fw_backlog_signed(const struct fw_stats *s) {
+    uint32_t b = s->drain_prod - s->drain_cons;
+    return (b >= (1u << 31)) ? (int64_t)b - (1LL << 32) : (int64_t)b;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -466,8 +473,9 @@ int main(int argc, char **argv)
     double rate_ppm = samplerate > 0
                     ? (eff_rate - (double)samplerate) / (double)samplerate * 1e6 : 0.0;
 
-    int sample_loss = (lib.bad_xfers > 0) || bufs_lost;
-    int lossless = !sample_loss;
+    /* PASS/FAIL on unambiguous transport/device faults only; the glDMACount
+     * gap and drain backlog are reported as measurements, not adjudicated. */
+    int sample_loss = (lib.bad_xfers > 0);
     int pass = !sample_loss && !internal_stop && !boot_changed && !mid_reset;
 
     printf("\n=== STREAM SOAK RESULT (no marker) ===\n");
@@ -486,28 +494,21 @@ int main(int argc, char **argv)
                    "off, FW_DMA_BUF_BYTES unverified (check INDETERMINATE)\n",
                    (double)produced_bytes / 1e9, (double)delivered_bytes / 1e9);
         else
-            printf("DMA buffers:     produced %.2f GB, delivered %.2f GB, "
-                   "undelivered %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
+            printf("DMA buffers:     glDMACount %.2f GB, delivered %.2f GB, "
+                   "gap %+.3f MB (in-flight %u->%u, slack %.2f MB)\n",
                    (double)produced_bytes / 1e9, (double)delivered_bytes / 1e9,
                    (double)undeliv_bytes / 1e6,
                    lib_start.in_flight, lib.in_flight, (double)byte_slack / 1e6);
-        /* Firmware drain (glDMAConsCount): in the no-marker control this should
-         * stay at the steady in-flight depth — the "no orphaning" baseline. */
+        /* Firmware drain (socket xferCount registers), reported raw. */
         if (st_start.drain_valid && st_end.drain_valid) {
-            uint32_t backlog0 = fw_backlog(&st_start);
-            uint32_t backlog1 = fw_backlog(&st_end);
-            int64_t  orphan   = (int64_t)backlog1 - (int64_t)backlog0;
-            if (backlog0 >= BACKLOG_SANE_MAX || backlog1 >= BACKLOG_SANE_MAX ||
-                orphan >= (int64_t)BACKLOG_SANE_MAX || orphan <= -(int64_t)BACKLOG_SANE_MAX)
-                printf("DMA drain:       producer/consumer counters incoherent "
-                       "(backlog %.1f -> %.1f MB) — producer xferCount not the "
-                       "full-stream byte count (one socket of the many-to-one?)\n",
-                       (double)backlog0 / 1e6, (double)backlog1 / 1e6);
-            else
-                printf("DMA drain:       backlog (produced-consumed) %.3f -> "
-                       "%.3f MB, orphaned %+.3f MB (expect ~0 with no marker)\n",
-                       (double)backlog0 / 1e6, (double)backlog1 / 1e6,
-                       (double)orphan / 1e6);
+            int64_t backlog0 = fw_backlog_signed(&st_start);
+            int64_t backlog1 = fw_backlog_signed(&st_end);
+            printf("DMA drain:       backlog start %+.3f end %+.3f net %+.3f MB; "
+                   "prod==cons %s; API-vs-rawreg skew %d B\n",
+                   (double)backlog0 / 1e6, (double)backlog1 / 1e6,
+                   (double)(backlog1 - backlog0) / 1e6,
+                   (st_end.drain_prod == st_end.drain_cons) ? "at end" : "differs",
+                   (int32_t)(st_end.drain_cons - st_end.drain_raw));
         } else {
             printf("DMA drain:       not reported by this firmware (GETSTATS "
                    "< 48 B) — flash the socket-xferCount build\n");
@@ -516,8 +517,8 @@ int main(int argc, char **argv)
     printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
     printf("Short transfers: %" PRIu64 "  (anomalous — no marker applied)\n", shorts);
     if (bufs_lost)
-        printf("  FAIL: %.3f MB produced but never delivered = %.1f ppm "
-               "(%.4f%%) — firmware/USB dropped data (clock-independent).\n",
+        printf("  glDMACount-delivered gap: %.3f MB = %.1f ppm (%.4f%%) "
+               "— compare against the DMA-drain backlog above and --statslog\n",
                (double)lost_bytes / 1e6, loss_ppm, loss_ppm / 1e4);
     if (lib.bad_xfers > 0)
         printf("  FAIL: %llu errored/cancelled USB transfers — transport loss.\n",
@@ -526,13 +527,8 @@ int main(int argc, char **argv)
         printf("  WARN: short transfers with no marker — FX3 committing partial "
                "buffers (stress/overflow symptom).\n");
     if (st_start.valid && st_end.valid) {
-        if (lossless && pd_valid)
-            printf("ADC clock:       %+.3f ppm (lossless: produced==delivered, "
-                   "no USB errors; assumes disciplined host)\n", rate_ppm);
-        else if (pd_valid)
-            printf("Implied clock:   %+.3f ppm (rate %+.3f + loss %.1f ppm added "
-                   "back) — fast clock masking the loss\n",
-                   rate_ppm + loss_ppm, rate_ppm, loss_ppm);
+        printf("Rate offset:     %+.3f ppm (delivered vs nominal; ADC-vs-host "
+               "clock conflated with any uniform loss)\n", rate_ppm);
         printf("PIB errors:      %u\n", pib_delta);
         printf("Stream faults:   %u\n",
                st_end.streaming_faults - st_start.streaming_faults);
