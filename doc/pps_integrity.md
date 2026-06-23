@@ -480,6 +480,16 @@ consumer socket `xferCount` registers (bytes; the drain backlog),
 `pib_errors`, `streaming_faults`, and `boot_count`. There is no
 `pps_count`/`pps_fail` for the GPIF-driven marker.
 
+**Host-side transfer diagnostics** (libusb layer, in `rx888_stats_t`): the
+summary also prints `zero-length=N` — `LIBUSB_TRANSFER_COMPLETED` transfers
+with `actual_length == 0` (ZLP / empty-buffer terminations, e.g. a marker
+partial landing on a boundary) — and an `Xfer status:` line breaking out the
+per-`libusb_transfer_status` tally (`ERROR / TIMED_OUT / CANCELLED / STALL /
+NO_DEVICE / OVERFLOW`). This names what `bad_xfers` used to lump together, so
+a short/ZLP-handling fault (`OVERFLOW` = device sent more than asked;
+`TIMED_OUT` = a transfer that never terminated) is explicit rather than
+inferred from a single `bad=0`. Both stayed 0 across the clean runs.
+
 ### Pass criteria
 
 - **No transport/device fault** — `bad_xfers == 0`, no device reset, no
