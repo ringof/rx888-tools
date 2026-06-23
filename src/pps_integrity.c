@@ -899,8 +899,12 @@ int main(int argc, char **argv)
                "— flash the socket-xferCount build to enable the orphan "
                "cross-check\n");
     }
-    printf("USB transfers:   ok=%llu bad=%llu\n",
-           lib.ok_xfers, lib.bad_xfers);
+    printf("USB transfers:   ok=%llu bad=%llu zero-length=%llu\n",
+           lib.ok_xfers, lib.bad_xfers, lib.zero_xfers);
+    printf("Xfer status:     ERROR=%llu TIMED_OUT=%llu CANCELLED=%llu STALL=%llu "
+           "NO_DEVICE=%llu OVERFLOW=%llu\n",
+           lib.status_counts[1], lib.status_counts[2], lib.status_counts[3],
+           lib.status_counts[4], lib.status_counts[5], lib.status_counts[6]);
     printf("Sample loss:     %" PRIu64 " continuity dip(s), ~%" PRIu64 " samples "
            "(diagnostic localizer)\n", loss_events, lost_samples_est);
     printf("Loss floor:      continuity %d samples (%.2f buffer), largest dip "

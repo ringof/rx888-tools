@@ -514,7 +514,12 @@ int main(int argc, char **argv)
                    "< 48 B) — flash the socket-xferCount build\n");
         }
     }
-    printf("USB transfers:   ok=%llu bad=%llu\n", lib.ok_xfers, lib.bad_xfers);
+    printf("USB transfers:   ok=%llu bad=%llu zero-length=%llu\n",
+           lib.ok_xfers, lib.bad_xfers, lib.zero_xfers);
+    printf("Xfer status:     ERROR=%llu TIMED_OUT=%llu CANCELLED=%llu STALL=%llu "
+           "NO_DEVICE=%llu OVERFLOW=%llu\n",
+           lib.status_counts[1], lib.status_counts[2], lib.status_counts[3],
+           lib.status_counts[4], lib.status_counts[5], lib.status_counts[6]);
     printf("Short transfers: %" PRIu64 "  (anomalous — no marker applied)\n", shorts);
     if (bufs_lost)
         printf("  glDMACount-delivered gap: %.3f MB = %.1f ppm (%.4f%%) "
