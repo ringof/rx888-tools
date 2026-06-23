@@ -256,26 +256,27 @@ def analyze_csv(path):
     # each partial marker buffer as a full 16 KB), not dropped data.
     g = [(r['sec'], r['dma_count'] * FW_DMA_BUF - r['samples_total'] * 2)
          for r in data if 'dma_count' in r and 'samples_total' in r]
+    marks = max((r.get('marks', 0) for r in data), default=0)  # 0 for no-marker control
     if len(g) > 2:
         gap0, gap1 = g[0][1], g[-1][1]
         growth = gap1 - gap0
-        incs = [g[i][1] - g[i-1][1] for i in range(1, len(g))]
-        med = st.median(incs)
         print(f"\n  glDMACount*16384 - delivered: {gap0/1e6:+.3f} -> {gap1/1e6:+.3f} MB "
-              f"(growth {growth/1e6:+.3f} MB; median {med/1024:+.1f}KB/s, "
-              f"~{med/FW_DMA_BUF:+.2f} buf/marker)")
-        if drain_no_accum is True:
-            print("  >>> backlog confirms no orphaning, so this growth is the "
-                  "per-marker partial-buffer OVER-COUNT (artifact), NOT loss. "
-                  f"({growth/1e6:.1f} MB / {len(incs)} markers = "
-                  f"{growth/max(len(incs),1)/1024:.1f}KB each.)")
+              f"(growth {growth/1e6:+.3f} MB over {marks} markers)")
+        if marks > 0:
+            print(f"  per-marker: {growth/marks/1024:+.1f} KB/marker "
+                  f"({growth/marks/FW_DMA_BUF:+.2f} buf) — the partial-buffer size")
+        if drain_no_accum is True and marks > 0:
+            print("  >>> backlog shows no orphaning, so this gap is the per-marker "
+                  "partial-buffer OVER-COUNT, not dropped data.")
+        elif drain_no_accum is True:
+            print("  >>> backlog shows no orphaning AND no marker -> gap ~0, "
+                  "stream is clean (this is the control baseline).")
         elif drain_no_accum is False:
-            print("  >>> backlog DID accumulate -> this growth is real orphaned "
-                  "data; cross-check the seconds where backlog stepped.")
+            print("  >>> backlog DID accumulate -> real orphaned data; cross-check "
+                  "the seconds where backlog stepped.")
         else:
-            print("  >>> no drain counter to confirm; growth alone cannot tell "
-                  "over-count from loss (per-second variance is inflated by host "
-                  "in-flight wobble, so smooth/bursty is unreliable here).")
+            print("  >>> no drain counter to confirm; the gap alone can't separate "
+                  "over-count from loss.")
 
 def main(argv):
     if len(argv) < 2:
