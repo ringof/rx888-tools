@@ -13,7 +13,12 @@ Status: STEPS 1 + 2 BUILT + VALIDATED (no hardware yet). Branch
   garble -> amplitude dip with no phase step. The analyzer reaches the same
   conclusions from the saved artifacts.
 
-Remaining: doc fold-in + PR (step 3), then the rig runs (step 4).
+- Step 3 — `doc/tone_quality.md` (dedicated) documents the tools, formats,
+  discriminator, and a gnuplot recipe; `tests/tone_quality.py --plotdata` dumps
+  the per-record time series and `tests/tone_quality_plots.sh` renders the three
+  synthetic cases to `doc/img/tone_quality_{clean,drop,garble}.png`.
+
+Remaining: PR refresh, then the rig runs (step 4).
 
 ## `--source`: hardware-free validation of the real DSP
 

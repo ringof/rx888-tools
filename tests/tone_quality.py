@@ -156,6 +156,30 @@ def read_iqlog(path):
     return meta, z
 
 
+def dump_baseband_series(meta, z, path):
+    """Write the per-record demodulated time series as plain columns for gnuplot
+    (or any plotter): record, time, amplitude, wrapped phase, unwrapped phase,
+    per-record phase step. The slip shows as a step in phase; a garble as a dip
+    in amplitude."""
+    bb_rate = meta['bb_rate']
+    amp = np.abs(z)
+    ph = np.degrees(np.angle(z))
+    uph = np.degrees(np.unwrap(np.angle(z)))
+    dph = np.empty_like(uph)
+    dph[0] = 0.0
+    dph[1:] = np.diff(uph)
+    t_ms = np.arange(len(z)) / bb_rate * 1e3
+    with open(path, 'w') as f:
+        f.write(f"# tone_quality baseband series: decim={meta['decim']} "
+                f"bb_rate={bb_rate:.3f}Hz fs={meta['fs']:.0f} ftone={meta['ftone']:.0f} "
+                f"deg_per_slip={meta['deg_per_slip']:.4f}\n")
+        f.write("# record  t_ms  amp_lsb  phase_deg  uphase_deg  dphase_deg\n")
+        for i in range(len(z)):
+            f.write(f"{i} {t_ms[i]:.6f} {amp[i]:.3f} {ph[i]:.4f} "
+                    f"{uph[i]:.4f} {dph[i]:.4f}\n")
+    print(f"  plotdata: wrote {len(z)} rows -> {path}")
+
+
 def analyze_baseband(meta, z, markers=None):
     """Phase-locked tracking demod on the decimated baseband. A grid slip is a
     persistent phase STEP (~deg_per_slip per slipped sample) the loop cannot
@@ -323,12 +347,16 @@ def main(argv):
     ap.add_argument("--markers")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--block", type=int, default=0)
+    ap.add_argument("--plotdata", help="write the demodulated per-record time "
+                    "series (iqlog only) as gnuplot columns to this file")
     a = ap.parse_args(argv[1:])
 
     # Dispatch on input type: tone_monitor iqlog / statslog / raw capture.
     if is_iqlog(a.capture):
         meta, z = read_iqlog(a.capture)
         print(f"===== {a.capture} (tone_monitor iqlog) =====")
+        if a.plotdata:
+            dump_baseband_series(meta, z, a.plotdata)
         markers = np.loadtxt(a.markers, dtype=np.int64, ndmin=1) if a.markers else None
         return analyze_baseband(meta, z, markers)
     if is_statslog(a.capture):
