@@ -401,14 +401,36 @@ chase:
 #### Still open: data *corruption* (delivered ≠ correct)
 
 "Not orphaned" is not "uncorrupted." A sample slipped or garbled at a
-partial-buffer splice would balance every byte count above yet be wrong. The
-sensitive test is a **known 10 MHz tone**: down-convert to baseband and track
-the unwrapped phase — a single dropped/duplicated/corrupted sample is a
-`2π·10/129.6 = 27.8°` phase step, trivially detectable; the FFT gives
-SINAD/SFDR for analog quality; and correlating phase-step indices with the
-marker positions tests the splice directly. The LTC2208 has no digital
-test-pattern mode, so the injected tone is the ground truth. This is the next
-experiment.
+partial-buffer splice would balance every byte count above yet be wrong, and
+none of the loss instrumentation would see it. The test (tool:
+`tests/tone_quality.py`) uses a **coherent 27 MHz tone as a synthesized test
+pattern** — the LTC2208 has no digital test-pattern mode, so we make one:
+
+- **Rig precondition.** A single Leo Bodnar LBE-1425 GPSDO 27 MHz output is
+  **split** to both the RX888 Si5351 reference *and* the RF input, with the
+  Si5351 on **integer multipliers only** (PLL ×24 → 648 MHz VCO → ÷5 →
+  129.6 MHz; no fractional MultiSynth, so no delta-sigma phase dithering).
+  The tone is then *exactly* phase-coherent with the sample clock:
+  `f_tone/fs = 27/129.6 = 5/24`, so the digitized tone is a **deterministic
+  period-24 sequence** (a built-in test pattern). Signal conditioning protects
+  the FX3 input but must keep the edge fast (don't reintroduce the slow RC edge
+  that chattered the marker comparator).
+- **Detector 1 — period-24 self-consistency:** `x[n]` must equal `x[n−24]` to
+  within ADC noise. A corruption breaks it sample-exactly. (A *drop* heals
+  after 24 samples once both terms shift equally, so this **localizes** the
+  event; it does not by itself distinguish drop from garble.)
+- **Detector 2 — DDC phase:** down-convert and track the unwrapped phase. A
+  **grid slip** (dropped/duplicated sample) is a persistent `360·27/129.6 =
+  75°` phase step; a **garble** (bit error) leaves the phase flat. This is what
+  separates the two failure modes, and confirms coherence (flat line) held.
+- **Detector 3 — FFT:** SINAD / SFDR / ENOB / noise floor (analog quality).
+- **Splice test:** correlate event sample-indices with the marker positions —
+  does the partial-buffer splice corrupt data even though it loses none?
+
+Self-validated on synthetic captures (clean → CLEAN; injected drop → 1 slip
+with a 75° step; injected garble → 1 bit-error, phase flat). Needs a raw
+`int16` capture (`rx888_stream`); `numpy`-based, so it is an offline analysis
+tool, not part of `make check`.
 
 ### Main thread — 1 Hz toggle loop
 
@@ -606,7 +628,12 @@ the marker mechanism adds no loss of its own.
   ratio, dip/spur co-occurrence, and temporal clustering. Pass several
   logs (`_baseline`, `_lowR`, `_sync`) for a comparison table; a working
   fix should drop dips/hour **and** collapse the boundary-enrichment
-  toward 1×.
+  toward 1×. It also ingests the `--statslog` CSV (drain-backlog analysis).
+- **Corruption analysis** (`tests/tone_quality.py CAPTURE.s16`): the
+  coherent-27 MHz-tone test pattern — period-24 self-consistency
+  (localizes), DDC phase (slip vs garble), FFT (SINAD/SFDR/ENOB), and a
+  `--markers` splice correlation. `numpy`-based; offline (not in `make check`).
+  See "Still open: data corruption" for the rig precondition.
 
 ## Verification
 
