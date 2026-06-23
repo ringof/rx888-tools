@@ -10,8 +10,14 @@
 > for ~3 days (2026-06-20 → 06-23) was a measurement artifact: `glDMACount ×
 > 16 KB` counts each *partial* marker buffer as a full 16 KB (~10.8 KB/marker).
 > The tools now report measurements, not verdicts. **Still open:** data
-> *corruption* (delivered ≠ correct) — the 10 MHz-tone test. See "Resolution"
-> below.
+> *corruption* (delivered ≠ correct) — the coherent-tone test (see
+> `doc/tone_monitor_plan.md`). See "Resolution" below.
+
+> **Last-known-working pairing:** host tools (this repo) commit
+> `bc68cbf3a18576067a0a8a80d7d2776a594e69d7` with rx888-firmware commit
+> `09cc99b2ae7be2924edcd7ea3fe5f78454845346`. The firmware GETSTATS cleanup
+> requested in `doc/pps_firmware_cleanup.md` must keep the 48-byte layout so
+> this pairing's host decoder still parses the response.
 
 ## Problem
 
