@@ -4,6 +4,14 @@
 > open questions resolved, then implemented as `src/pps_integrity.c`.
 > See "Decisions" below for what changed from the original draft.
 
+> **Status (resolved):** the in-band PPS marker is **byte-lossless** —
+> confirmed over a 3 h run by the byte-exact producer/consumer drain
+> counters (backlog net 0, leak bound < 6 ppb). The "~42 ppm loss" we chased
+> for weeks was a measurement artifact: `glDMACount × 16 KB` counts each
+> *partial* marker buffer as a full 16 KB (~10.8 KB/marker). The tools now
+> report measurements, not verdicts. **Still open:** data *corruption*
+> (delivered ≠ correct) — the 10 MHz-tone test. See "Resolution" below.
+
 ## Problem
 
 The PPS in-band marker (ExtIO_sddc #125) injects short USB bulk
@@ -22,7 +30,7 @@ reader.
 ## Tool
 
 ```
-pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-q N] [-p N] [-v]   # default: 4 hours, 16 MSPS
+pps_integrity [hours] [--rate MSPS] [--firmware FILE] [-q N] [-p N] [-l CSV] [-v]   # default: 4 hours, 16 MSPS
 ```
 
 `--rate` accepts fractional MSPS (e.g. `--rate 129.6`) so the test can
@@ -185,28 +193,23 @@ classification is auditable line by line.
 Marker classification answers "is the delimiter there?" — not "did we
 lose samples?" That is checked by independent detectors:
 
-1. **Bytes produced vs delivered — the authoritative, clock-independent
-   check.** The firmware's `glDMACount` (GETSTATS byte 0) counts the DMA
-   buffers the GPIF *produced*. **These are the firmware's small DMA
-   buffers (`FW_DMA_BUF_BYTES` = 16 KB, confirmed against the SDDC_FX3
-   GPIF→DMA config), not the host's 1 MB USB transfers** — the host aggregates ~64 DMA buffers per transfer, so
-   `glDMACount` runs ~64× `ok_xfers`. The comparison must therefore be in
-   **bytes**, not buffer counts:
-   ```
-   produced_bytes  = (glDMACount delta) × FW_DMA_BUF_BYTES
-   delivered_bytes = (samples delta)    × 2
-   ```
-   Both count the same data, so a slow ADC clock lowers *both* equally and
-   the difference stays at zero — only real loss makes produced exceed
-   delivered. This directly answers "were all DMA buffers delivered?".
-   *Caveats:* `glDMACount` resets on `STOPFX3` (the end snapshot is read
-   *before* `rx888_stop()`); the counters aren't sampled atomically and
-   the pipeline holds transfers in flight, so produced runs ahead by
-   ~`in_flight` — the report subtracts `in_flight` (in bytes) and allows a
-   few transfers of slack. `FW_DMA_BUF_BYTES` is an asserted firmware
-   constant, guarded at runtime (if produced/delivered disagree by a large
-   factor the assumption is wrong and the check is marked *indeterminate*
-   rather than failing).
+1. **Bytes produced vs delivered, and the byte-exact drain backlog.** The
+   firmware's `glDMACount` (GETSTATS byte 0) counts DMA buffers the GPIF
+   *produced* (`PROD_EVENT`, one per 16 KB buffer **regardless of fill**).
+   `produced_bytes = glDMACount × FW_DMA_BUF_BYTES` (16 KB, confirmed against
+   the SDDC_FX3 GPIF→DMA config) vs `delivered_bytes = samples × 2` gives a
+   gross, clock-independent gap — a slow ADC clock lowers both equally.
+   **But the marker abandons *partial* buffers, which `glDMACount × 16 KB`
+   counts as full, so while the marker runs this gap is dominated by that
+   over-count (~10.8 KB/marker ≈ 42 ppm), not loss** — the tool reports it as
+   a raw `gap`, not a verdict. The *authoritative* loss check is the
+   **byte-exact drain backlog** = producer-minus-consumer socket `xferCount`
+   (see "Where the loss is" below): a real orphan accumulates it; genuine
+   in-flight just wobbles ±1 buffer. *Caveats:* `glDMACount` resets on
+   `STOPFX3` (the end snapshot is read *before* `rx888_stop()`); the counters
+   aren't sampled atomically and the pipeline holds transfers in flight, so
+   produced runs ahead by ~`in_flight` — corrected in bytes with a few
+   transfers of slack.
 2. **librx888 `bad_xfers`** — errored/cancelled USB transfers
    (transport-level loss).
 3. **Inter-marker continuity (diagnostic localizer, not the verdict).**
@@ -214,10 +217,11 @@ lose samples?" That is checked by independent detectors:
    of single-second inter-marker counts. It localizes *when* a deficit
    appears, but marker-detection timing jitters by ~a marker's worth at
    high rates, so an isolated short interval (with the next running long,
-   net zero) is **not** loss. It therefore does not fail the run on its
-   own — it is reported and **corroborated against detector 1**: a deficit
-   that coincides with `produced > delivered` is real; one that doesn't is
-   flagged as marker-flush jitter.
+   net zero) is **not** loss — it is reported as a localizer only and does
+   not fail the run. (Historically it was "corroborated against the
+   produced-vs-delivered gap"; since that gap is now known to be
+   partial-buffer over-count, that corroboration was spurious — the
+   authoritative check is the drain backlog.)
 
 **PIB errors** (firmware GPIF overflow) are **polled every second** on
 the EP0 handle, so an overflow is localised to the second it happens and
@@ -225,50 +229,33 @@ correlated with that interval's continuity result: PIB *with* a deficit
 lost host-visible samples; PIB with none did not. The same poll catches
 a mid-run device reset (boot-count change) immediately.
 
-**Where the loss is — inside the FX3, on the DMA→USB drain (firmware-confirmed).**
-`glDMACount` increments in the firmware DMA callback on
-`CY_U3P_DMA_CB_PROD_EVENT` — i.e. when the **producer** socket commits a
-filled buffer *into* the DMA channel, **before** USB consumption. So
-`produced > delivered` means buffers that **entered the channel but never
-came out the USB consumer socket**: the gap is *inside the chip*, on the
-DMA-channel→USB drain, not across the USB wire. This localises the loss
-precisely — the producer fill is fine (every lost buffer was filled and
-counted); it is the **drain** that loses them. It also **rules out host
-backpressure**: a host too slow to drain would (a) show in the no-marker
-`stream_soak` control at the same data rate — it does not — and (b) the
-loss correlates 26.9× with the *device-internal* buffer-fill phase
-(`minxfer`), which the host neither sees nor controls, so it cannot be a
-host-delivery artifact.
+**Where the loss is: the byte-exact drain backlog (and there is none).**
+`glDMACount` counts on `CY_U3P_DMA_CB_PROD_EVENT` — once per buffer the
+**producer** socket commits into the channel, regardless of fill — so
+`glDMACount × 16 KB` over-counts the marker's partial buffers and is *not* a
+clean loss measure (see the Resolution section). The real check is the
+**consumer** side: the firmware exposes the producer and consumer DMA-socket
+`xferCount` registers (bytes) — producer `[36..39]`, consumer-API
+`[40..43]`, consumer-raw `[44..47]`, in a 48-byte GETSTATS response. (An
+earlier attempt used a `CY_U3P_DMA_CB_CONS_EVENT` callback counter; it never
+fires on an AUTO channel and read a flat 0, so the register read replaced it
+— and it must sum **both** PIB producer sockets to match the single
+consumer's rate.) These wrap ~every 16 s at 129.6 MSPS, so the meaningful
+quantity is the *instantaneous* **backlog = producer − consumer**, read as
+**signed** (read-skew can leave the consumer one buffer ahead, wrapping to
+~2³²). A real orphan makes the producer permanently outrun the consumer, so
+the backlog **accumulates** (net start→end ≠ 0, or a sustained step);
+genuine in-flight wobbles ±1 buffer and returns to ~0. Over 3 h the backlog
+held net 0 with peak ±1 buffer and no sustained step — bounding any leak at
+**< 6 ppb** — so nothing is orphaned, and the `glDMACount` gap is the
+partial-buffer over-count. The tools report the backlog raw (start/end/net,
+peak |in-flight|, `prod≠cons` count); `stream_soak` is the no-marker
+baseline. This supersedes an earlier reading of the gap as "drain-side
+orphaned loss": the byte-exact backlog shows no orphaning.
 
-The firmware also exposes the **consumer** side. (`CY_U3P_DMA_CB_CONS_EVENT`
-never fires on an AUTO channel — proven on hardware, the callback counter
-stayed pinned at 0 — so the firmware reads the **socket `xferCount`
-registers** directly instead.) GETSTATS now carries, in bytes:
-producer `xferCount` `[36..39]`, consumer `xferCount` (SDK API) `[40..43]`,
-and consumer `xferCount` (raw register) `[44..47]`, in a 48-byte response.
-These are 32-bit byte counters that **wrap ~every 16 s** at 129.6 MSPS, so
-only the *instantaneous* **backlog = producer − consumer** is meaningful
-(both wrap together, and the backlog — in-flight + orphaned — never nears
-2³²). The tools read it (absent on older firmware → reported unavailable)
-and surface the backlog both per second (an `orphan+NKB (drain)` note on
-the second a step lands, correlating it with the dip) and as a summary
-**cross-check**: the backlog's *growth* over the run is the orphaned bytes,
-and with USB-wire loss ruled out it should equal the host's
-`produced − delivered`. Agreement pins the loss to the in-chip
-producer→consumer hop (orphaned in the drain). In `stream_soak` the backlog
-should stay flat at the steady in-flight depth — the "no orphaning"
-baseline the marker's steps stand out against.
-
-One accounting nuance follows from the PROD_EVENT semantics: it fires per
-buffer *regardless of fill*, so `produced_bytes = glDMACount × 16 KB`
-could in principle over-count the *partial* buffers the marker forces.
-This cross-checks out as a small secondary term, not the headline: the
-**continuity detector is delivered-side** (gaps in *received* samples) and
-therefore immune to producer-count rounding, yet independently attributes
-~87 MB (397 events × ~110k samples) to real loss in the *same* events the
-byte check flags. Two detectors — one producer-side, one consumer-side —
-agree the bulk loss is real and ~order-118 MB. A byte-granular produced
-counter (see "Takeaways", #2) would close the ~87→118 MB residual cleanly.
+**This also rules out host backpressure:** a host too slow to drain would
+show in the no-marker `stream_soak` control at the same rate — it does not —
+and would also make the backlog accumulate, which it does not.
 
 ### Separating clock offset from loss
 
@@ -280,18 +267,21 @@ whereas a **slow clock delivers everything, just at a steadily lower
 rate** — a smooth drift with no fingerprints (the ~+0.16 ppm marker-size
 drift we observe is exactly this).
 
-So when every loss detector is clear, `produced == delivered` *proves* no
-data was dropped, and the rate offset is reported as a pure **ADC clock
-calibration** (`ADC clock: ±X ppm`). This assumes a disciplined
-(NTP/PTP/GPS) host clock; on a free-running host the ppm is host+ADC
-combined. If any detector fires, the offset line instead reads
-`Sample budget: … (clock+loss combined)` and the run fails.
+Loss and clock are separated by the **byte-exact drain backlog**: when it
+does not accumulate (it did not, over 3 h), no data was dropped and the rate
+offset is the ADC-vs-host clock. The tool reports the offset *neutrally* as
+`Rate offset: ±X ppm`, alongside the `budget` ppm and the `glDMACount` gap
+ppm, noting the two are conflated — it does **not** assert which dominates
+(here the gap is over-count, not loss). This assumes a disciplined
+(NTP/PTP/GPS) host clock; on a free-running host the budget is host+ADC
+combined.
 
-The summary prints its own **sensitivity**, which differs by detector:
-the continuity diagnostic has a fine floor (`LOSS_TOL`, ~0.1 buffer) but
-jitters; the authoritative produced-vs-delivered has a coarser floor (the
-in-flight pipeline, a few MB) but is clock-independent and reliable.
-Together: produced-vs-delivered is the verdict, continuity localizes.
+Sensitivities differ by detector: the continuity diagnostic has a fine
+floor (`LOSS_TOL`, ~0.1 buffer) but jitters; the `glDMACount` gap has a
+coarse floor (the in-flight pipeline, a few MB) *and* is confounded by the
+marker over-count; the **drain backlog** is the clean, clock-independent
+loss check, with single-buffer resolution that tightens with run length
+(< 6 ppb over 3 h).
 
 ### What we deliberately do *not* do
 
@@ -313,223 +303,106 @@ library stop, or marker-handle control faults. Blind-spot and displaced
 misses do not (marker timing only); an uncorroborated continuity dip does
 not.
 
-### Marker injection, not throughput, perturbs the stream (and the loss is anomalously large — root cause OPEN)
+### Resolution: the marker is byte-lossless; the "42 ppm loss" was a glDMACount over-count
 
-Measured on real hardware, 3 h each (sleep inhibited; in-flight-corrected):
+After a long chase (history below), byte-exact firmware counters and a 3 h
+run settled it: **the in-band PPS marker drops no data.** What we pursued for
+weeks as "~42 ppm of loss" is an artifact in our own `glDMACount × 16 KB`
+accounting — it counts each *partial* marker buffer as a full 16 KB.
 
-| run | rate | spurious shorts | loss | device |
-|-----|------|-------------|------|--------|
-| `stream_soak` (no marker) | 64 MSPS | 0 | 0 | clean |
-| `stream_soak` (no marker) | 129.6 MSPS | 0 | 0 | clean |
-| `pps_integrity` (1 Hz, 100 kΩ slow edge) | 129.6 MSPS | 403 | **118 MB = 42.3 ppm** | clean (PIB=0, bad=0, faults=0) |
-| `pps_integrity` (1 Hz, 1 kΩ fast edge) | 129.6 MSPS | **0** | **115 MB = 41.2 ppm** | clean |
+Measured over 3 h at 129.6 MSPS (10,800 markers, sleep inhibited):
 
-**Edge experiment (1 kΩ) result — the edge is not the loss.** Swapping the
-100 kΩ series resistor for 1 kΩ (a ~100× faster edge) **eliminated the
-spurious shorts (403 → 0) and halved displaced markers (61 → 32)** — marker
-*fidelity* improved, confirming the slow edge had been chattering across the
-input threshold and tripping the TOGGLE comparator spuriously. But the
-**loss did not move (42.3 → 41.2 ppm, within n=1 noise), and the
-boundary-enrichment signature is intact (26.9× → 25.8×) with an *identical*
-dip magnitude (median 98,347 → 98,220 samples ≈ 12 DMA buffers).** Two
-independent 3 h runs, same enrichment, same characteristic loss size: this
-is a **stable, reproducible structural commit-vs-buffer-boundary collision**,
-not edge metastability. Edge quality governs fidelity; the buffer boundary
-governs loss — decoupled, confirmed both directions.
+| quantity | value | meaning |
+|---|---|---|
+| `glDMACount × 16384 − delivered` | +119 MB = **42.6 ppm** | the apparent "loss" |
+| per marker | **10.8 KB** (~0.7 buffer) | the partial-buffer over-count |
+| drain backlog (`apiProd − apiCons`) | **net 0**, peak ±1 buffer, 0 sustained steps | no bytes orphaned |
+| `apiProd ≠ apiCons` | 1027 / 10,800 s | producer counter is independent, not mirrored |
+| real clock (`budget`) | **−0.47 ppm** | TCXO ~nominal; no fast clock |
+| `bad_xfers`, PIB, faults | 0 | clean device |
 
-This also **kills the synchronizer as a *loss* fix.** The clean edge crushed
-metastable events without touching the boundary loss, so the loss is not
-metastability-driven; and the firmware source later showed the marker is a
-forced **thread switch**, not a commit, so there is no commit to synchronize.
-The loss is a **drain-side descriptor desync** when that thread switch races
-the DMA adapter near a buffer boundary — see the "Path forward" block below
-for the firmware-confirmed mechanism, the decisive `CONS_EVENT` telemetry,
-and the A0/A/B fixes.
+**The over-count.** `glDMACount` increments once per committed DMA buffer
+(`PROD_EVENT`), regardless of fill. The marker fires a GPIF thread-switch that
+abandons a *partially*-filled 16 KB buffer; `glDMACount × 16384` books that
+partial as a full buffer, over-stating "produced" bytes by `16384 − fill` each
+marker — ~10.8 KB on average. At 1 marker/s that is a **fixed ~42 ppm
+regardless of run length**, which is exactly why it was suspiciously constant
+across every run while the real clock varied. `stream_soak` (no marker) shows
+no gap because it makes no partial buffers.
 
-Two firm conclusions and one open question:
+**Why "no loss" (byte-exact).** The firmware exposes the producer and consumer
+socket `xferCount` registers (bytes); their instantaneous difference is the
+backlog actually sitting in the DMA channel. It stays at **0 ± exactly one
+buffer** (genuine in-flight / read-skew) for the entire 3 h and **ends where it
+started**. A real orphan would make the producer permanently outrun the
+consumer, so the end backlog bounds the *total* leak: **< 1 buffer over 2.8 TB
+≈ < 6 ppb**. And the producer counter is independent, not a mirror — it differs
+from the consumer in 1027 of 10,800 seconds. So every produced byte was
+delivered.
 
-**Firm: it is not a throughput ceiling, it's the marker.** Same rate (129.6),
-same duration, healthy device both ways: the bare stream loses nothing, the
-marker run loses 42.3 ppm. The streaming path sustains 259 MB/s fine. (The
-bare stream is even clean at the *higher*-stress comparison — a drain limit
-would fail it first.)
+**The clock.** With the gap exposed as over-count, the old "implied clock / the
+fast clock was masking the loss" reading is dead: the real ADC-vs-host offset
+is the `budget` (−0.47 ppm this run) and it varies run to run like a real
+clock; the +42.6 ppm gap is a constant artifact sitting on top of it, not a
+clock effect.
 
-**Firm: the budget alone would have missed it.** With a +41.8 ppm fast ADC
-clock and 42.3 ppm loss, the sample-rate budget read **−0.5 ppm** —
-pristine. The clock-independent produced-vs-delivered check exposed it (and
-prints the *implied* clock, `budget + loss added back`). This is the case
-the whole loss-accounting design exists for.
+**Tools report measurements now, not verdicts.** `pps_integrity` /
+`stream_soak` print the numbers (glDMACount gap; drain backlog start/end/net;
+peak in-flight; `prod≠cons` count; raw counters; rate offset). PASS/FAIL is
+reserved for unambiguous faults (`bad_xfers`, device reset). Interpretation
+lives here and in the `--statslog` CSV via `tests/pps_log_stats.py`.
 
-**OPEN: the loss is consistent with a fixable rig artifact — but that is
-a hypothesis, not a measured result.** A correct forced buffer commit
-should cost ~0 samples (it ships a partial early, then continues). What we
-measure instead is loss that is **rare but, when it happens, large**:
+#### How we got here (and what each step ruled out)
 
-- Of 10,800 markers (1 Hz × 3 h), only **397 (3.68 %)** caused a *detected*
-  loss event, and those 397 carry essentially all 118 MB (median ~98k
-  samples each, ~1 ms). So the headline 42.3 ppm is **not** a per-marker
-  cost; it is a rare catastrophic mode. The other 96.3 % did not trip the
-  continuity detector — but that detector is jittery (it is demoted to a
-  diagnostic for exactly that reason), so "clean" means "below a noisy
-  floor," **not** verified zero. The true per-marker floor is unknown from
-  this data.
-- The device is *pristine* throughout — `PIB = 0`, `bad_xfers = 0`,
-  `faults = 0` — i.e. buffers `glDMACount` counts as produced but that
-  never become a USB transfer: the loss is in the handoff, not an overflow.
+The dead ends are worth recording — the same data now explained drove a long
+chase:
 
-Loss events are **26.9× enriched at buffer boundaries** (`pps_log_stats.py`),
-which points at a commit-vs-buffer-completion collision. Two cautions on
-how far that carries: the marker *size* distribution across all clean
-seconds is ~uniform (≈2.5k–521k samples) — that is **expected** from the
-incommensurate PPS-vs-fill phase, **not** itself evidence of anything; and
-**43.6 % of loss events are not boundary-adjacent**, so the boundary-race
-story does not account for all of them. The leading reading is still
-**fixable input conditions rather than the in-band concept**, but it
-rests on the suspects below, none yet tested:
+| run / step | what it showed |
+|---|---|
+| `stream_soak` (no marker), 64 / 129.6 MSPS | lossless — isolates the effect to the marker (we now know: to its partial buffers) |
+| `pps_integrity` 100 kΩ slow edge, 129.6 | gap 42.3 ppm; spurious shorts 403 |
+| `pps_integrity` 1 kΩ fast edge, 129.6 | gap unchanged (41.2 ppm); spurious 403 → 0 — edge governs *fidelity*, not the gap |
+| 3 h, byte-exact drain counters, 129.6 | gap 42.6 ppm but backlog **net 0** — the gap is over-count, not loss |
 
-The firmware source (reading the actual GPIF config and vendored SDK)
-turns the input-condition suspects from speculation into a **confirmed
-signal path** — though not yet a confirmed *cause*. The `PPS_CTL_ENABLE=1`
-marker commit is performed **entirely in GPIF hardware** (states
-`TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`), on an `AUTO_MANY_TO_ONE` channel with
-cross-route correct by construction (see the KBA note below — the software
-commit-ordering class is eliminated). What the config shows about the CTL
-path:
+- **KBA231382 (`INVALID_SEQUENCE` on commit-buffer)** — investigated, ruled
+  out: the marker isn't a CPU commit at all (next bullet). The
+  `SetWrapUp`-on-AUTO anti-pattern it warns about lives only in `synth_pps.c`,
+  the `PPS_CTL_ENABLE=0` path, which never runs here.
+- **Edge quality / metastability** — the marker reaches CTL[2] through a
+  100 kΩ → ~4 µs edge, sampled directly (no synchronizer) by a TOGGLE
+  comparator (`GPIF_CONFIG` bit 12) on the 129.6 MHz clock. The 1 kΩ fast-edge
+  run cleaned up *spurious* shorts (edge chatter) but left the gap untouched →
+  not the cause of the gap.
+- **The marker is a forced *thread-switch*, not a commit.** `BETA_THR_WRAPUP`
+  is set in no GPIF state; `TH0_PPS_COMMIT` is the normal `DATA_CNT_HIT`
+  transition firing *unconditionally*, abandoning a partial buffer, which the
+  DMA adapter then wraps to USB (the short transfer). This is the source of the
+  partial buffers `glDMACount` over-counts. The channel holds 4 × 16 KB buffers
+  (`AUTO_MANY_TO_ONE`, 2 PIB producers → 1 UIB consumer); the host's "64
+  buffers per 1 MB transfer" is URB-side assembly.
+- **The "drain-side orphan" hypothesis — refuted.** We suspected the abandoned
+  partial collided with the ping-pong handoff and orphaned ~12 buffers in the
+  DMA→USB drain. Building the consumer-side telemetry to *test* that is what
+  produced the byte-exact backlog — which shows **no** orphaning over 3 h.
+  (Getting the telemetry right took three firmware iterations: `CONS_EVENT`
+  never fires on an AUTO channel; the socket-register read had to sum **both**
+  producer sockets; and the host had to read the wrap-around backlog as
+  signed.) The "~12-buffer dip" and "26.9× boundary enrichment" we chased were
+  **continuity-detector artifacts** — that detector jitters by ~a marker's
+  worth and was reading partial-transfer boundaries, not real loss — consistent
+  with the backlog showing nothing orphaned.
 
-- **Edge quality (confirmed slow).** The PPS reaches the FX3 through a
-  100 kΩ series resistor → a ~4 µs RC edge. CTL[2] is sampled on the
-  **external ADC clock (129.6 MHz)**, not the faster PIB fabric clock, so
-  that edge spans **~500 consecutive sample clocks in the input threshold**
-  — 500 edges each able to violate setup/hold. Untested with a
-  fast/buffered (<1 clock) edge.
-- **No synchronizer, and edge-triggered (confirmed).** The control
-  comparator is in **TOGGLE mode** (`GPIF_CONFIG` bit 12) — it fires for
-  one clock whenever the *sampled* CTL[2] value differs from the previous
-  sample — and it samples CTL[2] **directly**: no intermediate sampling
-  state, no 2-flop synchronizer. A metastable sample propagates straight
-  into the `PPS_COMMIT` transition. The PPS vs original GPIF waveforms
-  differ in exactly two bits — `CTRL_COMP_ENABLE` (bit 0) and
-  `CTRL_COMP_TOGGLE` (bit 12) — so the marker is *only* "turn the toggle
-  comparator on," riding the raw async edge.
-- **DLL: correctly off, not a lever.** `pibClock.isDllEnable = CyFalse`;
-  the GPIF is in **sync mode** (`GPIF_CONFIG` bit 8 = 1) clocked by the
-  external ADC clock. The DLL exists for *async*-mode input timing, which
-  this interface does not use, so disabling it is correct — ruling out the
-  one firmware-config lever I had flagged (KBA210733).
-- **SDK 1.3.4** (`SDK/fw_lib/1_3_4/`).
+#### Still open: data *corruption* (delivered ≠ correct)
 
-So the metastability *mechanism path* is real and firmware-confirmed: a
-~4 µs async edge, sampled directly with no synchronizer by a toggle
-comparator on a 129.6 MHz clock, driving a state transition. That path is
-real — and the 1 kΩ edge experiment showed it **drives marker fidelity
-(spurious chatter), not the data loss**: cleaning the edge took spurious
-shorts 403 → 0 but left the loss and its boundary-enrichment unchanged (see
-the edge-experiment note under the table). So the loss is **not** a
-metastable stall on this edge; it is a structural collision when the forced
-commit lands near a buffer boundary, regardless of edge quality. The 43.6 %
-of loss events that are not boundary-adjacent remain a separate open thread.
-
-So this is **not** a verdict either way — neither that in-band marking is
-unworkable nor that it is fixable. The experiment sequence and where it
-landed:
-(1) **done — 129.6 MSPS baseline = 42.3 ppm** (n = 1, slow-edge resistor);
-(2) **done — 1 kΩ fast edge = 41.2 ppm, loss unchanged.** The clean edge
-fixed *fidelity* (spurious 403 → 0, displaced halved) but left the loss and
-its 26.9× → 25.8× boundary-enrichment intact — so the loss is a **structural
-commit-vs-boundary collision, not edge metastability** (see the edge-
-experiment note under the table above);
-(3) **a synchronizer state — dropped.** The firmware source has since
-confirmed the mechanism, and it is neither edge metastability (the clean
-edge ruled that out) nor a software commit: **the marker is not even a
-*commit*.** `BETA_THR_WRAPUP` is set in **no** waveform state;
-`TH0_PPS_COMMIT` is byte-identical to the normal `DATA_CNT_HIT` transition
-except it fires **unconditionally**. So the marker is a forced
-*thread-switch* that abandons a partially-filled buffer, and the short
-transfer is an **implicit side effect** — the DMA adapter auto-wrapping the
-abandoned socket, not a commanded wrap-up. A CTL[2] synchronizer cannot
-help a thread-switch-vs-adapter race, so it is off the table.
-
-**Firmware-confirmed mechanism.** The channel holds only **4 × 16 KB
-buffers** (`AUTO_MANY_TO_ONE`, 2 PIB producers → 1 UIB consumer); the
-host's "64 buffers per 1 MB transfer" is URB-side *assembly*, not device
-buffering. So the ~12-buffer loss cannot be 12 stranded buffers (that is
-3× the entire pool) — it is a **drain-side descriptor desync**: the
-consumer pointer skips ~12 buffers' worth while the producer keeps filling
-and counting, which is exactly why nothing overflows (`PIB = 0`) and the
-loss is silent. The whole consumer/drain side is confirmed
-**uninstrumented** (`CY_U3P_DMA_CB_CONS_EVENT` is commented out), so the
-loss is invisible to firmware *because nothing watches it*, not because
-nothing happens.
-
-**Path forward — instrument first, then three options.** The decisive next
-step is firmware telemetry, not another host run: enable
-`CY_U3P_DMA_CB_CONS_EVENT`, expose `glDMAConsCount`, and watch
-`glDMACount − glDMAConsCount` at the marker events. A ~12 jump that never
-recovers confirms the orphan directly, on the drain side where the loss
-is. With that in place:
-
-- **A0 — explicit `THR_WRAPUP` (one bit, try first).** Set
-  `BETA_THR_WRAPUP` in `PPS_COMMIT` so the partial buffer is wrapped by the
-  *sanctioned* primitive instead of the implicit adapter side-effect — a
-  deliberate, clock-ordered handshake rather than a race. **Caveat:**
-  `THR_WRAPUP` also *shuts the thread down*, so the thread must re-arm
-  cleanly or it trades the boundary drop for a per-marker re-arm gap (this
-  is plausibly why the original used the thread-switch hack). Nearly free to
-  try, and the `CONS` counter says immediately whether it worked.
-- **A — boundary-aware switch.** Use `ADDR_COUNT` as a danger-zone detector
-  to inhibit the CTL[2] transition near a boundary, deferring and recording
-  the offset (~4–6 GPIF states). The fallback if A0's explicit wrap still
-  collides.
-- **B — capture, don't commit (the clean sidestep).** A GPIO19
-  `POS_EDGE` ISR latches `glDMACount`, exposed via GETSTATS — zero stream
-  perturbation, buffer-level (~63 µs) resolution, stock waveform. Trades
-  sample-exact in-band timing for guaranteed no perturbation.
-
-The out-of-band MCU latch (B, or buffer-level + byte-offset) stays the only
-**proven** option until A0/A is shown to work.
-
-`-q`/`-p` raise in-flight buffering, which *might* let the pipeline ride
-out the perturbation; `tests/pps_knob_sweep.sh` measures whether it does.
-But the real next move, post-edge-experiment, is the **`CONS_EVENT`
-telemetry then path A0**, above.
-
-#### Investigated and ruled out: Infineon KBA231382 (commit-buffer failures)
-
-Infineon's KBA *"Handling Commit Buffer Failures Occurred during Video
-Transfers using FX3"* (KBA231382, AN75779/UVC reference) describes
-`CyU3PDmaMultiChannelCommitBuffer()` returning
-`CY_U3P_ERROR_INVALID_SEQUENCE` (error 71) when a CPU-side commit lands
-out of the socket order the GPIF fill sequence expects on the two
-ping-pong producer sockets `PIB_SOCKET_0`/`PIB_SOCKET_1` — a buffer
-silently fails to ship. That looked, on the face of it, like a strong
-match for the 26.9× boundary-enrichment: a forced partial commit at an
-arbitrary phase committing out of socket order.
-
-**It does not apply to this build.** The firmware source confirms the
-RX888 runs `PPS_CTL_ENABLE=1`, in which the marker commit is performed
-**entirely in GPIF hardware** (states `TH0_PPS_COMMIT`/`TH1_PPS_COMMIT`):
-
-- There is **no CPU `CommitBuffer()` or `SetWrapUp()`** in the marker path
-  at all — the KBA is about CPU-driven commits, so its mechanism cannot be
-  the cause here.
-- The streaming channel is `CY_U3P_DMA_TYPE_AUTO_MANY_TO_ONE`. Cross-route
-  is **correct by construction**: `TH0_PPS_COMMIT` only fires while
-  thread 0 is the active producer, `TH1_PPS_COMMIT` only while thread 1 is
-  — the state machine cannot commit the "wrong" socket.
-- (The `SetWrapUp`-on-AUTO anti-pattern the KBA warns about *does* exist in
-  the firmware tree — in `synth_pps.c`, which guesses socket 0 then falls
-  back to socket 1 with no return-code recovery — but that path belongs to
-  the `PPS_CTL_ENABLE=0` build and **never runs here**.)
-
-So the KBA was worth chasing and is now closed as a cause for this build.
-What it eliminates is the *software commit-ordering* class. The fast-edge
-run then closed the metastability question too (loss unchanged), and the
-firmware source closed the mechanism: the marker is a forced **thread
-switch** (no `THR_WRAPUP` in the waveform), and the loss is a **drain-side
-descriptor desync** of ~12 buffers when that switch races the DMA adapter
-near a boundary — silent because the consumer side is uninstrumented. See
-the experiment-outcome and "Path forward" block above for the confirmed
-mechanism and the A0/A/B options.
+"Not orphaned" is not "uncorrupted." A sample slipped or garbled at a
+partial-buffer splice would balance every byte count above yet be wrong. The
+sensitive test is a **known 10 MHz tone**: down-convert to baseband and track
+the unwrapped phase — a single dropped/duplicated/corrupted sample is a
+`2π·10/129.6 = 27.8°` phase step, trivially detectable; the FFT gives
+SINAD/SFDR for analog quality; and correlating phase-step indices with the
+marker positions tests the splice directly. The LTC2208 has no digital
+test-pattern mode, so the injected tone is the ground truth. This is the next
+experiment.
 
 ### Main thread — 1 Hz toggle loop
 
@@ -562,40 +435,51 @@ Here edge 3's marker was displaced into edge 4's oversized flush.
 ```
 === PPS INTEGRITY RESULT ===
 Duration:        03:00:00
-Sample rate:     64 MSPS (64000000 Hz)
+Sample rate:     129.6 MSPS (129600000 Hz)
 Transfer size:   524288 samples (1048576 bytes)
 Edges sent:      10800
-Markers seen:    10799
+Markers seen:    10797
 Spurious shorts: 0
-Missed markers:  1  (blind-spot: 0, displaced: 1) — marker timing only, see loss below
-Samples in:      9474614008 (9.47 Gsa)
-DMA buffers:     produced 18.95 GB (1156532 x 16384 B), delivered 18.95 GB, in-flight 0.03 GB, undelivered +0.000 MB (slack 4.19 MB)
-USB transfers:   ok=18204 bad=0
-Sample loss:     0 continuity dip(s), ~0 samples (diagnostic; NOT corroborated ...)
-Loss floor:      continuity 65536 samples (0.12 buffer), largest dip 0 (0.00 buffer); gross floor ~4.19 MB (in-flight)
-ADC clock:       +19.330 ppm (lossless: produced==delivered, no USB errors; assumes disciplined host)
-PIB errors:      2 total in 2 second(s); 0 coincided with a deficit
+Missed markers:  3  (blind-spot: 0, displaced: 3) — marker timing only, see loss below
+Displaced rate:  0.028% of edges (~1.0/hour) — delimiter moved one edge; reconstructable.
+Samples in:      1399681021808 (1399.68 Gsa)
+DMA buffers:     glDMACount 2799.48 GB (170866581 x 16384 B), delivered 2799.36 GB, gap +119.165 MB (in-flight 32->32, slack 4.19 MB)
+DMA drain:       backlog start +0.000 end +0.000 net +0.000 MB; peak |in-flight| 16384 B (1.0 buf); prod!=cons 1027/10800 s; API-vs-rawreg skew 0 B
+  drain raw:     start P=3538944 C=3538944 | end P=3338661600 C=3338661600 Craw=3338661600
+USB transfers:   ok=2678321 bad=0
+Sample loss:     310 continuity dip(s), ~28895477 samples (diagnostic localizer)
+Loss floor:      continuity 65536 samples (0.12 buffer), largest dip 238485 (0.45 buffer); in-flight slack ~4.19 MB
+  glDMACount-delivered gap: 119.165 MB = 42.6 ppm (0.0043%) — compare against the DMA-drain backlog above and --statslog
+Rate offset:     -1.188 ppm (delivered vs rate x elapsed; budget -0.470 ppm, glDMACount gap +42.6 ppm — conflated, see drain/CSV)
+PIB errors:      0 total in 0 second(s); 0 coincided with a deficit
 Stream faults:   0
 Boot count:      unchanged
 Result: PASS
 ```
 
-The headline integrity line is **`DMA buffers: produced ≈ delivered`** (in
-bytes) — clock-independent proof no buffer was dropped. With it and
-`bad_xfers == 0`, the rate offset is reported as a pure **`ADC clock`**
-calibration rather than loss. The `Sample loss` / continuity line is a
-diagnostic, flagged corroborated or not by the produced-vs-delivered
-check.
+The integrity headline is the **`DMA drain` backlog** (producer−consumer
+bytes still in the channel): net ~0 with peak ±1 buffer = nothing orphaned,
+clock-independent. The `DMA buffers: … gap` line is `glDMACount × 16 KB −
+delivered` — *gross*, and over-counts the partial marker buffers, so it reads
+~42 ppm here **even with no loss**; it is a raw measurement, not a verdict.
+`Rate offset` reports the delivered-vs-expected ppm with its `budget` and gap
+terms, asserting neither as the cause. `Sample loss` (continuity) is a
+localizer only. `Result: PASS/FAIL` keys on **unambiguous faults** —
+`bad_xfers`, device reset, streaming faults, spurious shorts — not the
+over-count gap.
 
-**Note on firmware counters:** GETSTATS exposes `dma_count` (glDMACount,
-DMA buffers produced — 16 KB each, *not* host transfers), `pib_errors`,
-`streaming_faults`, and `boot_count`, but no dedicated
-`pps_count`/`pps_fail`, and no DMA-*consumer* (delivered) counter.
+**Note on firmware counters:** GETSTATS exposes `glDMACount` (producer DMA
+buffers, 16 KB each — `PROD_EVENT`, regardless of fill), the producer and
+consumer socket `xferCount` registers (bytes; the drain backlog),
+`pib_errors`, `streaming_faults`, and `boot_count`. There is no
+`pps_count`/`pps_fail` for the GPIF-driven marker.
 
 ### Pass criteria
 
-- **No sample loss** — `bad_xfers == 0` and `produced_bytes − delivered_bytes`
-  within the in-flight slack. (Continuity dips are diagnostic, not failing.)
+- **No transport/device fault** — `bad_xfers == 0`, no device reset, no
+  streaming faults. (The `glDMACount` gap and continuity dips are *reported,
+  not failed on* — the gap is partial-buffer over-count; real orphaning would
+  show as `DMA drain` backlog accumulation, which it does not.)
 - `spurious_count == 0` — no shorts without a preceding rising edge.
 - No device resets (`boot_count` unchanged, no mid-run reset), no
   streaming faults, no early library stop, no marker-handle control
@@ -728,17 +612,18 @@ make librx888.a pps_integrity
 ./pps_integrity 4 --rate 64
 ```
 
-## Takeaways even if this doesn't work
+## Future work: firmware features that would sharpen these tools
 
-The in-band marker may not survive the edge experiment. The harness and the
-understanding behind it survive regardless: we now have trustworthy host-side
-data-quality, dropped-sample, and timing-error instrumentation
-(`pps_integrity`, `stream_soak`, `pps_log_stats.py`, the produced-vs-delivered
-and clock-vs-loss accounting). The natural next step is firmware features that
-turn what these tools currently **infer** into something the device **reports
-exactly** — none of which depend on in-band PPS panning out. Feasibility is a
-firmware call (FX3 SDK 1.3.4, `AUTO_MANY_TO_ONE` channel, GPIF counter
-hardware); these are ranked candidates with the open questions noted.
+The marker turned out lossless, so this is no longer a fallback list — it is
+the set of device-reported counters that would replace what the host still
+*infers*. Some already landed during the investigation: the byte-exact
+producer/consumer socket `xferCount` registers (the drain backlog) are exactly
+the "byte-granular produced/consumed counter" idea, and the backlog's
+accumulation is the drop detector. The rest stand as candidates (feasibility is
+a firmware call — FX3 SDK 1.3.4, `AUTO_MANY_TO_ONE` channel, GPIF counter
+hardware). The single highest-value *remaining* item is not firmware at all:
+the **10 MHz-tone corruption test** (see "Still open" above), since the byte
+accounting proves delivery, not correctness.
 
 **Dropped-sample detection (make it exact, not inferred)**
 
