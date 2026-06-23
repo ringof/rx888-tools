@@ -200,72 +200,82 @@ def analyze_csv(path):
     print(f"  rows={len(rows)} ({n} per-second + start/end)  "
           f"dur~{data[-1].get('sec', n)}s")
 
-    # --- drain counters: independence + orphan steps ---
+    drain_no_accum = None   # None = no drain data; True/False = verdict
+    # --- drain counters: independence + orphan accumulation ---
+    # backlog is unsigned (prod-cons mod 2^32). Read-skew lets the consumer be
+    # caught up to one buffer AHEAD, which wraps to ~2^32 — interpret as signed.
+    def sgn(b):
+        return b - (1 << 32) if b >= (1 << 31) else b
     dv = [r for r in data if r.get('drain_valid') == 1 and 'backlog' in r]
     if not dv:
         print("  drain_valid=0 on all rows -> firmware has no socket xferCount "
               "(GETSTATS < 48 B); reflash the socket-xferCount build")
     else:
         same = sum(1 for r in dv if r['drain_prod'] == r['drain_cons'])
-        backl = [r['backlog'] for r in dv]
-        nz = sum(1 for b in backl if b != 0)
-        s = sorted(backl); peak = s[-1]
+        sb = [sgn(r['backlog']) for r in dv]
+        nz = sum(1 for x in sb if x != 0)
+        s = sorted(sb); lo, hi = s[0], s[-1]
+        absmax = max(abs(lo), abs(hi))
         print(f"\n  drain rows: {len(dv)}/{n}")
         print(f"  drain_prod==drain_cons: {same}/{len(dv)} rows   "
               f"backlog nonzero: {nz}/{len(dv)} rows")
-        print(f"  backlog bytes: min={s[0]} med={s[len(s)//2]} "
-              f"max={peak} ({peak/FW_DMA_BUF:.1f} buffers)")
-        if peak == 0:
-            print("  >>> backlog is 0 on EVERY row -> apiProd MIRRORS apiCons "
-                  "(vacuous; the producer counter is not independent)")
+        print(f"  backlog (signed) bytes: min={lo} med={s[len(s)//2]} max={hi}  "
+              f"|peak in-flight| {absmax} ({absmax/FW_DMA_BUF:.1f} buf)")
+        if same == len(dv):
+            print("  >>> drain_prod == drain_cons on EVERY row -> apiProd MIRRORS "
+                  "apiCons (vacuous; producer counter not independent)")
         else:
-            print(f"  >>> backlog wobbles nonzero (peak {peak/FW_DMA_BUF:.1f} buf) "
-                  "-> producer counter looks INDEPENDENT of consumer")
-        # orphan steps (sustained jumps above the running high-water)
-        steps, hw = [], backl[0]
-        for r in dv:
-            b = r['backlog']
-            if b > hw + ORPHAN_STEP:
-                steps.append((r, b - hw))
-            if b > hw:
-                hw = b
-        print(f"  orphan steps (> {ORPHAN_STEP//FW_DMA_BUF} buffers): {len(steps)}")
+            print(f"  >>> {len(dv)-same} rows differ (in-flight wobble, |peak| "
+                  f"{absmax/FW_DMA_BUF:.1f} buf) -> apiProd IS INDEPENDENT of apiCons")
+        # orphan accumulation: a real orphan ratchets the backlog up and never
+        # drains it; in-flight wobble returns to ~0. Net start->end and the
+        # sustained peak tell them apart (channel only holds 4 buffers, so a
+        # backlog that stays above that is orphaning).
+        net = sgn(dv[-1]['backlog']) - sb[0]
+        steps, hw = [], sb[0]
+        for r, x in zip(dv, sb):
+            if x > hw + ORPHAN_STEP:
+                steps.append((r, x - hw))
+            if x > hw:
+                hw = x
+        print(f"  net backlog change start->end: {net:+d} B "
+              f"({net/FW_DMA_BUF:+.1f} buf)   sustained orphan steps "
+              f"(> {ORPHAN_STEP//FW_DMA_BUF} buf): {len(steps)}")
         for r, sz in steps[:12]:
             print(f"    sec {r.get('sec'):>5}  backlog+{sz//1024}KB "
                   f"({sz/FW_DMA_BUF:.1f} buf)  minxfer={r.get('minxfer')}")
+        drain_no_accum = (absmax <= 16 * FW_DMA_BUF
+                          and abs(net) <= 16 * FW_DMA_BUF and not steps)
+        if drain_no_accum:
+            print("  >>> backlog stays within in-flight (no accumulation) -> "
+                  "NO bytes orphaned producer->consumer.")
 
-    # --- glDMACount vs delivered: smooth artifact vs bursty real loss ---
+    # --- glDMACount vs delivered ---
+    # The byte-exact backlog above is authoritative: if it shows no accumulation,
+    # this gap is BY DEFINITION the partial-buffer over-count (glDMACount counts
+    # each partial marker buffer as a full 16 KB), not dropped data.
     g = [(r['sec'], r['dma_count'] * FW_DMA_BUF - r['samples_total'] * 2)
          for r in data if 'dma_count' in r and 'samples_total' in r]
     if len(g) > 2:
         gap0, gap1 = g[0][1], g[-1][1]
         growth = gap1 - gap0
         incs = [g[i][1] - g[i-1][1] for i in range(1, len(g))]
-        m = st.mean(incs); sd = st.pstdev(incs) if len(incs) > 1 else 0.0
+        med = st.median(incs)
         print(f"\n  glDMACount*16384 - delivered: {gap0/1e6:+.3f} -> {gap1/1e6:+.3f} MB "
-              f"(growth {growth/1e6:+.3f} MB)")
-        if growth < FW_DMA_BUF:
-            print("  >>> no net growth -> no glDMACount-vs-delivered loss signal "
-                  "this window")
+              f"(growth {growth/1e6:+.3f} MB; median {med/1024:+.1f}KB/s, "
+              f"~{med/FW_DMA_BUF:+.2f} buf/marker)")
+        if drain_no_accum is True:
+            print("  >>> backlog confirms no orphaning, so this growth is the "
+                  "per-marker partial-buffer OVER-COUNT (artifact), NOT loss. "
+                  f"({growth/1e6:.1f} MB / {len(incs)} markers = "
+                  f"{growth/max(len(incs),1)/1024:.1f}KB each.)")
+        elif drain_no_accum is False:
+            print("  >>> backlog DID accumulate -> this growth is real orphaned "
+                  "data; cross-check the seconds where backlog stepped.")
         else:
-            # how concentrated is the growth? seconds holding 90% of it.
-            pos = sorted((x for x in incs if x > 0), reverse=True)
-            tot = sum(pos) or 1
-            c, k = 0, 0
-            for x in pos:
-                c += x; k += 1
-                if c >= 0.9 * tot:
-                    break
-            print(f"  per-second gap increment: mean={m/1024:.1f}KB sd={sd/1024:.1f}KB; "
-                  f"90% of growth in {k}/{len(incs)} seconds")
-            smooth = sd < 0.6 * abs(m) + FW_DMA_BUF and k > 0.5 * len(incs)
-            print("  >>> " + ("SMOOTH/per-second -> consistent with the per-marker "
-                              "partial-buffer over-count (artifact, not dropped data)"
-                              if smooth else
-                              "BURSTY/concentrated -> consistent with real loss "
-                              "events (a few seconds carry the deficit)"))
-    print("\n  (cross-check: real loss => backlog steps AND bursty gap on the SAME "
-          "seconds; artifact => backlog flat/~0 while gap grows smoothly.)")
+            print("  >>> no drain counter to confirm; growth alone cannot tell "
+                  "over-count from loss (per-second variance is inflated by host "
+                  "in-flight wobble, so smooth/bursty is unreliable here).")
 
 def main(argv):
     if len(argv) < 2:
