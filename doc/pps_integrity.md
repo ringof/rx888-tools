@@ -7,10 +7,11 @@
 > **Status (resolved):** the in-band PPS marker is **byte-lossless** —
 > confirmed over a 3 h run by the byte-exact producer/consumer drain
 > counters (backlog net 0, leak bound < 6 ppb). The "~42 ppm loss" we chased
-> for weeks was a measurement artifact: `glDMACount × 16 KB` counts each
-> *partial* marker buffer as a full 16 KB (~10.8 KB/marker). The tools now
-> report measurements, not verdicts. **Still open:** data *corruption*
-> (delivered ≠ correct) — the 10 MHz-tone test. See "Resolution" below.
+> for ~3 days (2026-06-20 → 06-23) was a measurement artifact: `glDMACount ×
+> 16 KB` counts each *partial* marker buffer as a full 16 KB (~10.8 KB/marker).
+> The tools now report measurements, not verdicts. **Still open:** data
+> *corruption* (delivered ≠ correct) — the 10 MHz-tone test. See "Resolution"
+> below.
 
 ## Problem
 
@@ -307,8 +308,9 @@ not.
 
 After a long chase (history below), byte-exact firmware counters and a 3 h
 run settled it: **the in-band PPS marker drops no data.** What we pursued for
-weeks as "~42 ppm of loss" is an artifact in our own `glDMACount × 16 KB`
-accounting — it counts each *partial* marker buffer as a full 16 KB.
+~3 days (2026-06-20 → 06-23) as "~42 ppm of loss" is an artifact in our own
+`glDMACount × 16 KB` accounting — it counts each *partial* marker buffer as a
+full 16 KB.
 
 Measured over 3 h at 129.6 MSPS (10,800 markers, sleep inhibited):
 
@@ -371,8 +373,12 @@ chase:
 - **Edge quality / metastability** — the marker reaches CTL[2] through a
   100 kΩ → ~4 µs edge, sampled directly (no synchronizer) by a TOGGLE
   comparator (`GPIF_CONFIG` bit 12) on the 129.6 MHz clock. The 1 kΩ fast-edge
-  run cleaned up *spurious* shorts (edge chatter) but left the gap untouched →
-  not the cause of the gap.
+  run left the gap untouched (so the slow edge was not the cause of the gap)
+  — **but it was a real fix, not a dead end:** the slow edge had been
+  chattering the comparator, and the fast edge took **spurious shorts 403 → 0
+  and displaced markers 61 → 32**. That is a genuine marker-*fidelity* win
+  (clean 1:1 edge↔marker correspondence, zero false delimiters) and is a kept
+  change — it just fixed fidelity, not "loss" (there was none).
 - **The marker is a forced *thread-switch*, not a commit.** `BETA_THR_WRAPUP`
   is set in no GPIF state; `TH0_PPS_COMMIT` is the normal `DATA_CNT_HIT`
   transition firing *unconditionally*, abandoning a partial buffer, which the
