@@ -1,12 +1,19 @@
 # Plan: coherent-tone corruption monitor (`tone_monitor` + offline analyzer)
 
-Status: STEP 1 BUILT + DSP-VALIDATED (no hardware yet). Branch
-`claude/pps-development`. `src/tone_monitor.c` exists with `--statslog`,
-`--iqlog`, and a `--source FILE` replay mode; the inline Goertzel demod is
-validated against synthesized clean/drop/garble waveforms by
-`tests/tone_monitor_replay.sh` (in `make check`): clean -> flat phase, drop ->
-75.00 deg grid slip, garble -> amplitude dip with no phase step. The offline
-tracking-demod analyzer (step 2) is not built yet.
+Status: STEPS 1 + 2 BUILT + VALIDATED (no hardware yet). Branch
+`claude/pps-development`.
+- Step 1 — `src/tone_monitor.c`: inline Goertzel demod, `--statslog` CSV,
+  `--iqlog` baseband, `--source FILE` replay. Raw telemetry only, no verdict.
+- Step 2 — `tests/tone_quality.py`: offline analyzer now reads the `.iq`
+  baseband and the `--statslog` CSV (auto-detected) and runs the phase-locked
+  tracking demodulator (slip vs garble vs benign wander).
+- `tests/tone_monitor_replay.sh` (in `make check`) validates the whole chain on
+  synthesized clean/drop/garble waveforms with no hardware: clean -> flat
+  phase/CLEAN, drop -> 75.00 deg grid slip (1 slipped sample, localized),
+  garble -> amplitude dip with no phase step. The analyzer reaches the same
+  conclusions from the saved artifacts.
+
+Remaining: doc fold-in + PR (step 3), then the rig runs (step 4).
 
 ## `--source`: hardware-free validation of the real DSP
 
@@ -198,9 +205,10 @@ The phasor is scaled by `2/decim`, so `|I+jQ|` is the tone amplitude in LSB and
 
 1. DONE — `src/tone_monitor.c`: Goertzel inline + `--statslog` CSV + `--iqlog`
    binary + `--source` replay; Makefile + smoke + replay tests in `make check`.
-2. Offline analyzer path for the `.iq` binary + CSV with the tracking
-   demod/discriminator (phase-locked, slip vs garble vs benign wander); validate
-   on synthetic data (extend `tests/tone_quality.py`).
+2. DONE — `tests/tone_quality.py` reads the `.iq` baseband and `--statslog`
+   CSV (auto-detected) and runs the tracking demod/discriminator (phase-locked,
+   slip vs garble vs benign wander); validated on synthetic data via
+   `tests/tone_monitor_replay.sh`.
 3. Doc: fold method + formats into `doc/pps_integrity.md` (or a new
    `doc/tone_quality.md`); update PR #32 (still DRAFT).
 4. Rig: bare-stream tone baseline (confirm clean), then run alongside

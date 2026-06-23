@@ -39,7 +39,8 @@ g.astype('<i2').tofile(os.path.join(work, 'garble.s16'))
 PY
 
 for w in clean drop garble; do
-    "$TM" --source "$work/$w.s16" --iqlog "$work/$w.iq" --decim 2400 \
+    "$TM" --source "$work/$w.s16" --iqlog "$work/$w.iq" \
+        --statslog "$work/$w.csv" --decim 2400 \
         >/dev/null 2>&1 || { echo "FAIL: tone_monitor failed on $w"; exit 1; }
 done
 
@@ -79,5 +80,26 @@ check(amp.min() < 0.99*amp.max(), f"garble: amplitude dip (min {amp.min():.0f} <
 sys.exit(1 if fail else 0)
 PY
 rc=$?
+
+# Also exercise the offline analyzer (tone_quality.py) end-to-end on the iqlog,
+# confirming it reaches the same conclusions from the saved artifact.
+TQ="$(dirname "$0")/tone_quality.py"
+analyzer_check() {                  # analyzer_check <file> <regex> <label>
+    # Capture first: piping into `grep -q` lets grep close the pipe on match,
+    # which (with pipefail) surfaces python's SIGPIPE as a spurious failure.
+    local out; out="$(python3 "$TQ" "$1" 2>/dev/null)"
+    if grep -Eq "$2" <<<"$out"; then
+        echo "ok   analyzer: $3"
+    else
+        echo "FAIL analyzer: $3"; rc=1
+    fi
+}
+if [[ -f "$TQ" ]]; then
+    analyzer_check "$work/clean.iq"  "CLEAN: no slips"            "clean iqlog -> CLEAN"
+    analyzer_check "$work/drop.iq"   "1 grid SLIP"                "drop iqlog -> 1 slip"
+    analyzer_check "$work/garble.iq" "1 garble"                   "garble iqlog -> 1 garble"
+    analyzer_check "$work/drop.csv"  "step > 40 deg"              "drop statslog -> slip candidate"
+fi
+
 if [[ $rc -eq 0 ]]; then echo "ALL OK"; else echo "FAILED"; fi
 exit $rc

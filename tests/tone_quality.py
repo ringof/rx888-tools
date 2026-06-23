@@ -34,11 +34,14 @@
 #
 # Requires numpy.
 
-import sys, argparse, math
+import sys, argparse, math, struct
 try:
     import numpy as np
 except ImportError:
     sys.exit("tone_quality.py needs numpy (pip install numpy)")
+
+IQLOG_MAGIC = b'RX888IQ'
+IQLOG_HDRLEN = 48
 
 
 def period_samples(fs, ftone):
@@ -121,15 +124,216 @@ def ddc_phase(x, fs, ftone, decim=64):
     return np.degrees(a) * (fs/decim) / 360.0, np.degrees(resid)  # (resid Hz, deg)
 
 
+# ------------------------- tone_monitor artifacts ------------------------- #
+# tone_monitor (src/tone_monitor.c) demodulates the coherent tone inline and
+# writes raw telemetry: a decimated complex baseband (--iqlog) and a per-second
+# CSV (--statslog). This is the OFFLINE side: it reads those artifacts, runs the
+# phase-locked tracking demodulator, and separates real slips/garbles from
+# benign GPSDO/PLL/thermal wander (which a tracking loop follows and removes).
+
+def is_iqlog(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read(len(IQLOG_MAGIC)) == IQLOG_MAGIC
+    except OSError:
+        return False
+
+
+def read_iqlog(path):
+    """Return (meta, z) where z is the complex baseband (phasor in LSB)."""
+    with open(path, 'rb') as f:
+        hdr = f.read(IQLOG_HDRLEN)
+        if hdr[:len(IQLOG_MAGIC)] != IQLOG_MAGIC:
+            sys.exit(f"tone_quality.py: {path} is not an iqlog (bad magic)")
+        ver, decim, N, cyc = struct.unpack('<4I', hdr[8:24])
+        fs, ftone, t0 = struct.unpack('<3d', hdr[24:48])
+        iq = np.fromfile(f, dtype='<f4')
+    if iq.size < 4:
+        sys.exit(f"tone_quality.py: {path} has too few baseband records")
+    z = iq[0::2].astype(np.float64) + 1j * iq[1::2].astype(np.float64)
+    meta = dict(version=ver, decim=decim, N=N, cyc=cyc, fs=fs, ftone=ftone,
+                t0=t0, bb_rate=fs / decim, deg_per_slip=360.0 * cyc / N)
+    return meta, z
+
+
+def analyze_baseband(meta, z, markers=None):
+    """Phase-locked tracking demod on the decimated baseband. A grid slip is a
+    persistent phase STEP (~deg_per_slip per slipped sample) the loop cannot
+    follow; a garble is an amplitude/phase transient; benign wander is the slow,
+    smooth part the loop tracks out. Reports raw measurements AND a slip/garble
+    classification (the verdict lives here, offline, never in the inline tool)."""
+    bb_rate = meta['bb_rate']
+    dps = meta['deg_per_slip']
+    amp = np.abs(z)
+    uph = np.degrees(np.unwrap(np.angle(z)))     # unwrapped phase, deg
+    d = np.diff(uph)                             # per-record phase advance
+
+    # Tracker: the benign residual frequency is the robust (median) phase slope;
+    # subtract it so what remains is discontinuities (slips) + jitter.
+    base = float(np.median(d)) if len(d) else 0.0
+    resid = d - base
+    resid_freq_hz = base / 360.0 * bb_rate       # residual carrier offset
+    slip_thr = max(dps * 0.5, 20.0)              # half a slip, floored at 20 deg
+    slip_at = np.where(np.abs(resid) > slip_thr)[0]
+    clean_mask = np.abs(resid) <= slip_thr
+    jitter = float(resid[clean_mask].std()) if clean_mask.any() else 0.0
+
+    # Amplitude: robust baseline + MAD, with an ABSOLUTE floor so a noise-free
+    # (synthetic) tone whose MAD ~ 0 doesn't turn float-rounding wiggles into
+    # "garbles"; a real garble is a sizable amplitude hit. (Slow level drift is
+    # better removed with a rolling baseline — a future refinement.)
+    amed = float(np.median(amp))
+    mad = float(np.median(np.abs(amp - amed)))
+    amp_thr = max(6.0 * 1.4826 * mad, 0.01 * amed, 4.0)
+    amp_at = np.where(np.abs(amp - amed) > amp_thr)[0]
+
+    # Near-DC SNR of the coherent component (narrowband — the iqlog only spans
+    # +/- bb_rate/2 around the carrier, so this is close-in SNR, not Nyquist
+    # SINAD; full SINAD needs a raw-capture window). A slip splits the phasor
+    # into two regimes, so it is only meaningful with no slips.
+    dc = np.mean(z)
+    noi = float(np.mean(np.abs(z - dc) ** 2))
+    snr_nb = 10 * np.log10(float(np.abs(dc) ** 2) / noi) if noi > 0 else float('inf')
+
+    print(f"  baseband: {len(z)} records @ {bb_rate/1e3:.3f} kHz "
+          f"({len(z)/bb_rate:.3f} s)  decim={meta['decim']}  "
+          f"fs={meta['fs']/1e6:g} MHz  ftone={meta['ftone']/1e6:g} MHz")
+    print(f"  tone:     period N={meta['N']} ({meta['cyc']} cyc), "
+          f"{dps:.4f} deg per slipped sample")
+
+    print(f"\n  [1] amplitude (tracked)")
+    print(f"      median {amed:.1f} LSB  min {amp.min():.1f}  max {amp.max():.1f}  "
+          f"std {amp.std():.2f}  ({len(amp_at)} record(s) beyond +/-{amp_thr:.1f})")
+
+    snr_txt = "n/a (slips present)" if len(slip_at) else f"{snr_nb:.1f} dB"
+    print(f"\n  [2] phase tracking (slip discriminator)")
+    print(f"      residual carrier {resid_freq_hz:+.4f} Hz  "
+          f"(benign GPSDO/PLL wander, tracked out)")
+    print(f"      phase jitter {jitter:.3f} deg RMS (slips removed)  "
+          f"near-DC SNR {snr_txt}")
+    if len(slip_at) == 0:
+        print(f"      >>> NO grid slips (no phase step > {slip_thr:.0f} deg). "
+              f"Coherence intact.")
+    else:
+        tot = float(np.sum(np.round(resid[slip_at] / dps)))
+        print(f"      >>> {len(slip_at)} grid SLIP(s), net {tot:+.0f} sample(s):")
+        for i in slip_at[:20]:
+            smp = int((i + 1) * meta['decim'])
+            print(f"        record {i:>8} (~sample {smp:>12})  "
+                  f"{resid[i]:+.1f} deg = {resid[i]/dps:+.2f} slipped sample(s)")
+
+    print(f"\n  [3] disturbance classification")
+    # An amplitude event with NO coincident slip is a garble; a slip with an
+    # amplitude event is a slip+garble; a clean phase step is a pure slip.
+    def near(idx, pool, tol=2):
+        return pool.size and np.min(np.abs(pool - idx)) <= tol
+    garbles = [i for i in amp_at if not near(i, slip_at)]
+    if len(slip_at) == 0 and len(garbles) == 0:
+        print("      >>> CLEAN: no slips, no amplitude garbles.")
+    else:
+        if len(slip_at):
+            print(f"      {len(slip_at)} slip(s) (persistent phase step).")
+        if len(garbles):
+            print(f"      {len(garbles)} garble(s) (amplitude transient, no phase "
+                  f"step) at record(s): "
+                  + ", ".join(str(int(i)) for i in garbles[:20]))
+
+    if markers is not None:
+        events = np.unique(np.concatenate([slip_at, amp_at])) if (len(slip_at) or len(amp_at)) else np.array([], dtype=int)
+        ev_samp = (events + 1) * meta['decim']
+        tol = meta['decim']
+        if len(ev_samp):
+            n = sum(np.min(np.abs(markers - s)) < tol for s in ev_samp)
+            print(f"\n  marker correlation: {n}/{len(ev_samp)} events within "
+                  f"{tol} samples of a marker splice (of {len(markers)} markers)")
+        else:
+            print(f"\n  marker correlation: no events to correlate "
+                  f"({len(markers)} markers)")
+    return 0
+
+
+def is_statslog(path):
+    try:
+        with open(path, 'r', errors='ignore') as f:
+            for _ in range(4):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("time,sec,blocks"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def analyze_statslog(path):
+    """Summarize tone_monitor's per-second CSV: amplitude over time, residual
+    frequency, and the worst per-second phase step (the inline slip evidence)."""
+    rows, hdr = [], None
+    with open(path, 'r', errors='ignore') as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            if hdr is None and line.startswith("time,sec,blocks"):
+                hdr = line.split(","); continue
+            if hdr:
+                rows.append(line.split(","))
+    if not hdr or not rows:
+        sys.exit(f"tone_quality.py: {path} has no statslog rows")
+    col = {name: i for i, name in enumerate(hdr)}
+    def fcol(r, name):
+        try: return float(r[col[name]])
+        except (KeyError, IndexError, ValueError): return float('nan')
+    amp = np.array([fcol(r, "amp_mean") for r in rows])
+    amin = np.array([fcol(r, "amp_min") for r in rows])
+    rf = np.array([fcol(r, "resid_freq_hz") for r in rows])
+    step = np.array([fcol(r, "max_step_deg") for r in rows])
+    secs = len(rows)
+
+    print(f"  statslog: {secs} per-second rows")
+    print(f"  amplitude: mean {np.nanmean(amp):.1f} LSB  "
+          f"min-of-min {np.nanmin(amin):.1f}  spread {np.nanstd(amp):.2f}")
+    print(f"  residual freq: median {np.nanmedian(rf):+.4f} Hz  "
+          f"max |{np.nanmax(np.abs(rf)):.4f}| Hz")
+    worst = int(np.nanargmax(step))
+    print(f"  worst per-second phase step: {step[worst]:.2f} deg "
+          f"(row {worst}, sec {rows[worst][col['sec']]}, "
+          f"sample {rows[worst][col['worst_step_sample']]})")
+    # Rows whose worst step looks like a grid slip (~75 deg at the rig). This is
+    # a coarse flag; the iqlog gives the authoritative per-record view.
+    suspect = np.where(step > 40.0)[0]
+    if len(suspect) == 0:
+        print(f"  >>> no second with a phase step > 40 deg — no slip candidates.")
+    else:
+        print(f"  >>> {len(suspect)} second(s) with a step > 40 deg (slip "
+              f"candidates — analyze the iqlog for those windows):")
+        for i in suspect[:20]:
+            print(f"        sec {rows[i][col['sec']]:>6}  step {step[i]:.1f} deg  "
+                  f"sample {rows[i][col['worst_step_sample']]}")
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description="coherent-tone corruption + quality check")
-    ap.add_argument("capture")
+    ap.add_argument("capture", help="raw int16 capture, OR a tone_monitor "
+                    ".iq baseband / --statslog CSV (auto-detected)")
     ap.add_argument("--fs", type=float, default=129.6e6)
     ap.add_argument("--ftone", type=float, default=27e6)
     ap.add_argument("--markers")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--block", type=int, default=0)
     a = ap.parse_args(argv[1:])
+
+    # Dispatch on input type: tone_monitor iqlog / statslog / raw capture.
+    if is_iqlog(a.capture):
+        meta, z = read_iqlog(a.capture)
+        print(f"===== {a.capture} (tone_monitor iqlog) =====")
+        markers = np.loadtxt(a.markers, dtype=np.int64, ndmin=1) if a.markers else None
+        return analyze_baseband(meta, z, markers)
+    if is_statslog(a.capture):
+        print(f"===== {a.capture} (tone_monitor statslog) =====")
+        return analyze_statslog(a.capture)
 
     N, cyc = period_samples(a.fs, a.ftone)
     block = a.block or (N * 256)
