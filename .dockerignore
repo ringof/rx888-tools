@@ -1,0 +1,17 @@
+# Keep the build context small. The image builds from source via `make`.
+.git
+*.o
+*.a
+*.so
+librx888.pc
+rx888_stream
+rx888_dsp
+iqrecord
+fx3_cmd
+pps_integrity
+stream_soak
+tone_monitor
+tests/librx888_api
+firmware/*.img
+out/
+data/
