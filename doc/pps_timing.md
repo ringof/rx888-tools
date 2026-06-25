@@ -5,6 +5,12 @@ Status: PLAN (no rig yet). The timing half of the campaign — corruption first
 PASS:** the 27 MHz tone is only a trustworthy timing ruler once coherence is
 confirmed intact (no slips, residual carrier ≈ 0).
 
+This doc is the relative / OS-level proof (Tier 1 µs, Tier 2 sub-sample). The
+*absolute* tier (Tier 0: an independent GNSS reference to separate GPSDO drift
+from everything else, for distributed citizen-science arrays) is forward work,
+kept in `doc/timing_next_steps.md` — and gated on the Tier 1 µs proof landing
+first.
+
 ## The question
 
 The in-band PPS marker gives the *extracted* PPS: a sample index `S_k` where the
