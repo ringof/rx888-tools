@@ -30,9 +30,18 @@ Place this on a proper host with a hardware-timestamping NIC, **not the Pi**
 (the Pi's NIC is software-timestamping only, ~µs, useless for ns work).
 
 Rig:
-- **u-blox ZED-F9T** — timing-grade GNSS (~5 ns RMS time pulse with the
-  quantization-error/sawtooth correction it reports; multi-band; emits raw
-  observables for common-view).
+- **Timing-grade GNSS** — want dual-band (iono/multipath + good common-view) +
+  a clean PPS + raw observables, with quantization-error/sawtooth correction:
+  - **u-blox NEO-F10T** (F10 gen, compact, dual-band; successor to NEO-M8T) —
+    often the easiest to source; ArduSimple "simpleGNSS Timing" board.
+  - **u-blox ZED-F9T** (multi-band L1/L2/E5b, ~5 ns) — SparkFun "GNSS Timing
+    Breakout" has SMA timing ports (clean PPS straight into the NIC SDP),
+    also gnss.store / Mouser / timebeat.app.
+  - Fallbacks: NEO-M8T (single-band, very available, weaker common-view) or
+    ZED-F9P in time mode (positioning part, slightly worse TP). NOTE: there is
+    no "NEO-F9T" — the NEO-form F-series timing part is the NEO-F10T.
+  - Reference: N8UR / HamSCI "Timing and Location Performance of Recent u-blox
+    GNSS Receiver Modules" — on-target for the citizen-science audience.
 - **HW-timestamping NIC with an accessible SDP/PPS pin** (Intel i210 or i226 —
   see the caveat below). Feed the F9T PPS into an SDP pin and timestamp it
   against the NIC PHC in hardware, escaping the software-IRQ floor.
