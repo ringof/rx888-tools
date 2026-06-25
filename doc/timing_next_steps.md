@@ -48,7 +48,13 @@ sub-sample) in `doc/pps_timing.md`.
 Both the Intel **i210** (1 GbE, `igb` driver) and **i226** (2.5 GbE, `igc`)
 fully support, in silicon + driver, hardware timestamping of an external PPS on
 their SDP pins (`PTP_PF_EXTTS`), captured via `testptp`/`ts2phc`. The i210 is the
-more trodden path in the time-nuts community for exactly this.
+more trodden path in the time-nuts community for exactly this; the i226's `igc`
+PTP/extts support matured later, so use a recent kernel (6.x) and confirm extts
+actually arms (`testptp -d /dev/ptpN`) before relying on it. Also check the i226
+SDP I/O voltage against the F9T's 3.3 V TIMEPULSE — level-translate if it isn't
+3.3 V-tolerant (a non-issue on the i210). For this one job — HW-timestamping an
+external PPS — the i210 is the lower-risk pick even at 1 GbE; the i226 buys
+2.5 GbE for the data network at the cost of the newer `igc` path.
 
 **The catch is physical access to an SDP pin.** Retail single-port cards —
 including the Intel **I210-T1** and **I226-T1** — generally do NOT break the SDP
