@@ -11,6 +11,7 @@ fx3_cmd
 pps_integrity
 stream_soak
 tone_monitor
+tone_gen
 tests/librx888_api
 firmware/*.img
 out/

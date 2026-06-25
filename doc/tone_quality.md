@@ -141,6 +141,25 @@ clean → CLEAN, drop → 1 grid slip (+1 sample, localized), garble → 1 garbl
 only untested path is the device driver, which mirrors the known-good
 `stream_soak`.
 
+### `tone_gen` — synthetic stream driver (the "dummy driver")
+
+`src/tone_gen.c` emits a coherent tone as raw int16 to stdout, with
+deterministic defect injection, so the full streaming path can be exercised with
+no hardware:
+
+```
+tone_gen [seconds] --drop-every N --dup-every N --garble-every N --garble-len L \
+         --freq-offset PPM --noise LSB --samples N   |  tone_monitor --source -
+```
+
+It drives `tone_monitor`'s Goertzel stream processor and the iqlog ring over an
+arbitrarily long stream (`seconds 0` = endless), and `tests/tone_gen_soak.sh`
+(in `make check`) asserts the analyzer's response: a clean pipe → no slips,
+`--drop-every 600000` over 2.4 M samples → exactly 3 grid slips,
+`--garble-every` → amplitude garbles with no false slips, and `--freq-offset 5`
+→ a residual carrier of ~135 Hz (5 ppm × 27 MHz) — confirming the tracker reads
+a detune as benign carrier offset, not corruption.
+
 ## Running on the rig
 
 1. Bare-stream tone baseline (confirm CLEAN):

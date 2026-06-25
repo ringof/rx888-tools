@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity stream_soak tone_monitor
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity stream_soak tone_monitor tone_gen
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -128,6 +128,11 @@ tone_monitor: $(SRCDIR)/tone_monitor.c $(LIBRX_A) $(LIBRX_HDR)
 	    $(SRCDIR)/tone_monitor.c \
 	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -lm -o $@
 
+# tone_gen: synthetic coherent-tone source (no device, no libusb) for driving
+# tone_monitor --source in tests/soaks. Just needs -lm.
+tone_gen: $(SRCDIR)/tone_gen.c
+	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/tone_gen.c -lm -o $@
+
 rx888_dsp: $(SRCDIR)/rx888_dsp.c
 	$(CC) $(CFLAGS_DSP) -I$(INCDIR) $< -o $@ -lm -lpthread
 
@@ -159,7 +164,7 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak tone_monitor
+check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak tone_monitor tone_gen
 	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
 	if [ "$$present" = "1" ]; then \
 	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
@@ -172,7 +177,8 @@ check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak tone_monitor
 	$(TESTS_DIR)/pps_integrity_smoke.sh ./pps_integrity; \
 	$(TESTS_DIR)/stream_soak_smoke.sh ./stream_soak; \
 	$(TESTS_DIR)/tone_monitor_smoke.sh ./tone_monitor; \
-	$(TESTS_DIR)/tone_monitor_replay.sh ./tone_monitor
+	$(TESTS_DIR)/tone_monitor_replay.sh ./tone_monitor; \
+	$(TESTS_DIR)/tone_gen_soak.sh ./tone_gen ./tone_monitor
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.
