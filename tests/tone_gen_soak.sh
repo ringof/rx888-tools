@@ -44,6 +44,14 @@ out="$(drive garble --garble-every 800000 --garble-len 50)"
 check "$(has "$out" '2 garble')"                "garble-every 800k -> 2 amplitude garbles"
 check "$(has "$out" 'NO grid slips')"           "garble -> no false slips"
 
+# A square reference (GPSDO output) must still work: the Goertzel nulls all
+# harmonics except the few aliasing onto the bin (a small constant bias), so
+# slip detection is unaffected.
+out="$(drive sqdrop --square --drop-every 600000)"
+check "$(has "$out" '3 grid SLIP')"             "square wave + drop-every 600k -> still 3 grid slips"
+check "$([[ "$(has "$out" 'garble')" == 0 ]] && echo 1 || echo 0)" \
+                                                "square -> no false garbles"
+
 # +5 ppm detune -> residual carrier ~ 5e-6 * 27e6 = 135 Hz.
 out="$(drive foff --freq-offset 5)"
 rf="$(grep -Eo 'residual carrier [+-]?[0-9.]+' <<<"$out" | grep -Eo '[+-]?[0-9.]+$' || echo 0)"

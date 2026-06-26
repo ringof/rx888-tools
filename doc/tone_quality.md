@@ -30,6 +30,33 @@ test pattern the LTC2208 does not provide on its own. A single Goertzel bin at
 5/24 demodulates it to a slowly-varying complex phasor; corruption shows up as a
 discontinuity in that phasor.
 
+## Square-wave reference is fine
+
+A GPSDO reference output is typically a **square wave**, not a sine. That is OK:
+the single-bin Goertzel sees only the 27 MHz bin, and because the block length
+is a multiple of the period it **nulls every harmonic except the few that alias
+exactly back onto the bin** (in the 5/24 grid, harmonics ≡ 23 or 25 mod 24 — the
+23rd, 25th, 47th, 49th…, each ~1/n). Those add a small, *constant*, coherent
+bias to the bin's amplitude and phase; they do not add time-varying structure,
+so slip/garble detection is unaffected. Measured through the real path
+(`tone_gen --square | tone_monitor --source -`): a ±10000 square reads ~12665
+LSB in the bin (vs the 4/π·10000 = 12732 pure-fundamental, the ~0.5% deficit
+being the aliased harmonics), stays constant to ~44 dB, and a slip still reads a
+clean +75° step (±~0.2°, the small wobble from the 23rd harmonic counter-
+rotating). `tests/tone_gen_soak.sh` asserts this.
+
+Practical notes:
+- **Attenuate by the square's peak-to-peak** (more total power than a sine) so
+  the ADC doesn't clip.
+- An optional **~35–50 MHz low-pass/band-pass** before the FX3 strips the 3rd-
+  and-up harmonics → an effective sine, removing even the ~0.5% bin bias and the
+  broadband folded-harmonic energy. Not required (the Goertzel tolerates the
+  square); natural to fold into the FX3-protection conditioning if you want a
+  clean spectrum.
+- The **raw-capture FFT path** will show out-of-bin harmonic spurs (5.4, 16.2,
+  37.8, 48.6, 59.4 MHz …) with a square — expected, not corruption. The
+  single-bin Goertzel (iqlog path) is immune.
+
 ## What corruption looks like
 
 | event | phase | amplitude |

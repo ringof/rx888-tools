@@ -19,6 +19,9 @@
  *   --freq-offset PPM detune the tone (the analyzer should report this as the
  *                     residual carrier — tests the "benign wander" tracking)
  *   --noise LSB       add uniform +/-LSB noise (sets a floor / SNR)
+ *   --square          emit a +/-amp SQUARE wave instead of a sine (models a
+ *                     GPSDO square reference: fundamental + odd harmonics, the
+ *                     ones aliasing onto the bin bias it by a small constant)
  *
  * Length: positional SECONDS (default 1; 0 = endless until the reader closes),
  * or --samples N for an exact count.
@@ -75,6 +78,7 @@ static void usage(const char *a0)
         "  --garble-len L  Garble run length (default 50)\n"
         "  --freq-offset PPM  Detune the tone (-> residual carrier)\n"
         "  --noise LSB     Add uniform +/-LSB noise\n"
+        "  --square        Emit a +/-amp square wave (models a GPSDO square ref)\n"
         "\n"
         "Raw int16 LE REAL samples to stdout. Pipe into tone_monitor --source -.\n",
         a0);
@@ -86,14 +90,16 @@ int main(int argc, char **argv)
     double freq_ppm = 0.0, noise = 0.0;
     uint64_t samples = 0, drop_every = 0, dup_every = 0, garble_every = 0;
     unsigned garble_len = 50;
+    int square = 0;
 
-    enum { O_RATE=256,O_FTONE,O_AMP,O_SAMP,O_DROP,O_DUP,O_GARB,O_GLEN,O_FOFF,O_NOISE };
+    enum { O_RATE=256,O_FTONE,O_AMP,O_SAMP,O_DROP,O_DUP,O_GARB,O_GLEN,O_FOFF,O_NOISE,O_SQ };
     static struct option opts[] = {
         {"rate",required_argument,0,O_RATE},{"ftone",required_argument,0,O_FTONE},
         {"amp",required_argument,0,O_AMP},{"samples",required_argument,0,O_SAMP},
         {"drop-every",required_argument,0,O_DROP},{"dup-every",required_argument,0,O_DUP},
         {"garble-every",required_argument,0,O_GARB},{"garble-len",required_argument,0,O_GLEN},
         {"freq-offset",required_argument,0,O_FOFF},{"noise",required_argument,0,O_NOISE},
+        {"square",no_argument,0,O_SQ},
         {"help",no_argument,0,'h'},{0,0,0,0}
     };
     int c;
@@ -109,6 +115,7 @@ int main(int argc, char **argv)
         case O_GLEN:  garble_len = (unsigned)strtoul(optarg, NULL, 10); break;
         case O_FOFF:  freq_ppm = strtod(optarg, NULL); break;
         case O_NOISE: noise = strtod(optarg, NULL); break;
+        case O_SQ:    square = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -154,7 +161,8 @@ int main(int argc, char **argv)
             if (garble_every && emitted && emitted % garble_every == 0)
                 garble_left = garble_len;
 
-            double s = amp * cos(w * (double)n);
+            double co = cos(w * (double)n);
+            double s = square ? (co >= 0.0 ? amp : -amp) : amp * co;
             if (noise > 0.0)
                 s += ((double)(xorshift(&rng) & 0xffff) / 65535.0 * 2.0 - 1.0) * noise;
             if (garble_left) {    /* overwrite with noise -> amplitude transient */
