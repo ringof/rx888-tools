@@ -62,17 +62,40 @@ decim 2400). See `doc/pps_timing.md` for the two-tier timing method.
 
 ### 3b. Capture with the RX888 (USB passthrough)
 
+The FX3 **re-enumerates** when firmware is uploaded (boot PID `04b4:00f3` →
+app `04b4:00f1`), so a fixed `--device=/dev/bus/usb/BBB/DDD` mapping breaks.
+Bind-mount the whole USB tree and allow the USB major (189) so the new node is
+visible inside the container:
+
 ```sh
-# bare-stream tone baseline — confirm CLEAN before trusting the tone as a ruler
-docker run --rm --device=/dev/bus/usb -v "$PWD/data:/data" rx888-ppskit \
-    ./tone_monitor 1 --statslog /data/base.csv --iqlog /data/base.iq
-docker run --rm -v "$PWD/data:/data" rx888-ppskit \
-    python3 tests/tone_quality.py /data/base.iq
+# short test first (~7 s): confirms USB passthrough + firmware + SSD write
+docker run --rm \
+    -v /dev/bus/usb:/dev/bus/usb --device-cgroup-rule='c 189:* rmw' \
+    -v /mnt/ssd/rx888:/data \
+    rx888-ppskit \
+    ./tone_monitor 0.002 -f firmware/SDDC_FX3.img \
+        --iqlog /data/test.iq --statslog /data/test.csv
+
+# real run: 0 hours = until you docker stop / SIGINT
+docker run --rm \
+    -v /dev/bus/usb:/dev/bus/usb --device-cgroup-rule='c 189:* rmw' \
+    -v /mnt/ssd/rx888:/data \
+    rx888-ppskit \
+    ./tone_monitor 0 -f firmware/SDDC_FX3.img \
+        --iqlog /data/run.iq --statslog /data/run.csv
 ```
 
-`--device=/dev/bus/usb` passes the RX888 through; add a udev/cgroup rule (or
-`--privileged` for a quick POC) if your daemon restricts device access. USB bulk
-runs at full rate in the container — the kernel does the DMA.
+Notes:
+- The firmware blob is baked into the image (`make firmware` at build), so
+  `-f firmware/SDDC_FX3.img` resolves inside the container. If the device is
+  already in app mode (`04b4:00f1`, EEPROM-flashed), `-f` is harmless.
+- `--device-cgroup-rule='c 189:* rmw'` grants the USB char-device major; use
+  `--privileged` instead for a quick POC if the rule is fussy.
+- `/mnt/ssd/rx888` is the host SSD mount (make it writable: `chown` it to you);
+  `/data` is where the tools write. USB bulk runs at full rate in the container
+  — the kernel does the DMA.
+- Analyze from the same image: `docker run --rm -v /mnt/ssd/rx888:/data
+  rx888-ppskit python3 tests/tone_quality.py /data/test.iq`.
 
 ## What is NOT in the container, and why
 

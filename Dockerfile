@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libusb-1.0-0-dev libusb-1.0-0 \
         python3 python3-numpy \
         gnuplot-nox \
-        ca-certificates \
+        ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/rx888-tools
@@ -34,6 +34,12 @@ COPY . .
 # default -march=native would bake in the builder's microarch); rx888_dsp is not
 # built — its AVX2 path is x86-only and not part of this kit.
 RUN make NATIVE_MARCH= check
+
+# Fetch the pinned FX3 firmware blob into the image (checksum-verified) so live
+# capture from the container is self-contained: tools find it at
+# firmware/SDDC_FX3.img (relative to this WORKDIR). The no-hardware proof does
+# not need it; live capture with a boot-mode device does.
+RUN make firmware
 
 ENV LD_LIBRARY_PATH=/opt/rx888-tools
 COPY docker/reproduce.sh /usr/local/bin/reproduce
