@@ -47,7 +47,75 @@ independent synthetic cases.
 
 ## 3. Live capture on the Pi
 
-### 3a. Host timebase (once, for the timing test)
+### 3a. Host prerequisites (power, USB permissions, SSD, usbfs)
+
+These are the host-side gotchas that bite first. Do them once per Pi.
+
+**Power — do this first; the RX888 is hungry.** The RX888 mk2 draws ~0.7–1 A,
+and the **Pi 5 caps total USB current at 600 mA unless it detects a 5 A PSU**.
+Exceed it and over-current protection cuts the port: the FX3 browns out *mid
+firmware-boot*, the half-loaded image never runs, and it reverts to DFU
+(`04b4:00f3`) — looking exactly like a firmware or driver failure when it's
+really power.
+
+- **Best fix: power the RX888 from a self-powered USB 3.0 hub** (its current
+  then comes from the hub, not the Pi). Use a USB 3.0 port + cable — USB 2.0
+  also can't carry the ~259 MB/s stream. Keep the GPSDO off the RX888's supply.
+- If running straight off the Pi: use the official **27 W (5 A) PSU** and add
+  `usb_max_current_enable=1` to `/boot/firmware/config.txt`, then reboot.
+- Diagnose: `dmesg | grep -i over-current` (any hits = power), and
+  `vcgencmd get_throttled` (`0x0` = OK; nonzero = under-voltage/over-current).
+
+**USB permissions (udev)** — so the device is accessible without sudo and from
+the container:
+
+```sh
+sudo cp udev/99-rx888.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug/replug the RX888 so the rule applies to a fresh enumeration
+ls -l /dev/bus/usb/*/*           # the FX3 node should be 0666 / group plugdev
+```
+
+The rule sets `MODE:="0666"` for the FX3 boot (`00f3`) and app (`00f1`) PIDs
+(and a few PMODE variants).
+
+**SSD for captures** — keep captures off the SD card (raw is ~930 GB/hr;
+decimated `--iqlog` is ~1.5 GB/hr):
+
+```sh
+lsblk -f                                         # find the SSD (nvme0n1p1 / sda1)
+sudo mkdir -p /mnt/ssd && sudo mount /dev/nvme0n1p1 /mnt/ssd
+sudo mkdir -p /mnt/ssd/rx888 && sudo chown "$USER":"$USER" /mnt/ssd/rx888
+df -h /mnt/ssd                                   # confirm space
+```
+
+To make the mount permanent, add an `/etc/fstab` line by UUID (from `lsblk -f`):
+```
+UUID=<your-uuid>  /mnt/ssd  ext4  defaults,nofail  0  2
+```
+
+**usbfs buffer size** — high-rate streaming keeps `queue_depth × reqsize` of
+transfers in flight (default 32 × 1 MB = 32 MB), which exceeds usbfs's default
+16 MB limit → `ENOMEM`/`NO_DEVICE`-style failures under load. Raise it. Note
+`usbcore` is **built into the Pi kernel, not a module**, so
+`/etc/modprobe.d/options usbcore …` is silently ignored — set it on the **kernel
+command line**:
+
+```sh
+cat /sys/module/usbcore/parameters/usbfs_memory_mb     # current value
+sudo cp /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.bak
+# append to the END of the single line (replace 1000 with your tested value):
+sudo sed -i 's/$/ usbcore.usbfs_memory_mb=1000/' /boot/firmware/cmdline.txt
+cat /boot/firmware/cmdline.txt && wc -l /boot/firmware/cmdline.txt   # MUST stay one line
+sudo reboot
+# after reboot, verify it took:
+cat /sys/module/usbcore/parameters/usbfs_memory_mb
+```
+
+`cmdline.txt` must remain a single line — a stray newline breaks boot (restore
+the `.bak` if so).
+
+### 3b. Host timebase (once, for the timing test)
 
 ```sh
 sudo ./scripts/host-timebase-setup.sh            # dry run: prints intended changes
@@ -60,7 +128,7 @@ chronyc sources -v && chronyc tracking           # verify GPSDO lock
 Captures go to the NVMe, not the SD card (`--iqlog` is ~1.5 GB/hr at the default
 decim 2400). See `doc/pps_timing.md` for the two-tier timing method.
 
-### 3b. Capture with the RX888 (USB passthrough)
+### 3c. Capture with the RX888 (USB passthrough)
 
 The FX3 **re-enumerates** when firmware is uploaded (boot PID `04b4:00f3` →
 app `04b4:00f1`), so a fixed `--device=/dev/bus/usb/BBB/DDD` mapping breaks.
@@ -86,9 +154,13 @@ docker run --rm \
 ```
 
 Notes:
-- The firmware blob is baked into the image (`make firmware` at build), so
-  `-f firmware/SDDC_FX3.img` resolves inside the container. If the device is
-  already in app mode (`04b4:00f1`, EEPROM-flashed), `-f` is harmless.
+- The pinned-release firmware is baked into the image (`make firmware` at
+  build), so `-f firmware/SDDC_FX3.img` resolves inside the container. If the
+  device is already in app mode (`04b4:00f1`, EEPROM-flashed), `-f` is harmless.
+- **To use your own firmware build**, mount it over the baked one:
+  `-v "$PWD/firmware/SDDC_FX3.img:/opt/rx888-tools/firmware/SDDC_FX3.img:ro"`.
+- If firmware upload fails with `NO_DEVICE` and the device stays `00f3`, it's
+  almost always **power** (over-current), not Docker — see 3a. Fix power first.
 - `--device-cgroup-rule='c 189:* rmw'` grants the USB char-device major; use
   `--privileged` instead for a quick POC if the rule is fussy.
 - `/mnt/ssd/rx888` is the host SSD mount (make it writable: `chown` it to you);
