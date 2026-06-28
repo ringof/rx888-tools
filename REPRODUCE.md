@@ -115,6 +115,32 @@ cat /sys/module/usbcore/parameters/usbfs_memory_mb
 `cmdline.txt` must remain a single line — a stray newline breaks boot (restore
 the `.bak` if so).
 
+**GPSDO config + preflight (LBE-142x).** Configure the GPSDO once with the
+`lbe-142x` tool ([ringof](https://github.com/ringof/lbe-142x) /
+[bvernoux](https://github.com/bvernoux/lbe-142x)):
+
+```sh
+lbe-142x --f2 27000000     # OUT2 = 27 MHz coherent tone (saved to flash)
+lbe-142x --pps 1           # OUT1 = 1PPS (for pps-gpio)
+lbe-142x --nmea 1          # NMEA on (for chrony's coarse second)
+```
+
+Run **gpsd read-only** so it never reconfigures the GPSDO's internal GNSS — that
+chipset belongs to the disciplining loop, and gpsd's auto-probing both spews
+`$GNTXT` and risks disturbing the discipline. In `/etc/default/gpsd`:
+```
+DEVICES="/dev/ttyACM0"
+GPSD_OPTIONS="-n -b"
+```
+(`-b` = read-only; confirm `gpspipe -r` shows `"readonly":"true"`.)
+
+Then **gate every capture session** with the preflight (PASS/FAIL on GPS+PLL
+lock, antenna OK, OUT1=1PPS, OUT2=27 MHz, NMEA enabled, and a live NMEA fix):
+```sh
+export LBE142X=/path/to/lbe-142x/build/bin/lbe-142x   # or put it on PATH
+./scripts/gpsdo-preflight.sh
+```
+
 ### 3b. Host timebase (once, for the timing test)
 
 ```sh
