@@ -139,21 +139,94 @@ def is_iqlog(path):
         return False
 
 
-def read_iqlog(path):
-    """Return (meta, z) where z is the complex baseband (phasor in LSB)."""
+def _parse_iqlog_header(hdr, path=""):
+    if hdr[:len(IQLOG_MAGIC)] != IQLOG_MAGIC:
+        sys.exit(f"tone_quality.py: {path} is not an iqlog (bad magic)")
+    ver, decim, N, cyc = struct.unpack('<4I', hdr[8:24])
+    fs, ftone, t0 = struct.unpack('<3d', hdr[24:48])
+    return dict(version=ver, decim=decim, N=N, cyc=cyc, fs=fs, ftone=ftone,
+                t0=t0, bb_rate=fs / decim, deg_per_slip=360.0 * cyc / N)
+
+
+def read_iqlog_header(path):
+    """Header only — for streaming (windowed) analysis of large iqlogs."""
     with open(path, 'rb') as f:
-        hdr = f.read(IQLOG_HDRLEN)
-        if hdr[:len(IQLOG_MAGIC)] != IQLOG_MAGIC:
-            sys.exit(f"tone_quality.py: {path} is not an iqlog (bad magic)")
-        ver, decim, N, cyc = struct.unpack('<4I', hdr[8:24])
-        fs, ftone, t0 = struct.unpack('<3d', hdr[24:48])
+        return _parse_iqlog_header(f.read(IQLOG_HDRLEN), path)
+
+
+def read_iqlog(path):
+    """Return (meta, z) where z is the complex baseband (phasor in LSB).
+    Loads the whole file — use the windowed path for multi-GB captures."""
+    with open(path, 'rb') as f:
+        meta = _parse_iqlog_header(f.read(IQLOG_HDRLEN), path)
         iq = np.fromfile(f, dtype='<f4')
     if iq.size < 4:
         sys.exit(f"tone_quality.py: {path} has too few baseband records")
     z = iq[0::2].astype(np.float64) + 1j * iq[1::2].astype(np.float64)
-    meta = dict(version=ver, decim=decim, N=N, cyc=cyc, fs=fs, ftone=ftone,
-                t0=t0, bb_rate=fs / decim, deg_per_slip=360.0 * cyc / N)
     return meta, z
+
+
+def analyze_baseband_windowed(meta, path, window_sec):
+    """Streaming, drift-robust analysis for long / undisciplined captures.
+    Reads the iqlog in fixed windows (constant memory) and removes the carrier
+    LOCALLY per window, so a free-running oscillator's slow drift isn't mis-read
+    as slips. Same slip/amplitude/carrier view as analyze_baseband, but it scales
+    to multi-GB / multi-hour files and won't false-count drift as corruption."""
+    bb = meta['bb_rate']; dps = meta['deg_per_slip']; decim = meta['decim']
+    win = max(int(window_sec * bb), 4096)
+    slip_thr = max(dps * 0.5, 20.0)
+    total = 0; nwin = 0
+    amp_min = np.inf; amp_max = -np.inf; amp_sum = 0.0
+    carriers = []; slips = []; jit_sq = 0.0; jit_n = 0
+    with open(path, 'rb') as f:
+        f.seek(IQLOG_HDRLEN)
+        base = 0
+        while True:
+            raw = np.fromfile(f, dtype='<f4', count=2 * win)
+            if raw.size < 4:
+                break
+            z = raw[0::2].astype(np.float64) + 1j * raw[1::2].astype(np.float64)
+            amp = np.abs(z)
+            amp_min = min(amp_min, float(amp.min()))
+            amp_max = max(amp_max, float(amp.max()))
+            amp_sum += float(amp.sum())
+            uph = np.degrees(np.unwrap(np.angle(z)))
+            d = np.diff(uph)
+            if len(d):
+                local = float(np.median(d))             # local carrier this window
+                carriers.append(local / 360.0 * bb)
+                resid = d - local
+                m = np.abs(resid) > slip_thr
+                for k in np.where(m)[0]:
+                    slips.append((base + int(k) + 1, float(resid[k])))
+                cm = ~m
+                if cm.any():
+                    jit_sq += float(np.sum(resid[cm] ** 2)); jit_n += int(cm.sum())
+            total += len(z); base += len(z); nwin += 1
+    if total == 0:
+        sys.exit("tone_quality.py: empty iqlog")
+    amp_mean = amp_sum / total
+    jitter = (jit_sq / jit_n) ** 0.5 if jit_n else 0.0
+    carr = np.array(carriers) if carriers else np.array([0.0])
+    print(f"  baseband (windowed {window_sec:g}s): {total} records @ "
+          f"{bb/1e3:.3f} kHz ({total/bb:.1f} s)  decim={decim}  {nwin} windows")
+    print(f"  tone:     period N={meta['N']} ({meta['cyc']} cyc), {dps:.4f} deg/slip")
+    print(f"\n  [1] amplitude")
+    print(f"      mean {amp_mean:.1f} LSB  min {amp_min:.1f}  max {amp_max:.1f}")
+    print(f"\n  [2] phase (carrier removed per-window -> drift-robust)")
+    print(f"      residual carrier {carr.min():+.3f} .. {carr.max():+.3f} Hz "
+          f"(drift {carr.max()-carr.min():.3f} Hz over the capture)")
+    print(f"      phase jitter {jitter:.3f} deg RMS (slips removed)")
+    if not slips:
+        print(f"      >>> NO grid slips (no local step > {slip_thr:.0f} deg) across "
+              f"{nwin} windows. Acquisition coherent end to end.")
+    else:
+        net = int(sum(round(s[1] / dps) for s in slips))
+        print(f"      >>> {len(slips)} grid SLIP(s), net {net:+d} sample(s):")
+        for idx, deg in slips[:20]:
+            print(f"        record {idx:>11} (~sample {idx*decim:>14})  "
+                  f"{deg:+.1f} deg = {deg/dps:+.2f} sample(s)")
+    return 0
 
 
 def dump_baseband_series(meta, z, path):
@@ -405,6 +478,9 @@ def main(argv):
                     "spectrum (freq vs dBFS) for gnuplot; works on a raw capture "
                     "(full band) or an iqlog (baseband)")
     ap.add_argument("--powers-nperseg", type=int, default=8192)
+    ap.add_argument("--window", type=float, default=0, help="analyze the iqlog in "
+                    "streaming windows of N seconds (constant memory + drift-robust "
+                    "carrier removal; use for long / undisciplined-oscillator captures)")
     a = ap.parse_args(argv[1:])
 
     # 'powers'-style spectrum: print freq,dBFS columns + top peaks, then stop.
@@ -424,6 +500,10 @@ def main(argv):
 
     # Dispatch on input type: tone_monitor iqlog / statslog / raw capture.
     if is_iqlog(a.capture):
+        if a.window and a.window > 0:
+            meta = read_iqlog_header(a.capture)
+            print(f"===== {a.capture} (tone_monitor iqlog, windowed) =====")
+            return analyze_baseband_windowed(meta, a.capture, a.window)
         meta, z = read_iqlog(a.capture)
         print(f"===== {a.capture} (tone_monitor iqlog) =====")
         if a.plotdata:

@@ -119,9 +119,17 @@ tone_quality.py run.csv                # statslog: per-second summary + candidat
 tone_quality.py capture.s16            # raw int16: period-N + DDC + FFT (SINAD)
 tone_quality.py run.iq --markers pps_marks.txt   # correlate events vs PPS splices
 tone_quality.py run.iq --plotdata run.dat        # dump time series for gnuplot
+tone_quality.py 1h.iq --window 60                # streaming, drift-robust (long captures)
 ```
 
-Input type is auto-detected. On the **iqlog** it runs the phase-locked tracking
+Input type is auto-detected. The default iqlog path loads the whole file and
+estimates the carrier with a single median — fine for short, disciplined
+captures. For **long or undisciplined-oscillator captures** use `--window N`:
+it streams the iqlog in N-second windows (constant memory, so multi-GB/multi-hour
+files don't OOM) and removes the carrier *locally per window*, so a free-running
+oscillator's slow drift isn't mis-counted as slips. The per-second `--statslog`
+`max_step_deg` column is the same evidence computed inline, so it needs no
+re-processing of the iqlog at all. On the **iqlog** it runs the phase-locked tracking
 demodulator: the benign residual carrier is the robust (median) phase slope and
 is tracked out, leaving discontinuities. It reports the residual carrier (Hz),
 phase jitter (deg RMS, slips removed), near-DC SNR, and a **slip/garble
