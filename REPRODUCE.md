@@ -47,6 +47,16 @@ independent synthetic cases.
 
 ## 3. Live capture on the Pi
 
+**Native vs. the container — when to switch.** Host bring-up and debugging
+(firmware load, GPSDO config, mounting the SSD, dialing the attenuator, quick
+sanity grabs) is simplest **native** — fewer layers, fast iteration. Move into
+the **container** for the actual measurement runs and analysis, and for anything
+you share: the image pins the toolchain (tools + numpy + gnuplot) so captures
+and `tone_quality.py` results reproduce bit-for-bit elsewhere. Firmware load
+stays a host step (like the timebase) — load it natively, then the container
+captures the already-running device. Rule of thumb: **native to get first light
+dialed in; container once you're collecting data you intend to keep or publish.**
+
 ### 3a. Host prerequisites (power, USB permissions, SSD, usbfs)
 
 These are the host-side gotchas that bite first. Do them once per Pi.
@@ -93,6 +103,11 @@ To make the mount permanent, add an `/etc/fstab` line by UUID (from `lsblk -f`):
 ```
 UUID=<your-uuid>  /mnt/ssd  ext4  defaults,nofail  0  2
 ```
+
+Gate each session with `./scripts/ssd-preflight.sh` (or
+`CAPTURE_DIR=… MIN_FREE_GB=… ./scripts/ssd-preflight.sh`) — it verifies the dir
+is on the **mounted SSD** (not the SD card), writable, and has room, so a forgot-
+to-mount never silently fills the SD card mid-run.
 
 **usbfs buffer size** — high-rate streaming keeps `queue_depth × reqsize` of
 transfers in flight (default 32 × 1 MB = 32 MB), which exceeds usbfs's default
