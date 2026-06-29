@@ -219,9 +219,13 @@ a detune as benign carrier offset, not corruption.
 
 ## Running on the rig
 
+For the full step-by-step operational procedure — preflight gates, setting the
+front-end level, capture, analysis, and pass criteria — see the runbook,
+**`doc/test_runbook.md`**. In brief:
+
 1. Bare-stream tone baseline (confirm CLEAN):
-   `tone_monitor 1 --statslog base.csv --iqlog base.iq` then
-   `tone_quality.py base.iq`.
+   `tone_monitor 1 --gain 127 --att 0 --statslog base.csv --iqlog base.iq` then
+   `tone_quality.py base.iq --window 60`.
 2. Long soak with the PPS marker running, then correlate corruption events with
    the marker splices via `--markers`.
 
