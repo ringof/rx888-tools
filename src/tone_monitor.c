@@ -605,6 +605,7 @@ static int run_from_device(struct tone_ctx *ctx, double hours,
                            unsigned decim, unsigned long N, unsigned long cyc,
                            double bb_rate, const char *firmware_path,
                            unsigned queuedepth, unsigned reqsize,
+                           int gain, int att, int gain_high,
                            FILE *statslog, const char *iqlog_path, int verbose)
 {
     rx888_config_t cfg;
@@ -613,6 +614,9 @@ static int run_from_device(struct tone_ctx *ctx, double hours,
     cfg.firmware_path = firmware_path;
     if (queuedepth) cfg.queue_depth = queuedepth;
     if (reqsize)    cfg.req_packets = reqsize;
+    if (gain >= 0)      cfg.gain      = (unsigned)gain;   /* AD8370 VGA code */
+    if (att  >= 0)      cfg.att       = (unsigned)att;    /* DAT-31 attenuator */
+    if (gain_high >= 0) cfg.gain_high = gain_high;        /* VGA range low/high */
 
     rx888_t *r = NULL;
     int rc = rx888_open(&r, &cfg);
@@ -772,6 +776,9 @@ static void usage(const char *argv0)
         "                     instead of the device — drives the SAME DSP path,\n"
         "                     for validating with a synthesized waveform\n"
         "  -f, --firmware FILE  Upload FX3 firmware if device is in boot mode\n"
+        "  -g, --gain N         AD8370 VGA gain code 0..127 (library default 0)\n"
+        "  -a, --att N          DAT-31 attenuator 0..63, half-dB steps (default 0)\n"
+        "  --gainmode low|high  AD8370 gain range (library default high)\n"
         "  -q, --queuedepth N   Concurrent in-flight USB transfers (default 32)\n"
         "  -p, --reqsize N      USB transfer size in packets (default 1024)\n"
         "  -v, --verbose        Add residual-freq / max-step to the live line\n"
@@ -797,8 +804,9 @@ int main(int argc, char **argv)
     const char *source_path = NULL;
     int verbose = 0;
     unsigned queuedepth = 0, reqsize = 0;
+    int gain = -1, att = -1, gain_high = -1;   /* -1 = leave library default */
 
-    enum { OPT_FTONE = 256, OPT_DECIM, OPT_IQLOG, OPT_SOURCE };
+    enum { OPT_FTONE = 256, OPT_DECIM, OPT_IQLOG, OPT_SOURCE, OPT_GAINMODE };
     static struct option opts[] = {
         {"rate",       required_argument, 0, 'r'},
         {"ftone",      required_argument, 0, OPT_FTONE},
@@ -806,6 +814,9 @@ int main(int argc, char **argv)
         {"statslog",   required_argument, 0, 'l'},
         {"iqlog",      required_argument, 0, OPT_IQLOG},
         {"source",     required_argument, 0, OPT_SOURCE},
+        {"gain",       required_argument, 0, 'g'},
+        {"att",        required_argument, 0, 'a'},
+        {"gainmode",   required_argument, 0, OPT_GAINMODE},
         {"firmware",   required_argument, 0, 'f'},
         {"queuedepth", required_argument, 0, 'q'},
         {"reqsize",    required_argument, 0, 'p'},
@@ -814,7 +825,7 @@ int main(int argc, char **argv)
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "r:f:q:p:l:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:f:q:p:l:g:a:vh", opts, NULL)) != -1) {
         char *end = NULL;
         switch (c) {
         case 'r':
@@ -841,6 +852,14 @@ int main(int argc, char **argv)
         case 'l': statslog_path = optarg; break;
         case OPT_IQLOG: iqlog_path = optarg; break;
         case OPT_SOURCE: source_path = optarg; break;
+        case 'g': gain = (int)(strtoul(optarg, NULL, 10) & 0x7fu); break;
+        case 'a': att  = (int)(strtoul(optarg, NULL, 10) & 0x3fu); break;
+        case OPT_GAINMODE:
+            if      (!strcmp(optarg, "low"))  gain_high = 0;
+            else if (!strcmp(optarg, "high")) gain_high = 1;
+            else { fprintf(stderr, "%s: bad --gainmode '%s' (low|high)\n",
+                           PROG_NAME, optarg); return 2; }
+            break;
         case 'f': firmware_path = optarg; break;
         case 'q': queuedepth = (unsigned)strtoul(optarg, NULL, 10); break;
         case 'p': reqsize     = (unsigned)strtoul(optarg, NULL, 10); break;
@@ -930,6 +949,7 @@ int main(int argc, char **argv)
     else
         rc = run_from_device(&ctx, hours, samplerate, rate_msps, ftone_hz, decim,
                              N, cyc, bb_rate, firmware_path, queuedepth, reqsize,
+                             gain, att, gain_high,
                              statslog, iqlog_path, verbose);
 
     if (statslog) fclose(statslog);

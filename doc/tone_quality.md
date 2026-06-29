@@ -73,8 +73,14 @@ garble corrupts one block's energy then heals.
 
 ```
 tone_monitor [hours] --rate 129.6 --ftone 27e6 --decim 2400 \
-             --statslog run.csv --iqlog run.iq
+             --gain 127 --att 0 --statslog run.csv --iqlog run.iq
 ```
+
+Front-end gain matters: `--gain` (AD8370 VGA code 0..127), `--att` (DAT-31
+attenuator 0..63 half-dB steps), `--gainmode low|high`. The library default is
+the *bottom* of the gain range (code 0), which can leave a padded tone buried
+under the ADC's fixed fs/4 spur — set `--gain` high enough that the tone is the
+dominant peak (check with `--powers`).
 
 Single-bin Goertzel at bin `cyc/N` (1 multiply + 2 adds per sample, no
 per-sample trig). `--decim` is the block length / decimation and MUST be a
