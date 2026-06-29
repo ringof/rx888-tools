@@ -144,6 +144,22 @@ set ylabel "amplitude (LSB)";        plot "run.dat" using 2:3 with lines
 unset multiplot
 ```
 
+### Power spectrum (`--powers`)
+
+`tone_quality.py CAPTURE --powers --fs <Hz>` dumps a Welch-averaged power
+spectrum (a ka9q-radio `powers`-style view) — top peaks to stderr, `freq_mhz
+power_dbfs` columns to stdout for gnuplot. Works on a raw `.s16` (full band) or
+an iqlog (baseband). The peak's **`frac = freq/fs` is fs-independent**, so it
+proves *where* the energy is even when the assumed `fs` is wrong: a tone at
+`frac = 0.25` is at fs/4 regardless. (This is exactly how a wrong ADC rate is
+caught — e.g. a 27 MHz tone showing `frac 0.25` means fs = 4×27 = 108 MHz, not
+129.6.)
+
+```sh
+python3 tests/tone_quality.py raw.s16 --powers --fs 129600000 > powers.dat
+gnuplot -e "set xlabel 'MHz'; set ylabel 'dBFS'; plot 'powers.dat' u 1:2 w l"
+```
+
 `tests/tone_quality_plots.sh [tone_monitor] [outdir]` automates the whole
 pipeline (numpy synth → `tone_monitor --source --iqlog` → `--plotdata` →
 gnuplot) for the three synthetic cases. The figures below were produced by it

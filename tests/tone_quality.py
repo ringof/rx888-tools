@@ -338,6 +338,58 @@ def analyze_statslog(path):
     return 0
 
 
+def power_spectrum(sig, fs, nperseg, complex_in):
+    """Welch-averaged power spectrum (a 'powers'-style view). Returns
+    (freqs_hz, power_dBFS, nseg), referenced so a full-scale tone peaks at 0 dBFS.
+    The per-bin FRACTION freq/fs is fs-independent, so the peak location proves
+    where the energy sits even if the assumed fs is wrong."""
+    sig = np.asarray(sig)
+    if len(sig) < nperseg:
+        nperseg = 1 << int(math.floor(math.log2(max(len(sig), 2))))
+    nseg = len(sig) // nperseg
+    if nseg < 1:
+        sys.exit("tone_quality.py: capture too short for --powers")
+    w = np.hanning(nperseg)
+    FS_LSB = 32768.0
+    if complex_in:
+        acc = np.zeros(nperseg)
+        for i in range(nseg):
+            s = sig[i*nperseg:(i+1)*nperseg]
+            acc += np.abs(np.fft.fftshift(np.fft.fft((s - s.mean()) * w)))**2
+        freqs = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0/fs))
+        ref = (FS_LSB * np.sum(w))**2
+    else:
+        acc = np.zeros(nperseg//2 + 1)
+        for i in range(nseg):
+            s = sig[i*nperseg:(i+1)*nperseg]
+            acc += np.abs(np.fft.rfft((s - s.mean()) * w))**2
+        freqs = np.fft.rfftfreq(nperseg, 1.0/fs)
+        ref = (FS_LSB/2.0 * np.sum(w))**2
+    acc /= nseg
+    return freqs, 10.0*np.log10(acc/ref + 1e-30), nseg
+
+
+def dump_powers(freqs, dbfs, fs, nseg, label, top=8):
+    """Print the top peaks (to stderr) + freq,dBFS columns (to stdout, gnuplot)."""
+    print(f"# powers: {label}", file=sys.stderr)
+    print(f"#   fs={fs:.0f} Hz  bins={len(freqs)}  segments={nseg}", file=sys.stderr)
+    print(f"#   top peaks (freq, dBFS, frac=freq/fs — frac is fs-independent):",
+          file=sys.stderr)
+    used = []
+    for k in np.argsort(dbfs)[::-1]:
+        f = float(freqs[k])
+        if any(abs(f - u) < fs/512.0 for u in used):   # dedupe adjacent bins
+            continue
+        used.append(f)
+        print(f"#   {f/1e6:11.4f} MHz  {dbfs[k]:7.2f} dBFS  frac={f/fs:+.5f}",
+              file=sys.stderr)
+        if len(used) >= top:
+            break
+    print("# freq_mhz  power_dbfs")
+    for f, d in zip(freqs, dbfs):
+        print(f"{f/1e6:.6f} {d:.3f}")
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description="coherent-tone corruption + quality check")
     ap.add_argument("capture", help="raw int16 capture, OR a tone_monitor "
@@ -349,7 +401,26 @@ def main(argv):
     ap.add_argument("--block", type=int, default=0)
     ap.add_argument("--plotdata", help="write the demodulated per-record time "
                     "series (iqlog only) as gnuplot columns to this file")
+    ap.add_argument("--powers", action="store_true", help="dump a Welch power "
+                    "spectrum (freq vs dBFS) for gnuplot; works on a raw capture "
+                    "(full band) or an iqlog (baseband)")
+    ap.add_argument("--powers-nperseg", type=int, default=8192)
     a = ap.parse_args(argv[1:])
+
+    # 'powers'-style spectrum: print freq,dBFS columns + top peaks, then stop.
+    if a.powers:
+        if is_iqlog(a.capture):
+            meta, z = read_iqlog(a.capture)
+            bb = meta['fs'] / meta['decim']
+            freqs, dbfs, nseg = power_spectrum(z, bb, a.powers_nperseg, True)
+            dump_powers(freqs, dbfs, bb, nseg, f"{a.capture} (iqlog baseband)")
+        elif is_statslog(a.capture):
+            sys.exit("tone_quality.py: --powers needs a raw capture or iqlog, not a statslog")
+        else:
+            x = load(a.capture, a.max_samples)
+            freqs, dbfs, nseg = power_spectrum(x, a.fs, a.powers_nperseg, False)
+            dump_powers(freqs, dbfs, a.fs, nseg, a.capture)
+        return 0
 
     # Dispatch on input type: tone_monitor iqlog / statslog / raw capture.
     if is_iqlog(a.capture):
