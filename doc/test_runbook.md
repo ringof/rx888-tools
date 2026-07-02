@@ -38,9 +38,12 @@ and read the live `-v` columns:
   capture a short raw grab and look at the spectrum — the peak's `frac` is
   fs-independent (27 MHz at fs 129.6 ⇒ `frac ≈ 0.2083 = 5/24`):
   ```sh
-  timeout 1 ./rx888_stream -s 129600000 > /mnt/ssd/rx888/raw.s16
+  # match the level you capture at — rx888_stream's default gain is buried too:
+  timeout 1 ./rx888_stream -s 129600000 -g 127 -a 0 > /mnt/ssd/rx888/raw.s16
   python3 tests/tone_quality.py /mnt/ssd/rx888/raw.s16 --powers --fs 129600000 --max-samples 8000000
   ```
+  The tone should be the dominant peak at `frac ≈ 0.2083` (5/24). If the fs/4 spur
+  (`frac 0.25`) dominates instead, that's buried gain, not a rate problem.
 Adjust `--gain` / `--att` (or the external pad) until `amp_mean` is comfortable
 (a few thousand LSB; ~−10 to −20 dBFS). Do **not** start the long run until the
 probe is clean.
