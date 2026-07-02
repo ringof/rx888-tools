@@ -147,6 +147,17 @@ as plain columns:
 # record  t_ms  amp_lsb  phase_deg  uphase_deg  dphase_deg
 ```
 
+With `--window N`, `--plotdata` instead writes one row **per window** (constant
+memory, so it plots a multi-GB / multi-hour iqlog the per-record path can't
+load): `window t_s amp_mean amp_min amp_max resid_carrier_hz jitter_deg slips`.
+That is the whole-run picture (amplitude, drift, jitter, slip-count vs time);
+the per-record form below is for zooming a short slice.
+
+For a real capture, `tests/tone_quality_hourplot.sh STATSLOG [IQLOG] [outdir]
+[window_sec]` renders the lot in one go — the statslog panels (amplitude /
+residual carrier / worst phase-step vs time), the baseband `--powers` spectrum,
+and the per-window iqlog series — to PNGs. See `doc/test_runbook.md` §3d.
+
 gnuplot reads it directly — e.g. unwrapped phase (column 5) and amplitude
 (column 3) vs time (column 2):
 

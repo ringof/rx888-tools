@@ -52,6 +52,20 @@ check "$(has "$out" '3 grid SLIP')"             "square wave + drop-every 600k -
 check "$([[ "$(has "$out" 'garble')" == 0 ]] && echo 1 || echo 0)" \
                                                 "square -> no false garbles"
 
+# Windowed streaming + per-window plotdata (the drift-robust path used on long /
+# multi-GB captures): reuse the drop iqlog (3 slips). The per-window CSV must
+# carry the 8 raw columns and its slip column must total the same 3 slips the
+# whole-file path found — proving the constant-memory path agrees with it.
+if [[ -f "$work/drop.iq" ]]; then
+    python3 "$TQ" "$work/drop.iq" --window 0.005 --plotdata "$work/drop_win.dat" >/dev/null
+    hdr="$(grep -m1 '^# window' "$work/drop_win.dat" || true)"
+    check "$(has "$hdr" 'window .* t_s .* amp_mean .* resid_carrier_hz .* jitter_deg .* slips')" \
+                                                    "windowed plotdata -> 8-column raw per-window CSV"
+    slipsum="$(awk '!/^#/{s+=$8} END{print s+0}' "$work/drop_win.dat")"
+    check "$([[ "$slipsum" == 3 ]] && echo 1 || echo 0)" \
+                                                    "windowed plotdata slips total 3 (agrees with whole-file)"
+fi
+
 # +5 ppm detune -> residual carrier ~ 5e-6 * 27e6 = 135 Hz.
 out="$(drive foff --freq-offset 5)"
 rf="$(grep -Eo 'residual carrier [+-]?[0-9.]+' <<<"$out" | grep -Eo '[+-]?[0-9.]+$' || echo 0)"

@@ -166,18 +166,32 @@ def read_iqlog(path):
     return meta, z
 
 
-def analyze_baseband_windowed(meta, path, window_sec):
+def analyze_baseband_windowed(meta, path, window_sec, plotdata=None):
     """Streaming, drift-robust analysis for long / undisciplined captures.
     Reads the iqlog in fixed windows (constant memory) and removes the carrier
     LOCALLY per window, so a free-running oscillator's slow drift isn't mis-read
     as slips. Same slip/amplitude/carrier view as analyze_baseband, but it scales
-    to multi-GB / multi-hour files and won't false-count drift as corruption."""
+    to multi-GB / multi-hour files and won't false-count drift as corruption.
+
+    With plotdata set, writes one raw row per window (constant memory, so it
+    plots a multi-GB / multi-hour capture end to end that dump_baseband_series
+    could not load): the per-window amplitude, residual carrier, phase jitter,
+    and slip count vs time. Columns only, no verdict — gnuplot-ready."""
     bb = meta['bb_rate']; dps = meta['deg_per_slip']; decim = meta['decim']
     win = max(int(window_sec * bb), 4096)
     slip_thr = max(dps * 0.5, 20.0)
     total = 0; nwin = 0
     amp_min = np.inf; amp_max = -np.inf; amp_sum = 0.0
     carriers = []; slips = []; jit_sq = 0.0; jit_n = 0
+    pf = None
+    if plotdata:
+        pf = open(plotdata, 'w')
+        pf.write(f"# tone_quality windowed series: window={window_sec:g}s "
+                 f"({win} records) bb_rate={bb:.3f}Hz decim={decim} "
+                 f"fs={meta['fs']:.0f} ftone={meta['ftone']:.0f} "
+                 f"deg_per_slip={dps:.4f}\n")
+        pf.write("# window  t_s  amp_mean  amp_min  amp_max  resid_carrier_hz  "
+                 "jitter_deg  slips\n")
     with open(path, 'rb') as f:
         f.seek(IQLOG_HDRLEN)
         base = 0
@@ -187,22 +201,35 @@ def analyze_baseband_windowed(meta, path, window_sec):
                 break
             z = raw[0::2].astype(np.float64) + 1j * raw[1::2].astype(np.float64)
             amp = np.abs(z)
-            amp_min = min(amp_min, float(amp.min()))
-            amp_max = max(amp_max, float(amp.max()))
-            amp_sum += float(amp.sum())
+            w_amin = float(amp.min()); w_amax = float(amp.max())
+            w_asum = float(amp.sum())
+            amp_min = min(amp_min, w_amin)
+            amp_max = max(amp_max, w_amax)
+            amp_sum += w_asum
+            w_carr = 0.0; w_jit = 0.0; w_slips = 0
             uph = np.degrees(np.unwrap(np.angle(z)))
             d = np.diff(uph)
             if len(d):
                 local = float(np.median(d))             # local carrier this window
-                carriers.append(local / 360.0 * bb)
+                w_carr = local / 360.0 * bb
+                carriers.append(w_carr)
                 resid = d - local
                 m = np.abs(resid) > slip_thr
+                w_slips = int(m.sum())
                 for k in np.where(m)[0]:
                     slips.append((base + int(k) + 1, float(resid[k])))
                 cm = ~m
                 if cm.any():
+                    w_jit = float(resid[cm].std())
                     jit_sq += float(np.sum(resid[cm] ** 2)); jit_n += int(cm.sum())
+            if pf:
+                pf.write(f"{nwin} {base / bb:.3f} {w_asum / len(z):.3f} "
+                         f"{w_amin:.3f} {w_amax:.3f} {w_carr:+.4f} "
+                         f"{w_jit:.4f} {w_slips}\n")
             total += len(z); base += len(z); nwin += 1
+    if pf:
+        pf.close()
+        print(f"  plotdata: wrote {nwin} window rows -> {plotdata}")
     if total == 0:
         sys.exit("tone_quality.py: empty iqlog")
     amp_mean = amp_sum / total
@@ -472,8 +499,9 @@ def main(argv):
     ap.add_argument("--markers")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--block", type=int, default=0)
-    ap.add_argument("--plotdata", help="write the demodulated per-record time "
-                    "series (iqlog only) as gnuplot columns to this file")
+    ap.add_argument("--plotdata", help="write the demodulated time series as "
+                    "gnuplot columns to this file (iqlog only): per-record with "
+                    "the whole-file path, per-window with --window)")
     ap.add_argument("--powers", action="store_true", help="dump a Welch power "
                     "spectrum (freq vs dBFS) for gnuplot; works on a raw capture "
                     "(full band) or an iqlog (baseband)")
@@ -503,7 +531,7 @@ def main(argv):
         if a.window and a.window > 0:
             meta = read_iqlog_header(a.capture)
             print(f"===== {a.capture} (tone_monitor iqlog, windowed) =====")
-            return analyze_baseband_windowed(meta, a.capture, a.window)
+            return analyze_baseband_windowed(meta, a.capture, a.window, a.plotdata)
         meta, z = read_iqlog(a.capture)
         print(f"===== {a.capture} (tone_monitor iqlog) =====")
         if a.plotdata:

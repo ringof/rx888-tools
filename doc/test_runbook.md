@@ -95,6 +95,27 @@ PIB errors:      0    Stream faults: 0    Boot count: unchanged
 iqlog:           ... 0 dropped
 ```
 
+**(d) Pictures of the whole run** (one script → PNGs; gnuplot, plus numpy for
+the iqlog panels). Turns the telemetry above into figures you can eyeball
+instead of scanning numbers — raw measurements vs time, no verdict drawn on the
+plot:
+```sh
+# in the container (has gnuplot + numpy); writes PNGs to ./out
+docker run --rm -v /mnt/ssd/rx888:/data -v "$PWD:/opt/rx888-tools:ro" \
+    rx888-ppskit tests/tone_quality_hourplot.sh /data/run.csv /data/run.iq /data/out 60
+```
+- `run.csv` → `run_statslog.png`: amplitude (min/max band + mean), residual
+  carrier (drift), and worst phase-step vs time over the whole run. Needs only
+  gnuplot; works even without the iqlog.
+- `run.iq` → `run_powers.png` (baseband spectrum, tone near DC = the residual
+  carrier) and `run_window.png` (per-window amplitude / residual carrier /
+  jitter / slip-count over the whole, multi-GB iqlog — the constant-memory
+  `--window --plotdata` series). The last arg (`60`) is the window in seconds.
+
+A clean acquisition reads: amplitude flat (band tight on the mean), residual
+carrier a smooth line (its span = oscillator drift), phase-step and slip panels
+empty except perhaps sec 0.
+
 ## 4. Pass criteria (clean acquisition)
 
 | axis | source | pass |
