@@ -40,6 +40,13 @@ typedef struct {
     unsigned long long bytes_out;     /* cumulative bytes delivered to callback */
     unsigned int       in_flight;     /* outstanding USB transfers */
     unsigned long long last_cb_ms;    /* monotonic ms of most recent callback */
+    unsigned long long zero_xfers;    /* completed transfers with actual_length == 0
+                                         (ZLP / empty buffer terminations) */
+    /* Per libusb_transfer_status tally (statuses are 0..6 and contiguous):
+       [0]=COMPLETED [1]=ERROR [2]=TIMED_OUT [3]=CANCELLED [4]=STALL
+       [5]=NO_DEVICE [6]=OVERFLOW. Breaks out the lumped bad_xfers so a
+       short/ZLP-handling fault (OVERFLOW/TIMED_OUT/STALL) is named. */
+    unsigned long long status_counts[7];
 } rx888_stats_t;
 
 /*
@@ -178,6 +185,14 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
  * have a notification port.
  */
 int rx888_is_running(const rx888_t *r);
+
+/*
+ * Bytes per full bulk transfer (req_packets * negotiated max_packet).
+ * A short transfer (fewer bytes) is how the firmware's in-band markers
+ * appear to the sample callback. Valid only after rx888_start() has
+ * sized the transfer ring; returns 0 before then, or for a NULL handle.
+ */
+size_t rx888_get_transfer_bytes(const rx888_t *r);
 
 /*
  * Format a libusb error code as a human-readable string.

@@ -340,6 +340,8 @@ struct rx888 {
     atomic_ullong  ok_xfers;
     atomic_ullong  bad_xfers;
     atomic_ullong  bytes_out;
+    atomic_ullong  zero_xfers;          /* COMPLETED with actual_length == 0 */
+    atomic_ullong  status_counts[7];    /* per libusb_transfer_status (0..6) */
 };
 
 /* ------------------------------ streaming ------------------------------- */
@@ -375,6 +377,11 @@ static void *writer_main(void *arg) {
         if (!t) break;
         if (atomic_load(&r->stop_flag)) continue;
 
+        /* Per-status tally (libusb statuses are 0..6). Names the lumped
+         * bad_xfers and exposes ZLP/short-handling faults (OVERFLOW etc.). */
+        if (t->status >= 0 && t->status <= LIBUSB_TRANSFER_OVERFLOW)
+            atomic_fetch_add(&r->status_counts[t->status], 1);
+
         if (t->status == LIBUSB_TRANSFER_COMPLETED) {
             atomic_fetch_add(&r->ok_xfers, 1);
             if (t->actual_length > 0) {
@@ -386,6 +393,10 @@ static void *writer_main(void *arg) {
                           (size_t)t->actual_length / sizeof(int16_t),
                           r->cb_user);
                 }
+            } else {
+                /* A completed, zero-length transfer: a ZLP / empty-buffer
+                 * termination (e.g. a marker partial landing at a boundary). */
+                atomic_fetch_add(&r->zero_xfers, 1);
             }
         } else {
             atomic_fetch_add(&r->bad_xfers, 1);
@@ -447,11 +458,19 @@ void rx888_get_stats(const rx888_t *r, rx888_stats_t *out) {
     out->bytes_out  = atomic_load(&r->bytes_out);
     out->in_flight  = atomic_load(&r->in_flight);
     out->last_cb_ms = atomic_load(&r->last_cb_ms);
+    out->zero_xfers = atomic_load(&r->zero_xfers);
+    for (int i = 0; i < 7; i++)
+        out->status_counts[i] = atomic_load(&r->status_counts[i]);
 }
 
 int rx888_is_running(const rx888_t *r) {
     if (!r) return 0;
     return atomic_load(&r->stop_flag) ? 0 : 1;
+}
+
+size_t rx888_get_transfer_bytes(const rx888_t *r) {
+    /* buf_bytes is computed in rx888_start(); 0 before the ring is sized. */
+    return r ? (size_t)r->buf_bytes : 0;
 }
 
 int rx888_open(rx888_t **out, const rx888_config_t *cfg) {

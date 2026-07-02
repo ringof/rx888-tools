@@ -38,12 +38,22 @@ void rx888_close(rx888_t  *r);
 /* Diagnostics */
 void        rx888_get_stats(const rx888_t *r, rx888_stats_t *out);
 int         rx888_is_running(const rx888_t *r);
+size_t      rx888_get_transfer_bytes(const rx888_t *r);
 const char *rx888_strerror(int err);
 const char *rx888_version(void);
 ```
 
 Full type and field documentation lives in
 [`include/librx888.h`](../include/librx888.h).
+
+> **`rx888_get_transfer_bytes()`** is a read-only accessor returning
+> `buf_bytes` (`req_packets * negotiated max_packet`, the size of a full
+> bulk transfer). A short transfer (fewer bytes) is how the firmware's
+> in-band markers appear to the sample callback. The value is only
+> populated after `rx888_start()` sizes the transfer ring; the getter
+> returns 0 before then. Added for the `pps_integrity` tool — see
+> [`doc/pps_integrity.md`](pps_integrity.md). It is part of the
+> exported-symbol set asserted by CI.
 
 ### Typical sequence
 

@@ -72,7 +72,7 @@ LIBRX_A    := librx888.a
 LIBRX_HDR  := $(INCDIR)/librx888.h
 LIBRX_PC   := librx888.pc
 
-BINS := rx888_stream rx888_dsp iqrecord fx3_cmd
+BINS := rx888_stream rx888_dsp iqrecord fx3_cmd pps_integrity stream_soak tone_monitor tone_gen pps_edge_log
 
 all: $(LIBRX_SO) $(LIBRX_A) $(LIBRX_PC) $(BINS)
 
@@ -106,6 +106,40 @@ rx888_stream: $(SRCDIR)/rx888_stream.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/rx888_stream.c \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN' $(SAN_LDFLAGS) -o $@
 
+# pps_integrity: PPS in-band marker fidelity test. Statically linked against
+# librx888.a (no .so deployment concern) and libusb directly for its second
+# EP0-only handle. CFLAGS_STREAM lacks LIBUSB_CFLAGS, so add them — this file
+# includes libusb.h itself.
+pps_integrity: $(SRCDIR)/pps_integrity.c $(LIBRX_A) $(LIBRX_HDR)
+	$(CC) $(CFLAGS_STREAM) $(LIBUSB_CFLAGS) -I$(INCDIR) \
+	    $(SRCDIR)/pps_integrity.c \
+	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -o $@
+
+# stream_soak: no-marker control for pps_integrity. Same static link + libusb.
+stream_soak: $(SRCDIR)/stream_soak.c $(LIBRX_A) $(LIBRX_HDR)
+	$(CC) $(CFLAGS_STREAM) $(LIBUSB_CFLAGS) -I$(INCDIR) \
+	    $(SRCDIR)/stream_soak.c \
+	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -o $@
+
+# tone_monitor: coherent-tone data-QUALITY monitor. Same static link + libusb;
+# needs -lm for the inline Goertzel phasor (hypot/atan2/cos/sin).
+tone_monitor: $(SRCDIR)/tone_monitor.c $(LIBRX_A) $(LIBRX_HDR)
+	$(CC) $(CFLAGS_STREAM) $(LIBUSB_CFLAGS) -I$(INCDIR) \
+	    $(SRCDIR)/tone_monitor.c \
+	    $(LIBRX_A) $(LIBUSB_LIBS) -lpthread -lm -o $@
+
+# tone_gen: synthetic coherent-tone source (no device, no libusb) for driving
+# tone_monitor --source in tests/soaks. Just needs -lm.
+tone_gen: $(SRCDIR)/tone_gen.c
+	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/tone_gen.c -lm -o $@
+
+# pps_edge_log: direct /dev/pps0 edge logger (Tier 1 timing). Standalone — no
+# libusb, no librx888. Uses the RFC 2783 PPS API from <sys/timepps.h>
+# (pps-tools); self-guards to a stub if that header is absent, so it always
+# builds. No extra libs (time_pps_* live in libc / the header).
+pps_edge_log: $(SRCDIR)/pps_edge_log.c
+	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(SRCDIR)/pps_edge_log.c -o $@
+
 rx888_dsp: $(SRCDIR)/rx888_dsp.c
 	$(CC) $(CFLAGS_DSP) -I$(INCDIR) $< -o $@ -lm -lpthread
 
@@ -137,7 +171,7 @@ $(TESTS_DIR)/librx888_api: $(TESTS_DIR)/librx888_api.c $(LIBRX_SO) $(LIBRX_HDR)
 	$(CC) $(CFLAGS_STREAM) -I$(INCDIR) $(LIBUSB_CFLAGS) $< \
 	    -L. -lrx888 -Wl,-rpath,'$$ORIGIN/..' $(SAN_LDFLAGS) -o $@
 
-check: $(TEST_BINS) rx888_stream fx3_cmd
+check: $(TEST_BINS) rx888_stream fx3_cmd pps_integrity stream_soak tone_monitor tone_gen pps_edge_log
 	@present=$${RX888_HW_PRESENT:-$$($(TESTS_DIR)/rx888_present.sh)}; \
 	if [ "$$present" = "1" ]; then \
 	  echo "note: RX888 application-mode device attached — skipping no-device negative checks"; \
@@ -146,7 +180,13 @@ check: $(TEST_BINS) rx888_stream fx3_cmd
 	set -e; \
 	$(TESTS_DIR)/librx888_api; \
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
-	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
+	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd; \
+	$(TESTS_DIR)/pps_integrity_smoke.sh ./pps_integrity; \
+	$(TESTS_DIR)/stream_soak_smoke.sh ./stream_soak; \
+	$(TESTS_DIR)/tone_monitor_smoke.sh ./tone_monitor; \
+	$(TESTS_DIR)/tone_monitor_replay.sh ./tone_monitor; \
+	$(TESTS_DIR)/tone_gen_soak.sh ./tone_gen ./tone_monitor; \
+	$(TESTS_DIR)/pps_edge_log_smoke.sh ./pps_edge_log
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.

@@ -4,6 +4,11 @@
 /rx888_dsp
 /iqrecord
 /fx3_cmd
+/pps_integrity
+/stream_soak
+/tone_monitor
+/tone_gen
+/pps_edge_log
 
 # Library + pkg-config build outputs
 librx888.so
@@ -28,3 +33,7 @@ tests/librx888_api
 
 # Build artifacts
 *.d
+
+# Python bytecode
+__pycache__/
+*.pyc
