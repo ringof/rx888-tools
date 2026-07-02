@@ -158,6 +158,16 @@ export LBE142X=/path/to/lbe-142x/build/bin/lbe-142x   # or put it on PATH
 
 ### 3b. Host timebase (once, for the timing test)
 
+This disciplines the **Pi host clock** to the same Leo Bodnar GPSDO that drives
+the RX888 — so host timestamps and the GPS-locked ADC clock share one timebase
+(Tier 1, `doc/pps_timing.md`).
+
+**Level check first — the Pi GPIO is 3.3 V and NOT 5 V tolerant.** Confirm the
+GPSDO OUT1 (1PPS) output level before wiring it to a GPIO pin; if it's 5 V (or a
+hot pulse into 50 Ω), add a divider / level-shifter or you can damage the pin.
+The one PPS now fans to *two* loads (Pi GPIO here, and — for the extracted path —
+FX3 CTL[2]); plan the split/termination so neither edge degrades.
+
 ```sh
 sudo ./scripts/host-timebase-setup.sh            # dry run: prints intended changes
 sudo ./scripts/host-timebase-setup.sh --apply    # installs chrony+pps-tools, enables pps-gpio
@@ -165,6 +175,14 @@ sudo reboot
 ls -l /dev/pps0 && sudo ppstest /dev/pps0        # verify PPS asserts
 chronyc sources -v && chronyc tracking           # verify GPSDO lock
 ```
+
+Once `/dev/pps0` asserts, log the direct edges for the Tier 1 join (raw CSV,
+measurement only):
+```sh
+./pps_edge_log 60 -o /mnt/ssd/rx888/pps0_edges.csv   # 60 s; 0 = until ^C
+```
+`pps_edge_log` needs `pps-tools` (for `<sys/timepps.h>`); it builds as a stub
+that says so if the header is missing.
 
 Captures go to the NVMe, not the SD card (`--iqlog` is ~1.5 GB/hr at the default
 decim 2400). See `doc/pps_timing.md` for the two-tier timing method.

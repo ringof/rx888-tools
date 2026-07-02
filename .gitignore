@@ -8,6 +8,7 @@
 /stream_soak
 /tone_monitor
 /tone_gen
+/pps_edge_log
 
 # Library + pkg-config build outputs
 librx888.so

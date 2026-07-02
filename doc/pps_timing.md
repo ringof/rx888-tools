@@ -52,12 +52,28 @@ ever say.
 Plumbing (Tier 1):
 1. chrony.conf: `refclock PPS /dev/pps0 lock NMEA refid PPS`, NMEA via gpsd-SHM
    or chrony's NMEA driver; `log measurements tracking refclocks`.
-2. Direct edges: `ppstest /dev/pps0` (or a `time_pps_fetch()` logger) →
-   `edge  host_assert_time`.
-3. Extracted edges: `pps_integrity --ppslog` → `edge#, sample_index, host_time`.
+   (`scripts/host-timebase-setup.sh` installs this; REPRODUCE §3b.)
+2. Direct edges: **`pps_edge_log /dev/pps0`** (BUILT — `src/pps_edge_log.c`, the
+   RFC 2783 `time_pps_fetch()` logger) → CSV `edge,seq,assert_sec,assert_nsec`.
+   The `seq` column localizes any missed/duplicated edge.
+3. Extracted edges: `pps_integrity --ppslog` (TODO) → `edge#, sample_index,
+   host_time`.
 4. Offline join by edge number → residual CSV → gnuplot (residual vs time +
    histogram). chrony's `tracking.log`/`measurements.log` give an independent
    view of the direct-PPS jitter as a cross-check.
+
+**Precondition — the marker must be the GPSDO PPS, not the software toggle.**
+Both paths must timestamp the *same physical GPSDO pulse* or their difference is
+meaningless. Today `pps_integrity` **generates** the marker itself: it toggles
+`OUTXIO9` at 1 Hz in software, which reaches CTL[2] through the board RC and the
+GPIF comparator latches it on the ADC clock (see `doc/pps_integrity.md`). That is
+correct for the *fidelity* test (self-generated 1 Hz edge) but useless for
+timing — its sample index reflects when software wrote the bit, not the GPSDO
+edge. So Tier 1 additionally requires wiring the **GPSDO OUT1 (1PPS) onto
+CTL[2]** and switching `pps_integrity` from self-toggling to *reading*
+externally-generated markers. The comparator already sample-latches CTL[2] on
+the 129.6 MHz clock, so an external PPS should produce a genuine sample-aligned
+marker; the change is wiring + a small code path (and a `--ppslog`).
 
 Tier 1 is necessary (absolute anchoring + outlier catch) but floor-limited.
 
@@ -117,10 +133,13 @@ tone phase at the marker is meaningful as a timing reference.
 
 ## What we'd build when the rig is live
 
+- **DONE** — `pps_edge_log` (`src/pps_edge_log.c`): the direct `/dev/pps0` edge
+  logger (RFC 2783), CSV `edge,seq,assert_sec,assert_nsec`. In `make check`
+  (stubs cleanly where `<sys/timepps.h>` is absent).
 - `pps_integrity --ppslog FILE` — per marker: `edge#, sample_index, host_time`
-  (also feeds Tier 1's join and `tone_quality.py --markers`).
-- A small `ppstest`-style `/dev/pps0` logger (or chrony measurement log) for the
-  direct edges (Tier 1).
+  (also feeds Tier 1's join and `tone_quality.py --markers`). **Gated on the
+  marker being driven by the external GPSDO PPS on CTL[2]** (see the precondition
+  above), else the sample index is the software-toggle time, not the edge.
 - An offline timing analyzer (extend `tone_quality.py`): from the marker sample
   indices + the coherent baseband, compute `ΔS_k` (Tier 2 step 1), the
   marker-slot tone phase (steps 2–3), and the Tier-1 residual vs `/dev/pps0`;
