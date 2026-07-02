@@ -90,19 +90,34 @@ GP
     gnuplot <<GP
 set terminal pngcairo noenhanced size 1000,1040 font ",11"
 set output "$OUT/${iqbase}_window.png"
+# Compute every panel's y-range UP FRONT, while y is autoscaled: stats honors
+# the active yrange, so a range left set by a prior panel would filter out the
+# next column's points ("all points out of range"). A clean disciplined run is
+# near-flat (or exactly flat), so give a degenerate range a visible band instead
+# of letting gnuplot warn + autoscale to nothing.
+df = "$OUT/${iqbase}_win.dat"
+stats df using 6 nooutput; r_lo = STATS_min; r_hi = STATS_max
+rp = (r_hi > r_lo ? (r_hi-r_lo)*0.1 : (abs(r_hi)>0 ? abs(r_hi)*0.1 : 1))
+stats df using 7 nooutput; j_hi = STATS_max
+jp = (j_hi > 0 ? j_hi*0.1 : 1)
+stats df using 8 nooutput; s_hi = STATS_max
 set multiplot layout 4,1 title "iqlog per-window series (${WIN}s windows) — $iqbase"
 set grid
 set xlabel "time (s)"
 set ylabel "amplitude (LSB)"
-plot "$OUT/${iqbase}_win.dat" using 2:4:5 with filledcurves lc rgb "#cfe3f5" title "min..max", \
-     "$OUT/${iqbase}_win.dat" using 2:3 with lines lw 2 lc rgb "#1f77b4" title "amp_mean"
+plot df using 2:4:5 with filledcurves lc rgb "#cfe3f5" title "min..max", \
+     df using 2:3 with lines lw 2 lc rgb "#1f77b4" title "amp_mean"
 set ylabel "residual carrier (Hz)"
-plot "$OUT/${iqbase}_win.dat" using 2:6 with lines lw 2 lc rgb "#2ca02c" title "resid_carrier (drift)"
+set yrange [r_lo-rp : r_hi+rp]
+plot df using 2:6 with lines lw 2 lc rgb "#2ca02c" title "resid_carrier (drift)"
 set ylabel "phase jitter (deg RMS)"
-plot "$OUT/${iqbase}_win.dat" using 2:7 with lines lw 2 lc rgb "#9467bd" title "jitter"
+set yrange [0 : j_hi+jp]
+plot df using 2:7 with lines lw 2 lc rgb "#9467bd" title "jitter"
 set ylabel "grid slips / window"
-set yrange [0:*]
-plot "$OUT/${iqbase}_win.dat" using 2:8 with impulses lw 2 lc rgb "#d62728" title "slips"
+# A clean hour has slips=0 everywhere; floor the top at 1 so it draws a flat
+# baseline rather than an empty range.
+set yrange [0 : (s_hi > 0 ? s_hi*1.2 : 1)]
+plot df using 2:8 with impulses lw 2 lc rgb "#d62728" title "slips"
 unset multiplot
 GP
     echo "wrote $OUT/${iqbase}_window.png"
