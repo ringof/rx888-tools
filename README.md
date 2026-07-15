@@ -27,6 +27,13 @@ the data path — it links libusb directly and is independent of `librx888`. Its
 running* (and, with `--force`, run the full debug console). See
 [`doc/fx3_cmd.md`](doc/fx3_cmd.md).
 
+**`scripts/rx888_ppm.py`** builds on that control channel for one specific job:
+an online **ppm trim** of the ADC sample clock. It bends the Si5351/MS5351M
+PLL-A fractional divider a few ppm — glitch-free, without a PLL reset — so you
+can null a known carrier (WWV/CHU, a broadcast pilot, a siggen) by hand *while
+the receiver streams*, with no GPSDO and no restart. See
+[`doc/rx888_ppm.md`](doc/rx888_ppm.md).
+
 ---
 
 ## Requirements

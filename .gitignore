@@ -28,3 +28,4 @@ tests/librx888_api
 
 # Build artifacts
 *.d
+__pycache__/

@@ -146,7 +146,8 @@ check: $(TEST_BINS) rx888_stream fx3_cmd
 	set -e; \
 	$(TESTS_DIR)/librx888_api; \
 	$(TESTS_DIR)/cli_smoke.sh ./rx888_stream; \
-	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd
+	$(TESTS_DIR)/fx3_cmd_smoke.sh ./fx3_cmd; \
+	python3 $(TESTS_DIR)/rx888_ppm_selftest.py
 
 # Convenience: rebuild with ASan + UBSan and run the no-hardware tests.
 # Forces a clean rebuild so the sanitizer flags propagate everywhere.
